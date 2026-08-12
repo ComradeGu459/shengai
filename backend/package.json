@@ -1,0 +1,12 @@
+{
+  "name": "@qimao-terms-cloud/backend",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/server.mjs",
+    "start": "node src/server.mjs",
+    "build": "node --check src/server.mjs",
+    "lint": "node --check src/server.mjs"
+  }
+}
