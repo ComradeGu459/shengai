@@ -1,6 +1,8 @@
 # 依赖与包管理缓存
 node_modules/
 .pnpm-store/
+.local/
+.impeccable/
 
 # 密钥与本地环境配置
 .env
@@ -28,6 +30,7 @@ desktop.ini
 **/.turbo/
 **/.next/
 **/.vite/
+**/*.tsbuildinfo
 *.log
 *.tmp
 *.temp

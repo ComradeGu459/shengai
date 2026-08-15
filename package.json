@@ -2,6 +2,7 @@
   "name": "qimao-terms-cloud",
   "version": "0.0.0",
   "private": true,
+  "type": "module",
   "description": "审改工作台云端版模块化单体",
   "packageManager": "pnpm@11.21.0",
   "engines": {
@@ -13,13 +14,32 @@
     "pnpm": "11.21.0"
   },
   "scripts": {
-    "dev": "pnpm --parallel --filter @qimao-terms-cloud/backend --filter @qimao-terms-cloud/frontend run dev",
+    "dev": "pnpm run db:setup && pnpm --parallel --filter @qimao-terms-cloud/backend --filter @qimao-terms-cloud/frontend run dev",
     "dev:backend": "pnpm --filter @qimao-terms-cloud/backend run dev",
     "dev:frontend": "pnpm --filter @qimao-terms-cloud/frontend run dev",
+    "db:install": "node tools/local-postgres.mjs install",
+    "db:start": "node tools/local-postgres.mjs start",
+    "db:stop": "node tools/local-postgres.mjs stop",
+    "db:setup": "node tools/local-postgres.mjs setup && pnpm --filter @qimao-terms-cloud/backend run db:migrate",
+    "db:status": "node tools/local-postgres.mjs status",
     "build": "pnpm --recursive --if-present run build",
-    "lint": "pnpm --recursive --if-present run lint && node --check tools/verify-repository.mjs && node --check tests/backend/health.test.mjs && node --check tests/repository/skeleton.test.mjs",
-    "test": "node --test",
+    "typecheck": "pnpm --recursive --if-present run typecheck",
+    "lint": "pnpm --recursive --if-present run lint && node --check tools/verify-repository.mjs && node --check tools/local-postgres.mjs",
+    "test": "pnpm run db:setup && vitest run",
     "check:repo": "node tools/verify-repository.mjs",
-    "check": "pnpm run check:repo && pnpm run lint && pnpm run test && pnpm run build"
+    "check": "pnpm run check:repo && pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run build"
+  },
+  "devDependencies": {
+    "@tanstack/react-query": "5.101.4",
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.2",
+    "@types/node": "26.2.0",
+    "jsdom": "26.1.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-router": "8.3.0",
+    "tsx": "4.23.12",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
   }
 }

@@ -4,37 +4,17 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>审改工作台云端版</title>
-    <style>
-      :root {
-        color-scheme: light;
-        font-family: system-ui, sans-serif;
-        color: #18202b;
-        background: #f4f6f8;
-      }
-      body {
-        margin: 0;
-        min-height: 100vh;
-        display: grid;
-        place-items: center;
-      }
-      main {
-        max-width: 40rem;
-        margin: 2rem;
-        padding: 2rem;
-        border: 1px solid #d9e0e8;
-        border-radius: 1rem;
-        background: #ffffff;
-      }
-      p {
-        line-height: 1.7;
-        color: #52606d;
-      }
-    </style>
   </head>
   <body>
-    <main>
-      <h1>审改工作台云端版</h1>
-      <p>里程碑 1 工程骨架已就绪。业务界面将在下一里程碑确认后开始。</p>
-    </main>
+    <!--
+      THESIS: 让项目状态像生产台账一样一眼可核对，拒绝营销仪表盘与卡片堆叠。
+      OWN-WORLD: 冷灰侧栏、白色工作面、克制靛青操作与密集但留白清楚的数据表。
+      STORY: 员工进入项目中心，确认服务正常，检索现有项目或就地创建新项目。
+      FIRST VIEWPORT: 204px 侧栏、64px 单一页标题顶栏；工具栏与项目表占据主工作面，创建动作位于右上。
+      FORM: 已确认 Operate 列表页模板，继承 DESIGN.md；seed key: m2-project-center-confirmed.
+      FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md
+    -->
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
