@@ -8,13 +8,19 @@ const expectedNode = 'v24.19.0';
 const expectedPnpm = '11.21.0';
 const failures = [];
 
-const run = (command, args, options = {}) =>
-  spawnSync(command, args, {
+const run = (command, args, options = {}) => {
+  const result = spawnSync(command, args, {
     cwd: repositoryRoot,
     encoding: 'utf8',
     shell: false,
     ...options,
   });
+  return {
+    ...result,
+    stdout: typeof result.stdout === 'string' ? result.stdout : '',
+    stderr: typeof result.stderr === 'string' ? result.stderr : '',
+  };
+};
 
 const packageJson = JSON.parse(
   await readFile(resolve(repositoryRoot, 'package.json'), 'utf8'),
@@ -31,9 +37,12 @@ if (packageJson.packageManager !== `pnpm@${expectedPnpm}`) {
   failures.push(`packageManager 应固定为 pnpm@${expectedPnpm}`);
 }
 
-const pnpmVersion = run('pnpm', ['--version']);
-if (pnpmVersion.status !== 0 || pnpmVersion.stdout.trim() !== expectedPnpm) {
-  failures.push(`pnpm 版本应为 ${expectedPnpm}，实际为 ${pnpmVersion.stdout.trim() || '不可用'}`);
+const pnpmVersion = run(process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm', ['--version'], {
+  shell: process.platform === 'win32',
+});
+const pnpmStdout = typeof pnpmVersion.stdout === 'string' ? pnpmVersion.stdout.trim() : '';
+if (pnpmVersion.status !== 0 || pnpmStdout !== expectedPnpm) {
+  failures.push(`pnpm 版本应为 ${expectedPnpm}，实际为 ${pnpmStdout || '不可用'}`);
 }
 
 const gitRoot = run('git', ['rev-parse', '--show-toplevel']);
@@ -49,8 +58,17 @@ if (gitRoot.status !== 0) {
 const remotes = run('git', ['remote']);
 if (remotes.status !== 0) {
   failures.push('无法读取 Git 远程配置');
-} else if (remotes.stdout.trim()) {
-  failures.push(`当前里程碑不允许 Git 远程：${remotes.stdout.trim()}`);
+} else {
+  const allowedRemoteUrls = new Set([
+    'https://github.com/ComradeGu459/shengai.git',
+  ]);
+  for (const remoteName of remotes.stdout.trim().split(/\\r?\\n/).filter(Boolean)) {
+    const remoteUrl = run('git', ['remote', 'get-url', remoteName]);
+    const url = typeof remoteUrl.stdout === 'string' ? remoteUrl.stdout.trim() : '';
+    if (remoteUrl.status !== 0 || !allowedRemoteUrls.has(url)) {
+      failures.push(`Git 远程不在允许列表：${remoteName} -> ${url || '不可用'}`);
+    }
+  }
 }
 
 const ignoreCanaries = [
