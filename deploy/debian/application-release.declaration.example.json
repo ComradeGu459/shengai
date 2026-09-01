@@ -1,0 +1,32 @@
+{
+  "$schema": "qimao.application-release/v2",
+  "formatVersion": 2,
+  "release": {
+    "id": "replace-with-approved-release-id",
+    "previousBackendTarget": "/opt/qimao-terms-cloud/releases/pre-review-acceptance-release-20260901-r1",
+    "previousStaticTarget": "/srv/qimao-terms-cloud/frontend-pre-review-acceptance-release-20260901-r1",
+    "previousSystemStaticTarget": "/srv/qimao-terms-cloud/system-frontend-ai-hotfix-1552"
+  },
+  "runtime": {
+    "preservedUnits": {
+      "asr": "active/running/0/0",
+      "screenText": "inactive/dead/0/0",
+      "openVino": "active/running/0/0"
+    }
+  },
+  "candidate": {
+    "staticMarkers": [
+      "replace-with-approved-ui-marker"
+    ],
+    "systemStaticMarkers": [
+      "replace-with-approved-admin-ui-marker"
+    ],
+    "unauthenticatedProbe": {
+      "label": "replace_with_approved_probe",
+      "path": "/api/projects/00000000-0000-0000-0000-000000000000/screen-text/releases"
+    }
+  },
+  "migration": {
+    "mode": "none"
+  }
+}

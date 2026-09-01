@@ -1,0 +1,123 @@
+.drawer,
+.dialogBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  justify-items: end;
+  background: rgb(12 15 25 / 28%);
+}
+
+.drawerPanel {
+  width: min(480px, 100vw);
+  min-height: 100vh;
+  padding: 18px;
+  overflow: auto;
+  background: #fff;
+  box-shadow: -16px 0 38px rgb(24 28 42 / 18%);
+}
+
+.drawerPanel h2,
+.dialog h2 {
+  margin: 0 0 12px;
+}
+
+.closeButton {
+  float: right;
+}
+
+.skeleton,
+.errorBlock {
+  min-height: 180px;
+  padding: 18px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 14px;
+  background: #fafafd;
+}
+
+.errorBlock {
+  color: var(--danger);
+  border-color: #f0c8c8;
+  background: #fff2f2;
+}
+
+.preflightList {
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+}
+
+.preflightList li {
+  display: grid;
+  gap: 5px;
+  margin-bottom: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+.dialogBackdrop {
+  justify-items: center;
+  align-items: center;
+}
+
+.dialog {
+  width: min(460px, calc(100vw - 32px));
+  display: grid;
+  gap: 12px;
+  padding: 18px;
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 18px 48px rgb(24 28 42 / 24%);
+}
+
+.dialog button,
+.drawer button {
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  color: var(--text-primary);
+  background: #fff;
+  cursor: pointer;
+}
+
+.dialog label {
+  display: grid;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.dialog input,
+.dialog select,
+.dialog textarea {
+  min-height: 32px;
+  min-width: 0;
+  padding: 7px 9px;
+  color: var(--text-primary);
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  background: #fff;
+}
+
+.dialog p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.dialogActions,
+.checkboxRow {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.checkboxRow {
+  justify-content: flex-start;
+}

@@ -86,8 +86,12 @@ export const applyAsrHotwordCapabilities = (
 
 export const buildHotwordProjection = async (
   client: PoolClient,
-  termVersionId: string,
+  termVersionId: string | null,
 ): Promise<HotwordProjection> => {
+  if (!termVersionId) {
+    const summary = summarize([], 0, 0);
+    return { entries: [], omittedEntries: [], words: [], summary };
+  }
   const result = await client.query<{ type: string; name: string; aliases: string[] }>(
     `SELECT type, name, aliases
        FROM term_version_items

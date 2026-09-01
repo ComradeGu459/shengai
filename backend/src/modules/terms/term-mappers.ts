@@ -37,6 +37,13 @@ export interface RunRow extends QueryResultRow {
   diagnostics: string[];
   error_code: string | null;
   error_detail: string | null;
+  claimed_by: string | null;
+  claim_expires_at: Date | null;
+  provider_started_at: Date | null;
+  routing_version_id: string | null;
+  route_digest: string | null;
+  config_digest: string | null;
+  route_snapshot: Record<string, unknown> | null;
   created_at: Date;
   completed_at: Date | null;
 }

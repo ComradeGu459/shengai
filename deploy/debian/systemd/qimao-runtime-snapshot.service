@@ -1,0 +1,24 @@
+[Unit]
+Description=Qimao runtime telemetry snapshot collector
+After=network-online.target postgresql@15-main.service qimao-backend.service qimao-upload-completion-worker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /usr/local/lib/qimao-terms-cloud/qimao-runtime-snapshot-collector.py
+# 需要以 postgres 身份经本机 peer 读取 pg_stat_*；脚本仍只执行固定只读查询。
+TimeoutStartSec=45s
+TimeoutStopSec=5s
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/qimao-terms-cloud/runtime
+UMask=0027
+StandardOutput=journal
+StandardError=journal

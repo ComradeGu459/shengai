@@ -15,7 +15,7 @@ const binRoot = resolve(pgRoot, 'bin');
 // PostgreSQL 的 Windows 二进制在 initdb 阶段不能可靠处理当前含中文的仓库路径。
 // 数据库文件因此放到专用 ASCII 临时根目录，始终与源码和 Git 候选集分离。
 const dataRoot = resolve(postgresStateRoot, 'data');
-const logPath = resolve(localRoot, 'postgres.log');
+const logPath = resolve(postgresStateRoot, 'postgres.log');
 const archivePath = resolve(localRoot, 'postgresql-18.4.zip');
 const postgresUrl =
   'https://get.enterprisedb.com/postgresql/postgresql-18.4-1-windows-x64-binaries.zip';

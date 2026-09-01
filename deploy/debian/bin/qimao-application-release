@@ -1,0 +1,1078 @@
+#!/bin/bash
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C
+export PATH='/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin'
+
+readonly ENTRY_PATH='/usr/local/sbin/qimao-application-release'
+readonly DECLARATION_TOOL='/usr/local/libexec/qimao-application-release-declaration.mjs'
+readonly FIXED_INBOUND='/var/tmp/qimao-application-release-inbound'
+readonly DECLARATION_NAME='application-release.declaration.json'
+readonly CHECKSUMS_NAME='SHA256SUMS'
+readonly LOCK_FILE='/run/lock/qimao-application-release.lock'
+readonly RUNTIME='/run/qimao-application-release'
+readonly CURRENT='/opt/qimao-terms-cloud/current'
+readonly STATIC_LINK='/srv/qimao-terms-cloud/frontend'
+readonly SYSTEM_STATIC_LINK='/srv/qimao-terms-cloud/system-frontend'
+readonly CURRENT_NEXT='/opt/qimao-terms-cloud/current.application-release.next'
+readonly STATIC_NEXT='/srv/qimao-terms-cloud/frontend.application-release.next'
+readonly SYSTEM_STATIC_NEXT='/srv/qimao-terms-cloud/system-frontend.application-release.next'
+readonly BACKEND_UNIT='qimao-backend.service'
+readonly ASR_UNIT='qimao-worker@asr.worker.entry.js.service'
+readonly SCREEN_UNIT='qimao-worker@screen-text.worker.entry.js.service'
+readonly OPENVINO_UNIT='qimao-local-ocr-openvino.service'
+
+probe_status_allowed() {
+  case "$1" in
+    401|403) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+probe_status_matches() {
+  probe_status_allowed "$1" && [ "$1" = "$2" ]
+}
+
+employee_static_mode_allowed() {
+  case "$1" in
+    replace|preserve) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+system_static_mode_allowed() {
+  case "$1" in
+    replace|preserve) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+employee_static_preserve_guard() {
+  local mode="$1" expected="$2" stage="$3" link="$4" next="$5"
+  if [ "$mode" = 'replace' ]; then return 0; fi
+  [ "$mode" = 'preserve' ] \
+    && [ "$(readlink -f "$link" 2>/dev/null || true)" = "$expected" ] \
+    && [ ! -e "$stage" ] && [ ! -L "$stage" ] \
+    && [ ! -e "$next" ] && [ ! -L "$next" ]
+}
+
+employee_static_finalize() {
+  local mode="$1" expected="$2" stage="$3" new="$4" link="$5" next="$6"
+  case "$mode" in
+    replace)
+      static_created=1
+      mv -T "$stage" "$new"
+      static_stage_created=0
+      ;;
+    preserve)
+      employee_static_preserve_guard "$mode" "$expected" "$stage" "$link" "$next"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+employee_static_switch() {
+  local mode="$1" expected="$2" stage="$3" new="$4" link="$5" next="$6"
+  case "$mode" in
+    replace)
+      ln -s "$new" "$next"
+      static_switched=1
+      mv -Tf "$next" "$link"
+      ;;
+    preserve)
+      employee_static_preserve_guard "$mode" "$expected" "$stage" "$link" "$next"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+system_static_preserve_guard() {
+  local mode="$1" expected="$2" stage="$3" new="$4" link="$5" next="$6"
+  if [ "$mode" = 'replace' ]; then return 0; fi
+  [ "$mode" = 'preserve' ] \
+    && [ "$(readlink -f "$link" 2>/dev/null || true)" = "$expected" ] \
+    && [ ! -e "$stage" ] && [ ! -L "$stage" ] \
+    && { [ "$new" = "$expected" ] || { [ ! -e "$new" ] && [ ! -L "$new" ]; }; } \
+    && [ ! -e "$next" ] && [ ! -L "$next" ]
+}
+
+system_static_finalize() {
+  local mode="$1" expected="$2" stage="$3" new="$4" link="$5" next="$6"
+  case "$mode" in
+    replace)
+      system_static_created=1
+      mv -T "$stage" "$new"
+      system_static_stage_created=0
+      ;;
+    preserve)
+      system_static_preserve_guard "$mode" "$expected" "$stage" "$new" "$link" "$next"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+system_static_switch() {
+  local mode="$1" expected="$2" stage="$3" new="$4" link="$5" next="$6"
+  case "$mode" in
+    replace)
+      ln -s "$new" "$next"
+      system_static_switched=1
+      mv -Tf "$next" "$link"
+      ;;
+    preserve)
+      system_static_preserve_guard "$mode" "$expected" "$stage" "$new" "$link" "$next"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+runner_self_test() {
+  probe_status_allowed 401
+  probe_status_allowed 403
+  if probe_status_allowed 400 || probe_status_allowed 404 || probe_status_allowed 500; then return 1; fi
+  probe_status_matches 401 401
+  probe_status_matches 403 403
+  if probe_status_matches 401 403 || probe_status_matches 403 401; then return 1; fi
+  employee_static_mode_allowed replace
+  employee_static_mode_allowed preserve
+  if employee_static_mode_allowed keep || employee_static_mode_allowed drop; then return 1; fi
+  system_static_mode_allowed replace
+  system_static_mode_allowed preserve
+  if system_static_mode_allowed keep || system_static_mode_allowed drop; then return 1; fi
+  (
+    fixture_root="$(mktemp -d)"
+    trap 'rm -rf -- "$fixture_root"' EXIT
+    old="$fixture_root/old"
+    foreign="$fixture_root/foreign"
+    link="$fixture_root/frontend"
+    next="$fixture_root/frontend.next"
+    stage="$fixture_root/frontend.stage"
+    new="$fixture_root/frontend-new"
+    mkdir "$old" "$foreign"
+    ln -s "$old" "$link"
+    expected="$(readlink -f "$old")"
+    before="$(readlink -f "$link")"
+    static_created=0
+    static_stage_created=0
+    static_switched=0
+    employee_static_finalize preserve "$expected" "$stage" "$expected" "$link" "$next"
+    employee_static_switch preserve "$expected" "$stage" "$expected" "$link" "$next"
+    employee_static_preserve_guard preserve "$expected" "$stage" "$link" "$next"
+    [ "$(readlink -f "$link")" = "$before" ]
+    [ "$static_created/$static_stage_created/$static_switched" = '0/0/0' ]
+    [ ! -e "$stage" ] && [ ! -L "$stage" ] && [ ! -e "$next" ] && [ ! -L "$next" ]
+    rm -f "$link"
+    ln -s "$foreign" "$link"
+    if employee_static_preserve_guard preserve "$expected" "$stage" "$link" "$next"; then return 1; fi
+    rm -f "$link"
+    ln -s "$old" "$link"
+    mkdir "$stage"
+    static_created=0
+    static_stage_created=1
+    static_switched=0
+    employee_static_finalize replace "$expected" "$stage" "$new" "$link" "$next"
+    [ -d "$new" ] && [ ! -e "$stage" ] && [ "$static_created/$static_stage_created" = '1/0' ]
+    employee_static_switch replace "$expected" "$stage" "$new" "$link" "$next"
+    [ "$(readlink -f "$link")" = "$(readlink -f "$new")" ]
+    [ ! -e "$next" ] && [ ! -L "$next" ] && [ "$static_switched" = '1' ]
+    system_old="$fixture_root/system-old"
+    system_foreign="$fixture_root/system-foreign"
+    system_link="$fixture_root/system-frontend"
+    system_next="$fixture_root/system-frontend.next"
+    system_stage="$fixture_root/system-frontend.stage"
+    system_new="$fixture_root/system-frontend-new"
+    mkdir "$system_old" "$system_foreign"
+    ln -s "$system_old" "$system_link"
+    system_expected="$(readlink -f "$system_old")"
+    system_before="$(readlink -f "$system_link")"
+    system_static_created=0
+    system_static_stage_created=0
+    system_static_switched=0
+    system_static_finalize preserve "$system_expected" "$system_stage" "$system_new" "$system_link" "$system_next"
+    system_static_switch preserve "$system_expected" "$system_stage" "$system_new" "$system_link" "$system_next"
+    system_static_preserve_guard preserve "$system_expected" "$system_stage" "$system_new" "$system_link" "$system_next"
+    [ "$(readlink -f "$system_link")" = "$system_before" ]
+    [ "$system_static_created/$system_static_stage_created/$system_static_switched" = '0/0/0' ]
+    [ ! -e "$system_stage" ] && [ ! -L "$system_stage" ]
+    [ ! -e "$system_new" ] && [ ! -L "$system_new" ]
+    [ ! -e "$system_next" ] && [ ! -L "$system_next" ]
+    rm -f "$system_link"
+    ln -s "$system_foreign" "$system_link"
+    if system_static_preserve_guard preserve "$system_expected" "$system_stage" "$system_new" "$system_link" "$system_next"; then return 1; fi
+  )
+  printf '%s\n' 'runner_self_test=passed cases=28 statuses=401,403 employee=replace,preserve system_static=replace,preserve preserve_rollback=guarded'
+}
+
+if [ "${1-}" = '--self-test' ] && [ "$#" -eq 1 ]; then
+  runner_self_test
+  exit 0
+fi
+
+input_fail() {
+  echo "terminal=blocked code=$1 effects=0 inbound=retained"
+  exit 64
+}
+
+inbound="${1-}"
+[ "$EUID" -eq 0 ] || input_fail 'ROOT_REQUIRED'
+[ "$#" -eq 1 ] || input_fail 'ARGUMENT_COUNT_INVALID'
+[ "$inbound" = "$FIXED_INBOUND" ] || input_fail 'INBOUND_PATH_INVALID'
+[ "$(readlink -f -- "${BASH_SOURCE[0]}")" = "$ENTRY_PATH" ] || input_fail 'ENTRY_PATH_INVALID'
+[ -f "$ENTRY_PATH" ] && [ ! -L "$ENTRY_PATH" ] || input_fail 'ENTRY_FILE_INVALID'
+[ -f "$DECLARATION_TOOL" ] && [ ! -L "$DECLARATION_TOOL" ] || input_fail 'DECLARATION_TOOL_INVALID'
+[ "$(stat -c '%U:%G:%a' "$ENTRY_PATH")" = 'root:root:750' ] || input_fail 'ENTRY_IDENTITY_INVALID'
+[ "$(stat -c '%U:%G:%a' "$DECLARATION_TOOL")" = 'root:root:750' ] || input_fail 'DECLARATION_TOOL_IDENTITY_INVALID'
+
+for tool in \
+  /bin/bash \
+  /usr/local/bin/node \
+  /usr/bin/awk \
+  /usr/bin/base64 \
+  /usr/bin/chmod \
+  /usr/bin/chown \
+  /usr/bin/cmp \
+  /usr/bin/cp \
+  /usr/bin/curl \
+  /usr/bin/find \
+  /usr/bin/flock \
+  /usr/bin/grep \
+  /usr/bin/install \
+  /usr/bin/ln \
+  /usr/bin/mkdir \
+  /usr/bin/mktemp \
+  /usr/bin/mv \
+  /usr/bin/python3 \
+  /usr/bin/readlink \
+  /usr/bin/rm \
+  /usr/bin/rmdir \
+  /usr/sbin/runuser \
+  /usr/bin/seq \
+  /usr/bin/sha256sum \
+  /usr/bin/sleep \
+  /usr/bin/sort \
+  /usr/bin/stat \
+  /usr/bin/systemctl \
+  /usr/bin/systemd-run \
+  /usr/bin/tar \
+  /usr/bin/test \
+  /usr/bin/uniq \
+  /usr/bin/wc; do
+  [ -x "$tool" ] || input_fail 'FIXED_TOOL_MISSING'
+done
+
+[ -d "$inbound" ] && [ ! -L "$inbound" ] || input_fail 'INBOUND_DIRECTORY_INVALID'
+[ "$(stat -c '%U:%G:%a' "$inbound")" = 'qimao-deploy:qimao-deploy:700' ] \
+  || input_fail 'INBOUND_DIRECTORY_IDENTITY_INVALID'
+inbound_file_count="$(find "$inbound" -mindepth 1 -maxdepth 1 -type f | wc -l)"
+case "$inbound_file_count" in
+  3|4) ;;
+  *) input_fail 'INBOUND_FILE_COUNT_INVALID' ;;
+esac
+[ "$(find "$inbound" -mindepth 1 -maxdepth 1 ! -type f | wc -l)" = '0' ] \
+  || input_fail 'INBOUND_NONFILE_INVALID'
+declaration_source="$inbound/$DECLARATION_NAME"
+checksums_source="$inbound/$CHECKSUMS_NAME"
+for file in "$declaration_source" "$checksums_source"; do
+  [ -f "$file" ] && [ ! -L "$file" ] || input_fail 'INBOUND_CONTROL_FILE_INVALID'
+  [ "$(stat -c '%U:%G:%h' "$file")" = 'qimao-deploy:qimao-deploy:1' ] \
+    || input_fail 'INBOUND_CONTROL_FILE_IDENTITY_INVALID'
+done
+
+exec 9>"$LOCK_FILE"
+flock -n 9 || input_fail 'LOCK_ALREADY_HELD'
+[ ! -e "$RUNTIME" ] || input_fail 'RUNTIME_ALREADY_PRESENT'
+install -d -o root -g root -m 0700 "$RUNTIME"
+runtime_created=1
+
+preclaim_fail() {
+  local code="$1" cleanup='passed'
+  if [ "$runtime_created" -eq 1 ] && [ -e "$RUNTIME" ]; then
+    rm -rf --one-file-system -- "$RUNTIME" || cleanup='failed'
+  fi
+  echo "terminal=blocked code=$code effects=0 inbound=retained cleanup=$cleanup"
+  exit 64
+}
+
+trap 'preclaim_fail PRECLAIM_FAILED' ERR
+trap 'preclaim_fail SIGNAL_INT' INT
+trap 'preclaim_fail SIGNAL_TERM' TERM
+
+values_file="$RUNTIME/declaration.values"
+if ! /usr/local/bin/node "$DECLARATION_TOOL" --emit "$declaration_source" > "$values_file"; then
+  preclaim_fail 'DECLARATION_INVALID'
+fi
+
+release_id=''
+declaration_schema=''
+archive_name=''
+old_release=''
+new_release=''
+old_static=''
+new_static=''
+employee_static_mode=''
+system_static_enabled=''
+system_static_mode=''
+old_system_static=''
+new_system_static=''
+asr_expected_state=''
+screen_expected_state=''
+openvino_expected_state=''
+probe_label=''
+probe_path=''
+probe_expected_status=''
+migration_mode=''
+migration_helper=''
+migration_schema=''
+declare -a static_markers=()
+declare -a system_static_markers=()
+field_count=0
+while IFS=$'\t' read -r key encoded; do
+  if ! decoded="$(printf '%s' "$encoded" | base64 --decode)"; then
+    preclaim_fail 'DECLARATION_EMIT_INVALID'
+  fi
+  case "$key" in
+    schema) declaration_schema="$decoded" ;;
+    release_id) release_id="$decoded" ;;
+    archive_name) archive_name="$decoded" ;;
+    previous_backend) old_release="$decoded" ;;
+    next_backend) new_release="$decoded" ;;
+    previous_static) old_static="$decoded" ;;
+    next_static) new_static="$decoded" ;;
+    employee_static_mode) employee_static_mode="$decoded" ;;
+    system_static_enabled) system_static_enabled="$decoded" ;;
+    system_static_mode) system_static_mode="$decoded" ;;
+    previous_system_static) old_system_static="$decoded" ;;
+    next_system_static) new_system_static="$decoded" ;;
+    asr_expected_state) asr_expected_state="$decoded" ;;
+    screen_expected_state) screen_expected_state="$decoded" ;;
+    openvino_expected_state) openvino_expected_state="$decoded" ;;
+    probe_label) probe_label="$decoded" ;;
+    probe_path) probe_path="$decoded" ;;
+    probe_expected_status) probe_expected_status="$decoded" ;;
+    migration_mode) migration_mode="$decoded" ;;
+    migration_helper) migration_helper="$decoded" ;;
+    migration_schema) migration_schema="$decoded" ;;
+    static_marker) static_markers+=("$decoded") ;;
+    system_static_marker) system_static_markers+=("$decoded") ;;
+    *) preclaim_fail 'DECLARATION_EMIT_KEY_INVALID' ;;
+  esac
+  field_count=$((field_count + 1))
+done < "$values_file"
+
+[ "$field_count" -eq $((21 + ${#static_markers[@]} + ${#system_static_markers[@]})) ] \
+  || preclaim_fail 'DECLARATION_EMIT_COUNT_INVALID'
+[ "$declaration_schema" = 'qimao.application-release/v1' ] \
+  || [ "$declaration_schema" = 'qimao.application-release/v2' ] \
+  || preclaim_fail 'DECLARATION_EMIT_SCHEMA_INVALID'
+[ -n "$release_id" ] && [ -n "$archive_name" ] || preclaim_fail 'DECLARATION_EMIT_REQUIRED_INVALID'
+[ -n "$old_release" ] && [ -n "$new_release" ] || preclaim_fail 'DECLARATION_EMIT_REQUIRED_INVALID'
+[ -n "$old_static" ] && [ -n "$new_static" ] || preclaim_fail 'DECLARATION_EMIT_REQUIRED_INVALID'
+[ -n "$asr_expected_state" ] && [ -n "$screen_expected_state" ] && [ -n "$openvino_expected_state" ] \
+  || preclaim_fail 'DECLARATION_EMIT_REQUIRED_INVALID'
+[ -n "$probe_label" ] && [ -n "$probe_path" ] && probe_status_allowed "$probe_expected_status" \
+  || preclaim_fail 'DECLARATION_EMIT_REQUIRED_INVALID'
+case "$employee_static_mode" in
+  replace)
+    [ "$old_static" != "$new_static" ] && [ "${#static_markers[@]}" -ge 1 ] \
+      || preclaim_fail 'DECLARATION_EMIT_EMPLOYEE_STATIC_INVALID'
+    ;;
+  preserve)
+    [ "$declaration_schema" = 'qimao.application-release/v2' ] \
+      && [ "$old_static" = "$new_static" ] \
+      && [ "${#static_markers[@]}" -eq 0 ] \
+      || preclaim_fail 'DECLARATION_EMIT_EMPLOYEE_STATIC_INVALID'
+    ;;
+  *) preclaim_fail 'DECLARATION_EMIT_EMPLOYEE_STATIC_INVALID' ;;
+esac
+case "$system_static_enabled:$system_static_mode" in
+  false:replace)
+    [ "$declaration_schema" = 'qimao.application-release/v1' ] \
+      && [ -z "$old_system_static" ] && [ -z "$new_system_static" ] \
+      && [ "${#system_static_markers[@]}" -eq 0 ] \
+      || preclaim_fail 'DECLARATION_EMIT_SYSTEM_STATIC_INVALID'
+    ;;
+  true:replace)
+    [ "$declaration_schema" = 'qimao.application-release/v2' ] \
+      && [ -n "$old_system_static" ] && [ -n "$new_system_static" ] \
+      && [ "$old_system_static" != "$new_system_static" ] \
+      && [ "${#system_static_markers[@]}" -ge 1 ] \
+      || preclaim_fail 'DECLARATION_EMIT_SYSTEM_STATIC_INVALID'
+    ;;
+  true:preserve)
+    [ "$declaration_schema" = 'qimao.application-release/v2' ] \
+      && [ -n "$old_system_static" ] && [ "$old_system_static" = "$new_system_static" ] \
+      && [ "${#system_static_markers[@]}" -eq 0 ] \
+      || preclaim_fail 'DECLARATION_EMIT_SYSTEM_STATIC_INVALID'
+    ;;
+  *) preclaim_fail 'DECLARATION_EMIT_SYSTEM_STATIC_INVALID' ;;
+esac
+if [ "$employee_static_mode" = 'preserve' ] && [ "$system_static_enabled" != 'true' ]; then
+  preclaim_fail 'DECLARATION_EMIT_EMPLOYEE_STATIC_INVALID'
+fi
+case "$migration_mode" in
+  none)
+    [ -z "$migration_helper" ] && [ -z "$migration_schema" ] \
+      || preclaim_fail 'DECLARATION_EMIT_MIGRATION_INVALID'
+    ;;
+  gated)
+    [ "$migration_helper" = 'db-migration-gate.mjs' ] && [ -n "$migration_schema" ] \
+      || preclaim_fail 'DECLARATION_EMIT_MIGRATION_INVALID'
+    ;;
+  *) preclaim_fail 'DECLARATION_EMIT_MIGRATION_INVALID' ;;
+esac
+
+archive_source="$inbound/$archive_name"
+helper_source=''
+if [ "$migration_mode" = 'gated' ]; then
+  helper_source="$inbound/$migration_helper"
+fi
+expected_files="$RUNTIME/expected.files"
+actual_files="$RUNTIME/actual.files"
+{
+  printf '%s\n' "$CHECKSUMS_NAME" "$DECLARATION_NAME" "$archive_name"
+  if [ "$migration_mode" = 'gated' ]; then printf '%s\n' "$migration_helper"; fi
+} | sort > "$expected_files"
+find "$inbound" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort > "$actual_files"
+cmp -s "$expected_files" "$actual_files" || preclaim_fail 'INBOUND_FILE_SET_INVALID'
+
+declare -a payload_sources=("$declaration_source" "$archive_source" "$checksums_source")
+if [ "$migration_mode" = 'gated' ]; then payload_sources+=("$helper_source"); fi
+for file in "${payload_sources[@]}"; do
+  [ -f "$file" ] && [ ! -L "$file" ] || preclaim_fail 'INBOUND_FILE_INVALID'
+  [ "$(stat -c '%U:%G:%h' "$file")" = 'qimao-deploy:qimao-deploy:1' ] \
+    || preclaim_fail 'INBOUND_FILE_IDENTITY_INVALID'
+done
+
+release_stage="/opt/qimao-terms-cloud/releases/.${release_id}.stage"
+static_stage="/srv/qimao-terms-cloud/.frontend-${release_id}.stage"
+system_static_stage="/srv/qimao-terms-cloud/.system-frontend-${release_id}.stage"
+unpack="$RUNTIME/unpack"
+archive_list="$RUNTIME/archive.list"
+duplicate_list="$RUNTIME/archive.duplicates"
+api_headers="$RUNTIME/api.headers"
+api_body="$RUNTIME/api.body"
+
+failure_code='UNEXPECTED_FAILURE'
+exact_file_set=1
+release_stage_created=0
+static_stage_created=0
+system_static_stage_created=0
+release_created=0
+static_created=0
+system_static_created=0
+backend_switched=0
+static_switched=0
+system_static_switched=0
+backend_restart_attempted=0
+migration_attempted=0
+schema_retained='none'
+
+safe_remove() {
+  case "$1" in
+    "$RUNTIME"|"$release_stage"|"$new_release"|"$system_static_stage"|"$new_system_static")
+      rm -rf --one-file-system -- "$1" ;;
+    "$static_stage"|"$new_static")
+      [ "$employee_static_mode" = 'replace' ] || return 1
+      rm -rf --one-file-system -- "$1" ;;
+    *)
+      echo 'cleanup_refused=unsafe_path'
+      return 1 ;;
+  esac
+}
+
+cleanup_inbound() {
+  [ "$exact_file_set" -eq 1 ] || return 1
+  [ -e "$inbound" ] || return 0
+  chmod 0700 "$inbound"
+  rm -f -- "${payload_sources[@]}"
+  rmdir -- "$inbound"
+}
+
+health_wait() {
+  local attempt
+  for attempt in $(seq 1 30); do
+    if [ "$(curl --silent --show-error --max-time 5 -o /dev/null -w '%{http_code}' \
+      http://127.0.0.1:3001/health 2>/dev/null || true)" = '200' ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+service_state() {
+  local unit="$1"
+  printf '%s/%s/%s/%s' \
+    "$(systemctl show "$unit" -p ActiveState --value)" \
+    "$(systemctl show "$unit" -p SubState --value)" \
+    "$(systemctl show "$unit" -p NRestarts --value)" \
+    "$(systemctl show "$unit" -p ExecMainStatus --value)"
+}
+
+service_main_pid() {
+  systemctl show "$1" -p MainPID --value
+}
+
+restore_link() {
+  local link="$1" target="$2" next="$3"
+  rm -f -- "$next"
+  ln -s "$target" "$next"
+  mv -Tf "$next" "$link"
+}
+
+rollback() {
+  local rc="${1:-1}" cleanup_failed=0
+  trap - ERR EXIT INT TERM
+  set +e
+  if [ "$employee_static_mode" = 'preserve' ]; then
+    employee_static_preserve_guard preserve "$old_static" "$static_stage" "$STATIC_LINK" "$STATIC_NEXT" \
+      || cleanup_failed=1
+  fi
+  if [ "$backend_switched" -eq 1 ]; then
+    if [ "$(readlink -f "$CURRENT" 2>/dev/null || true)" = "$new_release" ]; then
+      restore_link "$CURRENT" "$old_release" "$CURRENT_NEXT" || cleanup_failed=1
+    elif [ "$(readlink -f "$CURRENT" 2>/dev/null || true)" != "$old_release" ]; then
+      cleanup_failed=1
+    fi
+  fi
+  if [ "$static_switched" -eq 1 ]; then
+    if [ "$(readlink -f "$STATIC_LINK" 2>/dev/null || true)" = "$new_static" ]; then
+      restore_link "$STATIC_LINK" "$old_static" "$STATIC_NEXT" || cleanup_failed=1
+    elif [ "$(readlink -f "$STATIC_LINK" 2>/dev/null || true)" != "$old_static" ]; then
+      cleanup_failed=1
+    fi
+  fi
+  if [ "$system_static_switched" -eq 1 ]; then
+    if [ "$(readlink -f "$SYSTEM_STATIC_LINK" 2>/dev/null || true)" = "$new_system_static" ]; then
+      restore_link "$SYSTEM_STATIC_LINK" "$old_system_static" "$SYSTEM_STATIC_NEXT" || cleanup_failed=1
+    elif [ "$(readlink -f "$SYSTEM_STATIC_LINK" 2>/dev/null || true)" != "$old_system_static" ]; then
+      cleanup_failed=1
+    fi
+  fi
+  if [ "$system_static_mode" = 'preserve' ]; then
+    system_static_preserve_guard preserve "$old_system_static" "$system_static_stage" "$new_system_static" "$SYSTEM_STATIC_LINK" "$SYSTEM_STATIC_NEXT" \
+      || cleanup_failed=1
+  fi
+  rm -f -- "$CURRENT_NEXT" "$SYSTEM_STATIC_NEXT"
+  if [ "$employee_static_mode" = 'replace' ]; then
+    rm -f -- "$STATIC_NEXT"
+  elif ! employee_static_preserve_guard preserve "$old_static" "$static_stage" "$STATIC_LINK" "$STATIC_NEXT"; then
+    cleanup_failed=1
+  fi
+  if [ "$backend_restart_attempted" -eq 1 ]; then
+    systemctl restart "$BACKEND_UNIT" || cleanup_failed=1
+    health_wait || cleanup_failed=1
+  fi
+  if [ "$release_stage_created" -eq 1 ] && [ -e "$release_stage" ]; then
+    safe_remove "$release_stage" || cleanup_failed=1
+  fi
+  if [ "$static_stage_created" -eq 1 ] && [ -e "$static_stage" ]; then
+    safe_remove "$static_stage" || cleanup_failed=1
+  fi
+  if [ "$system_static_stage_created" -eq 1 ] && [ -e "$system_static_stage" ]; then
+    safe_remove "$system_static_stage" || cleanup_failed=1
+  fi
+  if [ "$release_created" -eq 1 ] && [ -e "$new_release" ]; then
+    [ "$(readlink -f "$CURRENT" 2>/dev/null || true)" = "$old_release" ] \
+      && safe_remove "$new_release" || cleanup_failed=1
+  fi
+  if [ "$static_created" -eq 1 ] && [ -e "$new_static" ]; then
+    [ "$(readlink -f "$STATIC_LINK" 2>/dev/null || true)" = "$old_static" ] \
+      && safe_remove "$new_static" || cleanup_failed=1
+  fi
+  if [ "$system_static_created" -eq 1 ] && [ -e "$new_system_static" ]; then
+    [ "$(readlink -f "$SYSTEM_STATIC_LINK" 2>/dev/null || true)" = "$old_system_static" ] \
+      && safe_remove "$new_system_static" || cleanup_failed=1
+  fi
+  if [ "$employee_static_mode" = 'preserve' ]; then
+    employee_static_preserve_guard preserve "$old_static" "$static_stage" "$STATIC_LINK" "$STATIC_NEXT" \
+      || cleanup_failed=1
+  fi
+  if [ "$system_static_mode" = 'preserve' ]; then
+    system_static_preserve_guard preserve "$old_system_static" "$system_static_stage" "$new_system_static" "$SYSTEM_STATIC_LINK" "$SYSTEM_STATIC_NEXT" \
+      || cleanup_failed=1
+  fi
+  if [ "$runtime_created" -eq 1 ] && [ -e "$RUNTIME" ]; then
+    safe_remove "$RUNTIME" || cleanup_failed=1
+  fi
+  cleanup_inbound || cleanup_failed=1
+  if [ "$cleanup_failed" -eq 0 ]; then
+    echo "terminal=blocked code=$failure_code rollback=passed cleanup=passed migration_attempted:$migration_attempted schema_retained:$schema_retained"
+  else
+    echo "terminal=blocked code=$failure_code rollback_or_cleanup=failed migration_attempted:$migration_attempted schema_retained:$schema_retained"
+  fi
+  exit "$rc"
+}
+
+trap 'rc=$?; failure_code="${failure_code:-UNEXPECTED_FAILURE}"; rollback "$rc"' ERR
+trap 'rollback $?' EXIT
+trap 'failure_code=SIGNAL_INT; rollback 130' INT
+trap 'failure_code=SIGNAL_TERM; rollback 143' TERM
+
+chown --no-dereference root:root "$inbound" "${payload_sources[@]}"
+chmod 0500 "$inbound"
+chmod 0400 "${payload_sources[@]}"
+[ "$(stat -c '%U:%G:%a' "$inbound")" = 'root:root:500' ]
+for file in "${payload_sources[@]}"; do
+  [ "$(stat -c '%U:%G:%a' "$file")" = 'root:root:400' ]
+done
+
+failure_code='PAYLOAD_GATE_FAILED'
+/bin/bash -n "$ENTRY_PATH"
+/usr/local/bin/node --check "$DECLARATION_TOOL"
+/usr/local/bin/node "$DECLARATION_TOOL" --self-test >/dev/null
+claimed_values_file="$RUNTIME/declaration.claimed.values"
+/usr/local/bin/node "$DECLARATION_TOOL" --emit "$declaration_source" > "$claimed_values_file"
+cmp -s "$values_file" "$claimed_values_file"
+/usr/local/bin/node "$DECLARATION_TOOL" --verify-checksums "$declaration_source" "$checksums_source" >/dev/null
+(cd "$inbound" && sha256sum --strict -c "$CHECKSUMS_NAME" >/dev/null)
+if [ "$migration_mode" = 'gated' ]; then
+  /usr/local/bin/node --check "$helper_source"
+  helper_self_test_output="$(/usr/local/bin/node "$helper_source" --self-test)"
+  [ "$helper_self_test_output" = 'helper_self_test=passed' ]
+fi
+echo "payload_gate=passed release:$release_id migration:$migration_mode fixed_entry:passed declaration:passed sha:closed"
+
+failure_code='BASELINE_GATE_FAILED'
+[ "$(readlink -f "$CURRENT")" = "$old_release" ]
+[ -d "$old_release" ] && [ ! -L "$old_release" ]
+[ "$(readlink -f "$STATIC_LINK")" = "$old_static" ]
+[ -d "$old_static" ] && [ ! -L "$old_static" ]
+[ ! -e "$new_release" ] && [ ! -e "$release_stage" ]
+if [ "$employee_static_mode" = 'replace' ]; then
+  [ ! -e "$new_static" ] && [ ! -e "$static_stage" ]
+else
+  [ "$new_static" = "$old_static" ]
+  employee_static_preserve_guard preserve "$old_static" "$static_stage" "$STATIC_LINK" "$STATIC_NEXT"
+fi
+[ ! -e "$CURRENT_NEXT" ] && [ ! -e "$STATIC_NEXT" ] && [ ! -e "$SYSTEM_STATIC_NEXT" ]
+if [ "$system_static_enabled" = 'true' ]; then
+  [ "$(readlink -f "$SYSTEM_STATIC_LINK")" = "$old_system_static" ]
+  [ -d "$old_system_static" ] && [ ! -L "$old_system_static" ]
+  [ ! -e "$SYSTEM_STATIC_NEXT" ]
+  if [ "$system_static_mode" = 'replace' ]; then
+    [ ! -e "$new_system_static" ] && [ ! -e "$system_static_stage" ]
+  else
+    system_static_preserve_guard preserve "$old_system_static" "$system_static_stage" "$new_system_static" "$SYSTEM_STATIC_LINK" "$SYSTEM_STATIC_NEXT"
+  fi
+fi
+backend_active="$(systemctl show "$BACKEND_UNIT" -p ActiveState --value)"
+backend_sub="$(systemctl show "$BACKEND_UNIT" -p SubState --value)"
+backend_restarts="$(systemctl show "$BACKEND_UNIT" -p NRestarts --value)"
+backend_exec_main="$(systemctl show "$BACKEND_UNIT" -p ExecMainStatus --value)"
+[ "$backend_active" = 'active' ]
+[ "$backend_sub" = 'running' ]
+case "$backend_restarts" in ''|*[!0-9]*) false ;; esac
+[ "$backend_exec_main" = '0' ]
+[ "$(service_state "$ASR_UNIT")" = "$asr_expected_state" ]
+[ "$(service_state "$SCREEN_UNIT")" = "$screen_expected_state" ]
+[ "$(service_state "$OPENVINO_UNIT")" = "$openvino_expected_state" ]
+health_wait
+[ "$(curl --silent --show-error --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/ 2>/dev/null || true)" = '200' ]
+[ "$(curl --silent --show-error --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/projects/1/asr 2>/dev/null || true)" = '200' ]
+if [ "$system_static_enabled" = 'true' ]; then
+  [ "$(curl --silent --show-error --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/ 2>/dev/null || true)" = '200' ]
+  [ "$(curl --silent --show-error --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/budgets 2>/dev/null || true)" = '200' ]
+fi
+old_backend_state="$(service_state "$BACKEND_UNIT")"
+[ "$old_backend_state" = "$backend_active/$backend_sub/$backend_restarts/$backend_exec_main" ]
+old_backend_pid="$(service_main_pid "$BACKEND_UNIT")"
+[ "$old_backend_pid" -gt 1 ]
+old_asr_state="$(service_state "$ASR_UNIT")"
+old_screen_state="$(service_state "$SCREEN_UNIT")"
+old_openvino_state="$(service_state "$OPENVINO_UNIT")"
+echo "baseline=passed backend:$old_backend_state asr:$old_asr_state screen:$old_screen_state openvino:$old_openvino_state health:200 employee:200/200 employee_static:$employee_static_mode system_static:$system_static_enabled"
+
+failure_code='ARCHIVE_GATE_FAILED'
+install -d -o root -g root -m 0700 "$unpack"
+archive_audit_output="$(
+/usr/bin/python3 - "$archive_source" "$system_static_enabled" "$system_static_mode" "$employee_static_mode" <<'PY'
+# APPLICATION_RELEASE_ARCHIVE_GATE_BEGIN
+import posixpath
+import sys
+import tarfile
+
+
+class ArchiveGate(Exception):
+    pass
+
+
+def fail(code):
+    raise ArchiveGate(code)
+
+
+if len(sys.argv) != 5 or sys.argv[2] not in ("true", "false") \
+        or sys.argv[3] not in ("replace", "preserve") \
+        or sys.argv[4] not in ("replace", "preserve"):
+    fail("ARCHIVE_MODE_INVALID")
+EXPECTED_ROOTS = {"backend"}
+if sys.argv[4] == "replace":
+    EXPECTED_ROOTS.add("static")
+if sys.argv[2] == "true" and sys.argv[3] == "replace":
+    EXPECTED_ROOTS.add("system-static")
+
+
+def has_control(value):
+    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+
+def normalize_member(value):
+    name = value.rstrip("/")
+    if not name or name.startswith("/") or "\\" in name or has_control(name):
+        fail("MEMBER_PATH_INVALID")
+    parts = name.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        fail("MEMBER_PATH_INVALID")
+    if parts[0] not in EXPECTED_ROOTS:
+        fail("MEMBER_TOP_LEVEL_INVALID")
+    return name
+
+
+def normalize_link(source, value, hardlink=False):
+    if not value or value.startswith("/") or "\\" in value or has_control(value):
+        fail("LINK_TARGET_INVALID")
+    base = "" if hardlink else posixpath.dirname(source)
+    target = posixpath.normpath(posixpath.join(base, value))
+    if target in ("", ".", "..") or target.startswith("../") or target.startswith("/"):
+        fail("LINK_TARGET_ESCAPE")
+    if target.split("/", 1)[0] != source.split("/", 1)[0]:
+        fail("LINK_TARGET_CROSS_ROOT")
+    return target.rstrip("/")
+
+
+try:
+    with tarfile.open(sys.argv[1], "r:gz") as archive:
+        members = archive.getmembers()
+    if not members:
+        fail("ARCHIVE_EMPTY")
+    names = [normalize_member(member.name) for member in members]
+    if len(names) != len(set(names)):
+        fail("MEMBER_DUPLICATE")
+    if {name.split("/", 1)[0] for name in names} != EXPECTED_ROOTS:
+        fail("TOP_LEVEL_SET_INVALID")
+    name_set = set(names)
+    counts = {"regular": 0, "directory": 0, "symlink": 0, "hardlink": 0}
+    for member, name in zip(members, names):
+        if member.isfile():
+            counts["regular"] += 1
+        elif member.isdir():
+            counts["directory"] += 1
+        elif member.issym():
+            counts["symlink"] += 1
+            if normalize_link(name, member.linkname) not in name_set:
+                fail("SYMLINK_TARGET_MISSING")
+        elif member.islnk():
+            counts["hardlink"] += 1
+            if normalize_link(name, member.linkname, hardlink=True) not in name_set:
+                fail("HARDLINK_TARGET_MISSING")
+        else:
+            fail("MEMBER_TYPE_INVALID")
+    print(
+        "archive_audit=passed"
+        f" members:{len(members)}"
+        f" regular:{counts['regular']}"
+        f" directories:{counts['directory']}"
+        f" symlinks:{counts['symlink']}"
+        f" hardlinks:{counts['hardlink']}"
+    )
+except ArchiveGate as error:
+    print(f"archive_audit=blocked code={error}", file=sys.stderr)
+    raise SystemExit(1)
+except Exception:
+    print("archive_audit=blocked code=ARCHIVE_READ_INVALID", file=sys.stderr)
+    raise SystemExit(1)
+# APPLICATION_RELEASE_ARCHIVE_GATE_END
+PY
+)"
+echo "$archive_audit_output"
+tar -tzf "$archive_source" > "$archive_list"
+[ -s "$archive_list" ]
+if [ "$employee_static_mode" = 'preserve' ] && [ "$system_static_mode" = 'preserve' ]; then
+  awk 'index($0, "backend/") == 1 || $0 == "backend" { next } { exit 1 }' "$archive_list"
+elif [ "$employee_static_mode" = 'preserve' ] && [ "$system_static_mode" = 'replace' ]; then
+  awk 'index($0, "backend/") == 1 || index($0, "system-static/") == 1 || $0 == "backend" || $0 == "system-static" { next } { exit 1 }' "$archive_list"
+elif [ "$employee_static_mode" = 'replace' ] && [ "$system_static_enabled" = 'true' ] && [ "$system_static_mode" = 'replace' ]; then
+  awk 'index($0, "backend/") == 1 || index($0, "static/") == 1 || index($0, "system-static/") == 1 || $0 == "backend" || $0 == "static" || $0 == "system-static" { next } { exit 1 }' "$archive_list"
+else
+  awk 'index($0, "backend/") == 1 || index($0, "static/") == 1 || $0 == "backend" || $0 == "static" { next } { exit 1 }' "$archive_list"
+fi
+awk '$0 ~ /^\// || $0 ~ /(^|\/)\.\.($|\/)/ || $0 ~ /\\/ { exit 1 }' "$archive_list"
+sort "$archive_list" | uniq -d > "$duplicate_list"
+[ ! -s "$duplicate_list" ]
+tar --no-same-owner --no-same-permissions -xzf "$archive_source" -C "$unpack"
+[ -d "$unpack/backend" ] && [ ! -L "$unpack/backend" ]
+expected_root_count=1
+if [ "$employee_static_mode" = 'replace' ]; then
+  [ -d "$unpack/static" ] && [ ! -L "$unpack/static" ]
+  expected_root_count=$((expected_root_count + 1))
+else
+  [ ! -e "$unpack/static" ] && [ ! -L "$unpack/static" ]
+fi
+if [ "$system_static_enabled" = 'true' ] && [ "$system_static_mode" = 'replace' ]; then
+  [ -d "$unpack/system-static" ] && [ ! -L "$unpack/system-static" ]
+  expected_root_count=$((expected_root_count + 1))
+else
+  [ ! -e "$unpack/system-static" ] && [ ! -L "$unpack/system-static" ]
+fi
+[ "$(find "$unpack" -mindepth 1 -maxdepth 1 -type d | wc -l)" = "$expected_root_count" ]
+[ "$(find "$unpack" -mindepth 1 -maxdepth 1 ! -type d | wc -l)" = '0' ]
+
+failure_code='RELEASE_STAGE_FAILED'
+release_stage_created=1
+install -d -o root -g qimao -m 0750 "$release_stage"
+install -d -o root -g qimao -m 0750 "$release_stage/backend"
+cp -a --reflink=auto "$unpack/backend/." "$release_stage/backend/"
+chown -R --no-dereference root:qimao "$release_stage"
+find "$release_stage" -type d -exec chmod 0750 {} +
+find "$release_stage" -type f -exec chmod 0640 {} +
+
+if [ "$employee_static_mode" = 'replace' ]; then
+  failure_code='STATIC_STAGE_FAILED'
+  static_stage_created=1
+  install -d -o root -g root -m 0755 "$static_stage"
+  cp -a --reflink=auto "$unpack/static/." "$static_stage/"
+  chown -R --no-dereference root:root "$static_stage"
+  find "$static_stage" -type d -exec chmod 0755 {} +
+  find "$static_stage" -type f -exec chmod 0644 {} +
+else
+  employee_static_preserve_guard preserve "$old_static" "$static_stage" "$STATIC_LINK" "$STATIC_NEXT"
+fi
+
+if [ "$system_static_enabled" = 'true' ] && [ "$system_static_mode" = 'replace' ]; then
+  failure_code='SYSTEM_STATIC_STAGE_FAILED'
+  system_static_stage_created=1
+  install -d -o root -g root -m 0755 "$system_static_stage"
+  cp -a --reflink=auto "$unpack/system-static/." "$system_static_stage/"
+  chown -R --no-dereference root:root "$system_static_stage"
+  find "$system_static_stage" -type d -exec chmod 0755 {} +
+  find "$system_static_stage" -type f -exec chmod 0644 {} +
+fi
+
+failure_code='CANDIDATE_CONTENT_GATE_FAILED'
+for entry in \
+  "$release_stage/backend/dist/server.js" \
+  "$release_stage/backend/dist/workers/asr.worker.entry.js" \
+  "$release_stage/backend/dist/workers/screen-text.worker.entry.js" \
+  "$release_stage/backend/dist/workers/pre-review.worker.entry.js" \
+  "$release_stage/backend/dist/workers/term-extraction.worker.entry.js"; do
+  [ -f "$entry" ] && [ ! -L "$entry" ]
+  /usr/local/bin/node --check "$entry" >/dev/null
+  runuser -u qimao -- test -r "$entry"
+done
+if [ "$employee_static_mode" = 'replace' ]; then
+  [ -f "$static_stage/index.html" ] && [ ! -L "$static_stage/index.html" ]
+  [ "$(find "$static_stage/assets" -type f | wc -l)" -ge 1 ]
+  for marker in "${static_markers[@]}"; do
+    grep -R -F -q -- "$marker" "$static_stage/assets"
+  done
+else
+  employee_static_preserve_guard preserve "$old_static" "$static_stage" "$STATIC_LINK" "$STATIC_NEXT"
+fi
+if [ "$system_static_enabled" = 'true' ] && [ "$system_static_mode" = 'replace' ]; then
+  [ -f "$system_static_stage/index.html" ] && [ ! -L "$system_static_stage/index.html" ]
+  [ "$(find "$system_static_stage/assets" -type f | wc -l)" -ge 1 ]
+  for marker in "${system_static_markers[@]}"; do
+    grep -R -F -q -- "$marker" "$system_static_stage/assets"
+  done
+fi
+
+failure_code='CANDIDATE_IMPORT_GATE_FAILED'
+(
+  cd "$release_stage/backend"
+  runuser -u qimao -- /usr/local/bin/node --input-type=module -e "
+    await import('@tus/server');
+    await import('./dist/modules/storage/s3-compatible-storage.js');
+    await import('./dist/modules/asr/tencent-asr-runtime.js');
+    await import('./dist/workers/asr.worker.entry.js');
+    await import('./dist/app.js');
+    await import('./dist/server.js');
+  "
+)
+if [ "$system_static_mode" = 'preserve' ]; then
+  system_static_preserve_guard preserve "$old_system_static" "$system_static_stage" "$new_system_static" "$SYSTEM_STATIC_LINK" "$SYSTEM_STATIC_NEXT"
+fi
+echo "candidate_gate=passed backend_entries:5 employee_static:$employee_static_mode static_markers:${#static_markers[@]} system_static:$system_static_mode system_static_markers:${#system_static_markers[@]} imports:6"
+
+if [ "$migration_mode" = 'gated' ]; then
+  failure_code='MIGRATION_PREFLIGHT_FAILED'
+  migration_helper_stage="$release_stage/.db-migration-gate.mjs"
+  migration_preflight_output="$RUNTIME/migration-preflight.output"
+  migration_verify_output="$RUNTIME/migration-verify.output"
+  install -o root -g qimao -m 0640 "$helper_source" "$migration_helper_stage"
+  systemd-run --quiet --wait --pipe --collect \
+    --unit="qimao-release-${release_id}-db-preflight" \
+    --property=Type=oneshot \
+    --property=User=qimao \
+    --property=Group=qimao \
+    --property=WorkingDirectory="$release_stage/backend" \
+    --property=EnvironmentFile=/etc/qimao-terms-cloud/backend.env \
+    --property=PrivateTmp=yes \
+    --property=ProtectSystem=strict \
+    --property=ProtectHome=yes \
+    --property=NoNewPrivileges=yes \
+    --property=UMask=0027 \
+    --property=TimeoutStartSec=60s \
+    /usr/local/bin/node "$migration_helper_stage" --before --migration-dir "$release_stage/backend/migrations" \
+    > "$migration_preflight_output"
+  [ "$(wc -l < "$migration_preflight_output")" = '1' ]
+  grep -F -x -q -- "db_gate=before passed pending=$migration_schema" "$migration_preflight_output"
+
+  failure_code='CURRENT_SWITCH_FAILED'
+  release_created=1
+  mv -T "$release_stage" "$new_release"
+  release_stage_created=0
+  ln -s "$new_release" "$CURRENT_NEXT"
+  backend_switched=1
+  mv -Tf "$CURRENT_NEXT" "$CURRENT"
+
+  failure_code='MIGRATION_FAILED'
+  migration_attempted=1
+  schema_retained='unknown'
+  systemd-run --quiet --wait --pipe --collect \
+    --unit="qimao-release-${release_id}-migrate" \
+    --property=Type=oneshot \
+    --property=User=qimao \
+    --property=Group=qimao \
+    --property=WorkingDirectory="$new_release/backend" \
+    --property=EnvironmentFile=/etc/qimao-terms-cloud/backend.env \
+    --property=PrivateTmp=yes \
+    --property=ProtectSystem=strict \
+    --property=ProtectHome=yes \
+    --property=NoNewPrivileges=yes \
+    --property=UMask=0027 \
+    --property=TimeoutStartSec=300s \
+    /usr/local/bin/node "$new_release/backend/dist/database/migrate.js"
+  schema_retained="$migration_schema"
+  [ "$(service_main_pid "$BACKEND_UNIT")" = "$old_backend_pid" ]
+  [ "$(service_state "$BACKEND_UNIT")" = "$old_backend_state" ]
+
+  failure_code='MIGRATION_VERIFY_FAILED'
+  systemd-run --quiet --wait --pipe --collect \
+    --unit="qimao-release-${release_id}-db-verify" \
+    --property=Type=oneshot \
+    --property=User=qimao \
+    --property=Group=qimao \
+    --property=WorkingDirectory="$new_release/backend" \
+    --property=EnvironmentFile=/etc/qimao-terms-cloud/backend.env \
+    --property=PrivateTmp=yes \
+    --property=ProtectSystem=strict \
+    --property=ProtectHome=yes \
+    --property=NoNewPrivileges=yes \
+    --property=UMask=0027 \
+    --property=TimeoutStartSec=60s \
+    /usr/local/bin/node "$new_release/.db-migration-gate.mjs" --after --migration-dir "$new_release/backend/migrations" \
+    > "$migration_verify_output"
+  [ "$(wc -l < "$migration_verify_output")" = '1' ]
+  grep -F -x -q -- "db_gate=after passed schema=$migration_schema" "$migration_verify_output"
+  echo "migration=passed schema:$migration_schema"
+
+  if [ "$employee_static_mode" = 'replace' ]; then
+    failure_code='STATIC_SWITCH_FAILED'
+  else
+    failure_code='EMPLOYEE_STATIC_PRESERVE_FAILED'
+  fi
+  employee_static_finalize "$employee_static_mode" "$old_static" "$static_stage" "$new_static" "$STATIC_LINK" "$STATIC_NEXT"
+  employee_static_switch "$employee_static_mode" "$old_static" "$static_stage" "$new_static" "$STATIC_LINK" "$STATIC_NEXT"
+  if [ "$system_static_enabled" = 'true' ] && [ "$system_static_mode" = 'replace' ]; then
+    failure_code='SYSTEM_STATIC_SWITCH_FAILED'
+    system_static_finalize replace "$old_system_static" "$system_static_stage" "$new_system_static" "$SYSTEM_STATIC_LINK" "$SYSTEM_STATIC_NEXT"
+    system_static_switch replace "$old_system_static" "$system_static_stage" "$new_system_static" "$SYSTEM_STATIC_LINK" "$SYSTEM_STATIC_NEXT"
+  elif [ "$system_static_mode" = 'preserve' ]; then
+    system_static_switch preserve "$old_system_static" "$system_static_stage" "$new_system_static" "$SYSTEM_STATIC_LINK" "$SYSTEM_STATIC_NEXT"
+  fi
+else
+  failure_code='ATOMIC_SWITCH_FAILED'
+  release_created=1
+  mv -T "$release_stage" "$new_release"
+  release_stage_created=0
+  employee_static_finalize "$employee_static_mode" "$old_static" "$static_stage" "$new_static" "$STATIC_LINK" "$STATIC_NEXT"
+  if [ "$system_static_enabled" = 'true' ] && [ "$system_static_mode" = 'replace' ]; then
+    system_static_finalize replace "$old_system_static" "$system_static_stage" "$new_system_static" "$SYSTEM_STATIC_LINK" "$SYSTEM_STATIC_NEXT"
+  fi
+  ln -s "$new_release" "$CURRENT_NEXT"
+  backend_switched=1
+  mv -Tf "$CURRENT_NEXT" "$CURRENT"
+  employee_static_switch "$employee_static_mode" "$old_static" "$static_stage" "$new_static" "$STATIC_LINK" "$STATIC_NEXT"
+  if [ "$system_static_enabled" = 'true' ] && [ "$system_static_mode" = 'replace' ]; then
+    system_static_switch replace "$old_system_static" "$system_static_stage" "$new_system_static" "$SYSTEM_STATIC_LINK" "$SYSTEM_STATIC_NEXT"
+  elif [ "$system_static_mode" = 'preserve' ]; then
+    system_static_switch preserve "$old_system_static" "$system_static_stage" "$new_system_static" "$SYSTEM_STATIC_LINK" "$SYSTEM_STATIC_NEXT"
+  fi
+fi
+[ "$(readlink -f "$CURRENT")" = "$new_release" ]
+if [ "$employee_static_mode" = 'replace' ]; then
+  [ "$(readlink -f "$STATIC_LINK")" = "$new_static" ]
+else
+  employee_static_preserve_guard preserve "$old_static" "$static_stage" "$STATIC_LINK" "$STATIC_NEXT"
+fi
+if [ "$system_static_enabled" = 'true' ]; then
+  if [ "$system_static_mode" = 'replace' ]; then
+    [ "$(readlink -f "$SYSTEM_STATIC_LINK")" = "$new_system_static" ]
+  else
+    system_static_preserve_guard preserve "$old_system_static" "$system_static_stage" "$new_system_static" "$SYSTEM_STATIC_LINK" "$SYSTEM_STATIC_NEXT"
+  fi
+fi
+
+failure_code='BACKEND_RESTART_OR_HEALTH_FAILED'
+backend_restart_attempted=1
+systemctl restart "$BACKEND_UNIT"
+health_wait
+
+failure_code='POST_SWITCH_GATE_FAILED'
+candidate_backend_state="$(service_state "$BACKEND_UNIT")"
+candidate_backend_pid="$(service_main_pid "$BACKEND_UNIT")"
+[ "$candidate_backend_state" = 'active/running/0/0' ]
+[ "$candidate_backend_pid" -gt 1 ]
+[ "$(service_state "$ASR_UNIT")" = "$old_asr_state" ]
+[ "$(service_state "$SCREEN_UNIT")" = "$old_screen_state" ]
+[ "$(service_state "$OPENVINO_UNIT")" = "$old_openvino_state" ]
+sleep 5
+[ "$(service_main_pid "$BACKEND_UNIT")" = "$candidate_backend_pid" ]
+[ "$(service_state "$BACKEND_UNIT")" = "$candidate_backend_state" ]
+[ "$(service_state "$ASR_UNIT")" = "$old_asr_state" ]
+[ "$(service_state "$SCREEN_UNIT")" = "$old_screen_state" ]
+[ "$(service_state "$OPENVINO_UNIT")" = "$old_openvino_state" ]
+api_result="$(curl --silent --show-error --max-time 10 \
+  -D "$api_headers" -o "$api_body" -w $'%{http_code}\n%{content_type}' \
+  -H 'accept: application/json' \
+  "http://127.0.0.1:3001$probe_path")"
+api_status="${api_result%%$'\n'*}"
+api_content_type="${api_result#*$'\n'}"
+probe_status_matches "$probe_expected_status" "$api_status"
+case "$api_content_type" in application/json*) ;; *) false ;; esac
+! grep -qi -- '<html' "$api_body"
+[ "$(curl --silent --show-error --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/ 2>/dev/null || true)" = '200' ]
+[ "$(curl --silent --show-error --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/projects/1/asr 2>/dev/null || true)" = '200' ]
+if [ "$system_static_enabled" = 'true' ]; then
+  [ "$(curl --silent --show-error --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/ 2>/dev/null || true)" = '200' ]
+  [ "$(curl --silent --show-error --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/budgets 2>/dev/null || true)" = '200' ]
+fi
+if [ "$employee_static_mode" = 'preserve' ]; then
+  employee_static_preserve_guard preserve "$old_static" "$static_stage" "$STATIC_LINK" "$STATIC_NEXT"
+fi
+echo "post_switch=passed health:200 unauth_${probe_label}:${probe_expected_status}/json/nonhtml employee:200/200 employee_static:$employee_static_mode system_static:$system_static_mode backend:$candidate_backend_state/stable_pid_5s asr:$old_asr_state screen:$old_screen_state openvino:$old_openvino_state"
+
+failure_code='FINAL_CLEANUP_FAILED'
+cleanup_inbound
+safe_remove "$RUNTIME"
+runtime_created=0
+[ ! -e "$inbound" ] && [ ! -e "$RUNTIME" ]
+[ ! -e "$CURRENT_NEXT" ] && [ ! -e "$STATIC_NEXT" ] && [ ! -e "$SYSTEM_STATIC_NEXT" ]
+[ ! -e "$release_stage" ]
+if [ "$employee_static_mode" = 'replace' ]; then
+  [ ! -e "$static_stage" ]
+else
+  employee_static_preserve_guard preserve "$old_static" "$static_stage" "$STATIC_LINK" "$STATIC_NEXT"
+fi
+if [ "$system_static_enabled" = 'true' ]; then
+  if [ "$system_static_mode" = 'replace' ]; then
+    [ ! -e "$system_static_stage" ]
+  else
+    system_static_preserve_guard preserve "$old_system_static" "$system_static_stage" "$new_system_static" "$SYSTEM_STATIC_LINK" "$SYSTEM_STATIC_NEXT"
+  fi
+fi
+trap - ERR EXIT INT TERM
+db_write=0
+if [ "$migration_mode" = 'gated' ]; then db_write=1; fi
+echo "terminal=passed release:$new_release static:$new_static employee_static:$employee_static_mode system_static:$system_static_mode system_static_target:$new_system_static backend_restart:1 db_write:$db_write migration:$migration_mode schema_retained:$schema_retained cos_write:0 route_write:0 budget_write:0 provider_calls:0 asr_restart:0 openvino_restart:0 screen_start:0"
+exit 0

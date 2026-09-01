@@ -1,6 +1,27 @@
 # 部署
 
-当前里程碑只完成部署选型，不会连接任何云账户、创建资源或写入凭据。
+本目录保存声明式部署资产，不会因文件落盘自动连接云账户、创建资源、读取凭据或执行发布。
+
+## 测试服务器应用发布唯一入口
+
+测试服务器后续常规 `backend + employee static` 发布、同步管理员站的
+`backend + employee static + system static` 发布，以及保持员工站指针不变的
+`backend + system static` 发布，都只使用一个公开 root 入口：
+
+```text
+/usr/local/sbin/qimao-application-release /var/tmp/qimao-application-release-inbound
+```
+
+- 固定 runner 源码：`debian/bin/qimao-application-release`；声明校验器：`debian/bin/application-release-declaration.mjs`。
+- `qimao.application-release/v1` 保持原有 backend + 员工站合同；只有声明为 `v2` 时才支持 `system-static/`、管理员站 marker 和旧管理员站回滚目标。
+- v1 和既有 v2 声明未提供 `release.employeeStatic` 时严格保持原有 `replace` 语义；v2 也可显式声明 `{ "mode": "replace" }`，归档继续必须包含 `static/` 并切换员工站。
+- v2 如声明 `release.employeeStatic={"mode":"preserve","expectedTarget":"/srv/qimao-terms-cloud/frontend-..."}`，release 中不得再出现 `previousStaticTarget`，candidate 不得出现 `staticMarkers`，归档也不得含 `static/`。固定入口在 baseline、stage、switch、rollback、post-switch 和 final cleanup 都逐次确认员工 symlink 仍解析到 `expectedTarget`，并保证 employee stage/`.next` 从未创建。
+- preserve 只影响员工静态站；backend、`system-static/`、migration、健康门与失败回滚仍使用同一固定入口和既有路径，禁止用手工链接或一次性 runner 替代。
+- 每个发布批次只替换 `application-release.declaration.json`、由 release id 派生名称的 archive、`SHA256SUMS`，以及 `migration.mode=gated` 时唯一可选的 `db-migration-gate.mjs`。
+- `asr-srt-compare-1642/runner.sh`、`screen-text-partial-release-1714/runner.sh` 等按任务生成的 runner 只保留为历史证据，不得作为新发布入口或复制成新版本。
+- 固定入口的安装、传输和执行都是单独的外部动作；本地文件存在不代表已经安装或发布。
+
+完整声明合同、安全门、回滚与安装前门见 `docs/deployment/RELEASE-AUTOMATION-SERVER-1717-RESULT.md`。
 
 ## M2 选定拓扑
 

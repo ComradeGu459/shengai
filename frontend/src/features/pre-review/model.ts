@@ -5,6 +5,7 @@ import type {
   PreEditItem,
   PreEditSessionStatus,
 } from '@qimao-terms-cloud/contracts';
+import { createUuid } from '../../platform/randomUuid.js';
 
 export const sessionStatusLabels: Record<PreEditSessionStatus, string> = {
   preparing: '正在准备', ready: '可审改', limited: '有限审改', stale: '来源已变化',
@@ -49,4 +50,4 @@ export const itemState = (item: PreEditItem) => {
 
 export const normalizedTextLength = (text: string) => text.replace(/\s/g, '').length;
 
-export const makeIntent = (signature: string) => ({ signature, key: crypto.randomUUID() });
+export const makeIntent = (signature: string) => ({ signature, key: createUuid() });

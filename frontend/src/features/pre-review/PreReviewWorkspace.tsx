@@ -17,7 +17,9 @@ import {
 import { Link, useNavigate, useParams } from 'react-router';
 
 import { projectModules } from '../../modules.js';
+import { createUuid } from '../../platform/randomUuid.js';
 import { getProjectMaterialState } from '../materials/api.js';
+import { listScreenTextReleases } from '../screen-text/api.js';
 import { getTermWorkspace } from '../terms/api.js';
 import {
   applyPreEditPolicy,
@@ -59,7 +61,7 @@ type Intent<T> = { signature: string; key: string; payload: T };
 type DecisionPayload = { itemId: string; body: CreatePreEditDecisionBody };
 
 const intentFor = <T,>(current: Intent<T> | null, signature: string, payload: T) =>
-  current?.signature === signature ? current : { signature, key: crypto.randomUUID(), payload };
+  current?.signature === signature ? current : { signature, key: createUuid(), payload };
 
 const apiRequestId = (error: unknown) => error instanceof PreReviewApiError ? error.requestId : null;
 const canReplayIntent = (error: unknown) =>
@@ -142,6 +144,12 @@ export const PreReviewWorkspace = () => {
   const materials = useQuery({ queryKey: ['project-material-state', projectId], queryFn: () => getProjectMaterialState(projectId), enabled: Boolean(projectId), retry: false });
   const terms = useQuery({ queryKey: ['term-workspace', projectId], queryFn: () => getTermWorkspace(projectId), enabled: Boolean(projectId), retry: false });
   const sessions = useQuery({ queryKey: ['pre-review-sessions', projectId], queryFn: () => listPreEditSessions(projectId), enabled: Boolean(projectId), retry: false });
+  const screenTextReleases = useQuery({
+    queryKey: ['screen-text-releases', projectId, 'pre-review-gate'],
+    queryFn: () => listScreenTextReleases(projectId, { sort: 'version_desc', limit: 1, offset: 0 }),
+    enabled: Boolean(projectId),
+    retry: false,
+  });
   const session = useQuery({
     queryKey: ['pre-review-session', projectId, sessionId],
     queryFn: () => getPreEditSession(projectId, sessionId!),
@@ -312,8 +320,8 @@ export const PreReviewWorkspace = () => {
     else if (session.isError) sessionRetryRef.current?.focus();
     else if (session.isSuccess && !session.isFetching) { sessionRecovery.current = false; decisionPaneRef.current?.focus(); }
   }, [session.dataUpdatedAt, session.errorUpdatedAt, session.isError, session.isFetching, session.isSuccess]);
-  const gateFetching = materials.isFetching || terms.isFetching || sessions.isFetching;
-  const gateError = materials.error ?? terms.error ?? sessions.error;
+  const gateFetching = materials.isFetching || terms.isFetching || sessions.isFetching || screenTextReleases.isFetching;
+  const gateError = materials.error ?? terms.error ?? sessions.error ?? screenTextReleases.error;
   useLayoutEffect(() => {
     if (!gateRecovery.current) return;
     if (gateFetching) gateStateRef.current?.focus();
@@ -329,9 +337,14 @@ export const PreReviewWorkspace = () => {
     else if (prepareMutation.isError) prepareRetryRef.current?.focus();
   }, [prepareMutation.isError, prepareMutation.isPending]);
 
-  const canCreate = materials.data?.project.lifecycleStatus === 'active' && Boolean(terms.data?.latestVersion && terms.data.sourceIsCurrent);
+  const latestScreenTextRelease = screenTextReleases.data?.items[0];
+  const screenTextSourceMatches = Boolean(latestScreenTextRelease
+    && latestScreenTextRelease.manifestId === terms.data?.source.manifestId
+    && latestScreenTextRelease.termVersionId === terms.data?.latestVersion?.id);
+  const canCreate = materials.data?.project.lifecycleStatus === 'active'
+    && Boolean(terms.data?.latestVersion && terms.data.sourceIsCurrent && screenTextSourceMatches);
   const beginCreate = () => {
-    if (!materials.data || !terms.data?.latestVersion || !terms.data.sourceIsCurrent) return;
+    if (!materials.data || !terms.data?.latestVersion || !terms.data.sourceIsCurrent || !screenTextSourceMatches) return;
     const payload = { termVersionId: terms.data.latestVersion.id, expectedProjectVersion: materials.data.project.version };
     const signature = JSON.stringify(payload);
     createIntent.current = intentFor(createIntent.current, signature, payload);
@@ -438,24 +451,30 @@ export const PreReviewWorkspace = () => {
     if (event.key === 'Escape') event.preventDefault();
   };
 
-  if (materials.isPending || terms.isPending || sessions.isPending) return <section className={styles.page}><div className={styles.pageState} role="status" tabIndex={-1} ref={gateStateRef}><span className={styles.spinner} aria-hidden="true" /><strong>正在核对前置审改来源</strong><p>读取项目、已确认术语版本和历史会话。</p></div></section>;
-  if (materials.isError || terms.isError || sessions.isError) {
-    const error = materials.error ?? terms.error ?? sessions.error;
-    return <section className={styles.page}><div className={styles.pageState} tabIndex={-1} ref={gateStateRef}><ErrorBlock title="前置审改门禁读取失败" error={error} action="重新读取门禁" actionRef={gateRetryRef} pending={gateFetching} onAction={() => { if (!gateFetching) { gateRecovery.current = true; void materials.refetch(); void terms.refetch(); void sessions.refetch(); } }} /></div></section>;
+  if (materials.isPending || terms.isPending || sessions.isPending || screenTextReleases.isPending) return <section className={styles.page}><div className={styles.pageState} role="status" tabIndex={-1} ref={gateStateRef}><span className={styles.spinner} aria-hidden="true" /><strong>正在核对前置审改来源</strong><p>读取项目、已确认术语版本、画面字 Release 和历史会话。</p></div></section>;
+  if (materials.isError || terms.isError || sessions.isError || screenTextReleases.isError) {
+    const error = materials.error ?? terms.error ?? sessions.error ?? screenTextReleases.error;
+    return <section className={styles.page}><div className={styles.pageState} tabIndex={-1} ref={gateStateRef}><ErrorBlock title="前置审改门禁读取失败" error={error} action="重新读取门禁" actionRef={gateRetryRef} pending={gateFetching} onAction={() => { if (!gateFetching) { gateRecovery.current = true; void materials.refetch(); void terms.refetch(); void sessions.refetch(); void screenTextReleases.refetch(); } }} /></div></section>;
   }
 
   const project = materials.data!.project;
+  const gateAction = !terms.data?.latestVersion || !terms.data.sourceIsCurrent
+    ? { to: `/projects/${projectId}/terms`, label: '前往术语' }
+    : !latestScreenTextRelease || !screenTextSourceMatches
+      ? { to: `/projects/${projectId}/screen-text`, label: '前往画面字' }
+      : null;
   return <section className={styles.page}>
     <div className={styles.projectContext}><div><Link to="/projects">项目中心</Link><span>/</span><strong>{project.name}</strong><span className={styles.projectStatus}>{project.lifecycleStatus === 'active' ? '使用中' : '只读'}</span></div><nav aria-label="项目工作台模块">{projectModules.map((module) => module.status === 'active' ? <Link key={module.id} to={module.route.replace(':projectId', projectId)} aria-current={module.id === 'project-pre-review' ? 'page' : undefined}>{module.title}</Link> : <span key={module.id} aria-disabled="true">{module.title}</span>)}</nav></div>
     <header className={styles.sourceHeader} tabIndex={-1} ref={sourceHeaderRef}>
       <div><span>公司稿来源</span><strong>{terms.data?.source.episodeCount ?? 0} 集 · {terms.data?.source.sourceSrtSetDigest?.slice(0, 8) ?? '未确认'}</strong></div>
       <div><span>中文识别</span><strong>{session.data ? `${asrComparableCount} / ${session.data.episodeCounts.total} 集可对照` : '暂无会话事实'}</strong><small>{session.data ? `${session.data.episodeCounts.total - asrComparableCount} 集有限审改` : '创建会话后读取'}</small></div>
       <div><span>术语版本</span><strong>{terms.data?.latestVersion ? `V${terms.data.latestVersion.version}` : '未确认'}</strong></div>
+      <div><span>画面字 Release</span><strong>{session.data?.screenTextRelease ? `V${session.data.screenTextRelease.version}${session.data.screenTextRelease.partial ? '（部分）' : ''}` : latestScreenTextRelease ? `V${latestScreenTextRelease.version}${latestScreenTextRelease.partial ? '（部分）' : ''}` : '未发布'}</strong><small>{session.data?.screenTextRelease?.partial ? `排除 ${session.data.screenTextRelease.excludedEpisodes.length} 集` : session.data ? '完整来源已固定' : !latestScreenTextRelease ? '需先发布画面字来源' : !screenTextSourceMatches ? '与当前术语或素材不一致' : latestScreenTextRelease.partial ? `排除 ${latestScreenTextRelease.excludedEpisodes.length} 集` : '可用于创建会话'}</small></div>
       <div><span>会话状态</span><strong>{session.data ? sessionStatusLabels[session.data.status] : '尚未创建'}</strong></div>
       {!session.data && <button type="button" className={styles.primaryButton} disabled={!canCreate || createMutation.isPending} onClick={beginCreate}>{createMutation.isPending ? '正在创建会话' : '创建前置审改会话'}</button>}
       {session.data && <button type="button" ref={baselineTrigger} disabled={sessionReadOnly || commandPending || !selectedItem} onClick={() => { policyMutation.reset(); setBaselineOpen(true); }}>调整文本基准</button>}
     </header>
-    {!canCreate && !session.data && <div className={styles.blockNotice} role="status"><strong>来源门禁尚未满足</strong><span>{project.lifecycleStatus !== 'active' ? '项目不是使用中状态。' : !terms.data?.latestVersion ? '请先确认术语版本。' : '公司稿来源已经变化，请重新确认术语。'}</span><Link to={`/projects/${projectId}/terms`}>前往术语</Link></div>}
+    {!canCreate && !session.data && <div className={styles.blockNotice} role="status"><strong>来源门禁尚未满足</strong><span>{project.lifecycleStatus !== 'active' ? '项目不是使用中状态。' : !terms.data?.latestVersion ? '请先确认术语版本。' : !terms.data.sourceIsCurrent ? '公司稿来源已经变化，请重新确认术语。' : !latestScreenTextRelease ? '当前项目没有已发布画面字 Release，请先完成画面字发布。' : !screenTextSourceMatches ? '画面字 Release 与当前术语或素材来源不一致，请先发布匹配版本。' : '正在核对可用来源。'}</span>{gateAction && <Link to={gateAction.to}>{gateAction.label}</Link>}</div>}
     {createMutation.isError && <ErrorBlock title="前置审改会话创建失败" error={createMutation.error} action={recoveryAction(createMutation.error, '重试同一创建意图')} actionRef={createRetryRef} onAction={() => { if (canReplayIntent(createMutation.error)) beginCreate(); else void refreshWorkspace(); }} pending={createMutation.isPending} />}
     {feedback && <div className={styles.feedback} role="status" tabIndex={-1} ref={feedbackRef}>{feedback}</div>}
     {!sessionId && sessions.data?.items.length === 0 && <div className={styles.emptyWorkspace}><strong>还没有前置审改会话</strong><p>门禁满足后创建会话；系统会固定公司稿、术语、ASR、素材与格式策略身份。</p></div>}
@@ -465,6 +484,7 @@ export const PreReviewWorkspace = () => {
     {session.data?.status === 'failed' && <div className={styles.pageState} tabIndex={-1} ref={prepareStateRef}><strong>会话准备失败</strong><p>{session.data.errorDetail ?? '准备任务没有完成。'}</p>{prepareMutation.isError && <ErrorBlock title="重新准备失败" error={prepareMutation.error} action={recoveryAction(prepareMutation.error, '重试同一准备意图')} actionRef={prepareRetryRef} onAction={() => { if (canReplayIntent(prepareMutation.error)) retryPreparation(); else void refreshWorkspace(); }} pending={prepareMutation.isPending} />}<button type="button" className={styles.primaryButton} disabled={prepareMutation.isPending} onClick={retryPreparation}>{prepareMutation.isPending ? '正在重新准备' : '重新准备会话'}</button></div>}
     {session.data && !['preparing', 'failed'].includes(session.data.status) && currentEpisode && <>
       {session.data.status === 'stale' && <div className={styles.staleNotice} role="alert"><strong>来源已经变化，历史会话只读</strong><span>旧决定和导出继续可追溯；唯一下一步是从当前来源创建新会话。</span><button type="button" disabled={!canCreate || createMutation.isPending} onClick={beginCreate}>从新来源创建会话</button></div>}
+      {session.data.screenTextRelease?.partial && <div className={styles.limitedNotice} role="status"><strong>画面字来源为部分 Release</strong><span>排除 {session.data.screenTextRelease.excludedEpisodes.length} 集；仅影响画面字对照，不会重跑、删除或改写已发布的异常集。</span><ul className={styles.releaseExclusionList}>{session.data.screenTextRelease.excludedEpisodes.map((entry) => <li key={`${entry.episodeNumber}-${entry.jobId}`}>第 {entry.episodeNumber} 集 · {entry.status}{entry.errorCode ? ` · ${entry.errorCode}` : ''}</li>)}</ul></div>}
       {limitedEpisode && <div className={styles.limitedNotice} role="status"><strong>第 {currentEpisode.episodeNumber} 集仅公司稿有限审改</strong><span>{currentEpisode.limitedReason ?? '缺少可用 ASR 结果。'} 不得冒充完成双源对照。</span></div>}
       <section className={styles.screeningBar} aria-label="自动筛选摘要">
         <div><span className={styles.screeningMark} aria-hidden="true">筛</span><strong>自动筛选已完成</strong><span>{currentEpisode.counts.pending} 条待人工</span><span>{currentEpisode.counts.blocking} 条格式阻断</span><em>本地确定性规则优先</em><span>AI 复核未启用 · 不影响人工审改</span></div>

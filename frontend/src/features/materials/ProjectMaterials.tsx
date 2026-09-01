@@ -11,6 +11,7 @@ import { useEffect, useMemo, useRef, useState, type ChangeEvent, type KeyboardEv
 import { Link, useParams } from 'react-router';
 
 import { projectModules } from '../../modules.js';
+import { createUuid } from '../../platform/randomUuid.js';
 import { confirmMaterialManifest, getProjectMaterialState, MaterialApiError } from './api.js';
 import {
   autoPairMaterials,
@@ -21,6 +22,7 @@ import {
   type MaterialSelections,
   type ScannedMaterialFile,
 } from './scan.js';
+import { storeMaterialFileHandoff } from '../uploads/file-selection.js';
 import styles from './ProjectMaterials.module.css';
 
 const roles = ['company_srt', 'asr_video', 'screen_video'] as const;
@@ -61,6 +63,7 @@ export const ProjectMaterials = () => {
   const confirmTriggerRef = useRef<HTMLButtonElement | null>(null);
   const confirmDialogRef = useRef<HTMLElement | null>(null);
   const cancelConfirmRef = useRef<HTMLButtonElement | null>(null);
+  const selectedFilesRef = useRef<File[]>([]);
 
   const state = useQuery({
     queryKey: ['project-material-state', projectId],
@@ -84,6 +87,12 @@ export const ProjectMaterials = () => {
   const confirmMutation = useMutation({
     mutationFn: confirmMaterialManifest,
     onSuccess: (manifest) => {
+      storeMaterialFileHandoff({
+        projectId,
+        manifestId: manifest.id,
+        manifestVersion: manifest.version,
+        files: selectedFilesRef.current,
+      });
       queryClient.setQueryData<ProjectMaterialState>(['project-material-state', projectId], (current) =>
         current ? { ...current, manifest } : current,
       );
@@ -103,13 +112,16 @@ export const ProjectMaterials = () => {
   }, [confirmOpen]);
 
   const scanFolder = async (event: ChangeEvent<HTMLInputElement>) => {
+    const selectedFiles = [...(event.target.files ?? [])];
+    selectedFilesRef.current = selectedFiles;
     setScanState('scanning');
     setScanError('');
     try {
       await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
-      const scanned = scanMaterialFiles(Array.from(event.target.files ?? []));
+      const scanned = scanMaterialFiles(selectedFiles);
       const relevant = scanned.files.filter((file) => file.mediaType);
       if (!relevant.length) {
+        selectedFilesRef.current = [];
         setRootName(scanned.rootName);
         setFiles([]);
         setEpisodes([]);
@@ -125,6 +137,7 @@ export const ProjectMaterials = () => {
       setAssignmentDrafts({});
       setScanState('ready');
     } catch (error) {
+      selectedFilesRef.current = [];
       setScanError(error instanceof Error ? error.message : '无法读取文件元数据。');
       setScanState('failed');
     } finally {
@@ -156,7 +169,7 @@ export const ProjectMaterials = () => {
     const signature = JSON.stringify(body);
     const intent = confirmIntent.current?.signature === signature
       ? confirmIntent.current
-      : { signature, idempotencyKey: crypto.randomUUID() };
+      : { signature, idempotencyKey: createUuid() };
     confirmIntent.current = intent;
     confirmMutation.mutate({ projectId, idempotencyKey: intent.idempotencyKey, body });
   };

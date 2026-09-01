@@ -1,4 +1,5 @@
 import { Type, type Static } from '@sinclair/typebox';
+import { SystemControlScreenTextRuntimeConfigSchema } from './system-control.js';
 
 const Uuid = () => Type.String({ format: 'uuid' });
 const Digest = () => Type.String({ pattern: '^[0-9a-f]{64}$' });
@@ -56,6 +57,14 @@ export const ScreenTextUsageSchema = Type.Object({
   finalAmount: Type.String(),
   reconciliationStatus: Type.Union([Type.Literal('final'), Type.Literal('pending')]),
   providerRequestId: Type.Union([Type.String(), Type.Null()]),
+  conversionSnapshotId: Type.Optional(Type.Union([Uuid(), Type.Null()])),
+  rateDigest: Type.Optional(Type.Union([Digest(), Type.Null()])),
+  conversionEffectiveAt: Type.Optional(Type.Union([Timestamp(), Type.Null()])),
+  originalCurrency: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  originalEstimatedAmount: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  originalFinalAmount: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  estimatedAmountCny: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  finalAmountCny: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 }, { additionalProperties: false });
 export type ScreenTextUsage = Static<typeof ScreenTextUsageSchema>;
 
@@ -83,7 +92,7 @@ export const ScreenTextExecutionSchema = Type.Object({
   kind: ScreenTextExecutionKindSchema,
   adapter: Type.String({ minLength: 1, maxLength: 80 }),
   provider: Type.String({ minLength: 1, maxLength: 40 }),
-  model: Type.String({ minLength: 1, maxLength: 80 }),
+  model: Type.String({ minLength: 1, maxLength: 160 }),
   language: Type.String({ minLength: 1, maxLength: 20 }),
   deployment: Type.String({ minLength: 1, maxLength: 80 }),
   inputVersion: Type.String({ minLength: 1, maxLength: 40 }),
@@ -166,6 +175,8 @@ export const ScreenTextAttemptSchema = Type.Object({
     Type.Literal('failed'), Type.Literal('cancelled'), Type.Literal('reconciliation_required'),
   ]),
   execution: ScreenTextExecutionSchema,
+  runtimeConfig: Type.Optional(SystemControlScreenTextRuntimeConfigSchema),
+  runtimeConfigDigest: Type.Optional(Digest()),
   inputDigest: Digest(),
   receipt: Type.Union([
     Type.Literal('simulated'), Type.Literal('submitted'), Type.Literal('unsupported'), Type.Literal('unknown'),
@@ -209,11 +220,15 @@ export const ScreenTextBatchSchema = Type.Object({
   termVersionId: Uuid(), termVersion: Type.Integer({ minimum: 1 }),
   manifestId: Uuid(), manifestVersion: Type.Integer({ minimum: 1 }),
   execution: ScreenTextExecutionSchema,
+  runtimeConfig: Type.Optional(SystemControlScreenTextRuntimeConfigSchema),
+  runtimeConfigDigest: Type.Optional(Digest()),
   frameStrategyVersion: Type.String(), dedupeStrategyVersion: Type.String(),
   termProjection: ScreenTextTermProjectionSchema,
   usage: ScreenTextUsageSummarySchema,
   status: ScreenTextBatchStatusSchema, revision: Type.Integer({ minimum: 1 }),
   counts: ScreenTextBatchCountsSchema,
+  routingVersionId: Type.Union([Uuid(), Type.Null()]),
+  deploymentVersionId: Type.Union([Uuid(), Type.Null()]),
   jobs: Type.Array(ScreenTextEpisodeJobSchema), createdAt: Timestamp(), updatedAt: Timestamp(),
 }, { additionalProperties: false });
 export type ScreenTextBatch = Static<typeof ScreenTextBatchSchema>;
@@ -225,6 +240,8 @@ export const ScreenTextBatchSummarySchema = Type.Object({
   manifestId: Uuid(), manifestVersion: Type.Integer({ minimum: 1 }),
   status: ScreenTextBatchStatusSchema, revision: Type.Integer({ minimum: 1 }),
   counts: ScreenTextBatchCountsSchema,
+  routingVersionId: Type.Union([Uuid(), Type.Null()]),
+  deploymentVersionId: Type.Union([Uuid(), Type.Null()]),
   createdAt: Timestamp(), updatedAt: Timestamp(),
 }, { additionalProperties: false });
 export type ScreenTextBatchSummary = Static<typeof ScreenTextBatchSummarySchema>;
@@ -328,10 +345,31 @@ export const ScreenTextReleaseExportSchema = Type.Object({
   id: Uuid(), episodeNumber: EpisodeNumber(), filename: Type.String(),
   sha256: Digest(), sizeBytes: Type.Integer({ minimum: 1 }), downloadPath: Type.String(),
 }, { additionalProperties: false });
+export const ScreenTextReleaseExclusionSchema = Type.Object({
+  episodeNumber: EpisodeNumber(), jobId: Uuid(),
+  status: Type.Union([
+    Type.Literal('failed'), Type.Literal('reconciliation_required'), Type.Literal('cancelled'),
+  ]),
+  attemptId: Type.Union([Uuid(), Type.Null()]),
+  errorCode: Type.Union([Type.String({ minLength: 1, maxLength: 160 }), Type.Null()]),
+  effectClass: Type.Union([
+    Type.Literal('external_not_accepted'), Type.Literal('unauthorized'),
+    Type.Literal('external_unknown'), Type.Literal('quality_rejected'), Type.Literal('cancelled'),
+    Type.Null(),
+  ]),
+  providerRequestId: Type.Union([Type.String({ minLength: 1, maxLength: 255 }), Type.Null()]),
+}, { additionalProperties: false });
+export type ScreenTextReleaseExclusion = Static<typeof ScreenTextReleaseExclusionSchema>;
+export const ScreenTextReleaseSourceSchema = Type.Object({
+  id: Uuid(), version: Type.Integer({ minimum: 1 }), releaseDigest: Digest(),
+  partial: Type.Boolean(), excludedEpisodes: Type.Array(ScreenTextReleaseExclusionSchema),
+}, { additionalProperties: false });
+export type ScreenTextReleaseSource = Static<typeof ScreenTextReleaseSourceSchema>;
 export const ScreenTextReleaseSchema = Type.Object({
   id: Uuid(), projectId: Uuid(), version: Type.Integer({ minimum: 1 }), batchId: Uuid(),
   termVersionId: Uuid(), manifestId: Uuid(), draftRevision: Type.Integer({ minimum: 1 }),
   releaseDigest: Digest(), cueCount: Type.Integer({ minimum: 0 }),
+  partial: Type.Boolean(), excludedEpisodes: Type.Array(ScreenTextReleaseExclusionSchema),
   exports: Type.Array(ScreenTextReleaseExportSchema), createdAt: Timestamp(),
 }, { additionalProperties: false });
 export type ScreenTextRelease = Static<typeof ScreenTextReleaseSchema>;
@@ -351,6 +389,7 @@ export const ScreenTextReleaseListSchema = Type.Object({
 
 export const CreateScreenTextReleaseBodySchema = Type.Object({
   batchId: Uuid(), expectedBatchRevision: Type.Integer({ minimum: 1 }),
+  allowPartial: Type.Optional(Type.Boolean()),
 }, { additionalProperties: false });
 export type CreateScreenTextReleaseBody = Static<typeof CreateScreenTextReleaseBodySchema>;
 
@@ -358,6 +397,66 @@ export const CreateScreenTextPlaybackGrantBodySchema = Type.Object({
   expectedBatchRevision: Type.Integer({ minimum: 1 }),
 }, { additionalProperties: false });
 export type CreateScreenTextPlaybackGrantBody = Static<typeof CreateScreenTextPlaybackGrantBodySchema>;
+
+/** 零网络本地 OCR sidecar 的安全协议元数据；实际媒体字节只在服务端受控 transport 内流转。 */
+export const ScreenTextLocalOcrSidecarProtocolVersionSchema = Type.Literal('screen_text_local_ocr_v1');
+export const ScreenTextLocalOcrSidecarMediaSchema = Type.Object({
+  inputKind: Type.Literal('server_extracted_frames'),
+  contentType: Type.String({ minLength: 1, maxLength: 120 }),
+  // 视频对象可达现有上传上限；本地 sidecar 的整对象路径仍由 adapter 20MB 限制，
+  // streamed media 只传服务端核验的对象元数据与有界帧。
+  sizeBytes: Type.Integer({ minimum: 1, maximum: 50_000_000_000 }),
+  checksumAlgorithm: Type.Literal('sha256'),
+  checksumValue: Digest(),
+  videoDurationMs: Type.Integer({ minimum: 1, maximum: 86_400_000 }),
+  maxFrameCount: Type.Integer({ minimum: 1, maximum: 600 }),
+  maxPixels: Type.Integer({ minimum: 1, maximum: 120_000_000 }),
+}, { additionalProperties: false });
+export type ScreenTextLocalOcrSidecarMedia = Static<typeof ScreenTextLocalOcrSidecarMediaSchema>;
+
+export const ScreenTextLocalOcrSidecarFrameSchema = Type.Object({
+  frameIndex: Type.Integer({ minimum: 0, maximum: 599 }),
+  capturedAtMs: Type.Integer({ minimum: 0, maximum: 86_400_000 }),
+  width: Type.Integer({ minimum: 1, maximum: 7_680 }),
+  height: Type.Integer({ minimum: 1, maximum: 4_320 }),
+}, { additionalProperties: false });
+export type ScreenTextLocalOcrSidecarFrame = Static<typeof ScreenTextLocalOcrSidecarFrameSchema>;
+
+export const ScreenTextLocalOcrSidecarRequestSchema = Type.Object({
+  protocolVersion: ScreenTextLocalOcrSidecarProtocolVersionSchema,
+  attemptId: Uuid(),
+  requestId: Type.String({ minLength: 1, maxLength: 200 }),
+  media: ScreenTextLocalOcrSidecarMediaSchema,
+  frames: Type.Array(ScreenTextLocalOcrSidecarFrameSchema, { minItems: 1, maxItems: 600 }),
+  language: Type.String({ minLength: 1, maxLength: 20 }),
+  modelVersion: Type.String({ minLength: 1, maxLength: 120 }),
+}, { additionalProperties: false });
+export type ScreenTextLocalOcrSidecarRequest = Static<typeof ScreenTextLocalOcrSidecarRequestSchema>;
+
+export const ScreenTextLocalOcrSidecarBoxSchema = Type.Object({
+  frameIndex: Type.Integer({ minimum: 0, maximum: 599 }),
+  text: Type.String({ minLength: 1, maxLength: 500 }),
+  confidence: Type.Number({ minimum: 0, maximum: 1 }),
+  language: Type.String({ minLength: 1, maxLength: 20 }),
+  x: Type.Integer({ minimum: 0, maximum: 7_679 }),
+  y: Type.Integer({ minimum: 0, maximum: 4_319 }),
+  width: Type.Integer({ minimum: 1, maximum: 7_680 }),
+  height: Type.Integer({ minimum: 1, maximum: 4_320 }),
+  startMs: Type.Integer({ minimum: 0, maximum: 86_400_000 }),
+  endMs: Type.Integer({ minimum: 1, maximum: 86_400_000 }),
+}, { additionalProperties: false });
+export type ScreenTextLocalOcrSidecarBox = Static<typeof ScreenTextLocalOcrSidecarBoxSchema>;
+
+export const ScreenTextLocalOcrSidecarResponseSchema = Type.Object({
+  protocolVersion: ScreenTextLocalOcrSidecarProtocolVersionSchema,
+  attemptId: Uuid(),
+  requestId: Type.String({ minLength: 1, maxLength: 200 }),
+  modelVersion: Type.String({ minLength: 1, maxLength: 120 }),
+  language: Type.String({ minLength: 1, maxLength: 20 }),
+  frameCount: Type.Integer({ minimum: 0, maximum: 600 }),
+  boxes: Type.Array(ScreenTextLocalOcrSidecarBoxSchema, { maxItems: 2_000 }),
+}, { additionalProperties: false });
+export type ScreenTextLocalOcrSidecarResponse = Static<typeof ScreenTextLocalOcrSidecarResponseSchema>;
 
 export const ScreenTextPlaybackGrantSchema = Type.Object({
   assetId: Uuid(), episodeNumber: EpisodeNumber(), url: Type.String(), expiresAt: Timestamp(),

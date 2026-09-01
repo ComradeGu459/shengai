@@ -29,6 +29,7 @@ import { ScreenTextReadRepository } from './screen-text.read.repository.js';
 import { ScreenTextPlaybackRepository } from './screen-text.playback.repository.js';
 import { ScreenTextService } from './screen-text.service.js';
 import { ScreenTextWriteRepository } from './screen-text.write.repository.js';
+import { SystemControlRoutingService } from '../system-control/system-control.routing.service.js';
 
 const ProjectParams = Type.Object({ projectId: Type.String({ format: 'uuid' }) });
 const BatchParams = Type.Object({
@@ -62,12 +63,12 @@ const sendError = (reply: FastifyReply, requestId: string, error: ScreenTextDoma
   } });
 
 export const screenTextRoutes: FastifyPluginAsyncTypebox = async (app) => {
+  const routing = new SystemControlRoutingService(app.database, { asr: app.asrAdapterRegistry, screenText: app.screenTextAdapterRegistry });
   const service = new ScreenTextService(
     new ScreenTextReadRepository(app.database),
-    new ScreenTextWriteRepository(app.database, app.screenTextAdapterRegistry.defaultDescriptor),
+    new ScreenTextWriteRepository(app.database, routing, app.screenTextAdapterRegistry),
     new ScreenTextPlaybackRepository(app.database, app.uploadStorage),
     app.screenTextEvidenceStorage,
-    process.env.NODE_ENV !== 'production',
   );
   const handle = async <T>(reply: FastifyReply, requestId: string, operation: () => Promise<T>) => {
     try { return await operation(); }

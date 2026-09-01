@@ -19,7 +19,7 @@ export class ProjectLifecycleService {
     for (const target of targets) {
       const now = this.clock();
       try {
-        await this.storage.abortMultipart(target.storageUploadId);
+        await this.storage.abortMultipart({ storageUploadId: target.storageUploadId, objectKey: target.objectKey });
         const objectOutcome = await this.storage.deleteObject(target.objectKey);
         await this.repository.recordMultipartCleanup(target, { ok: true }, now);
         await this.repository.recordAudit(projectId, 'multipart_cleanup_completed', {
@@ -74,5 +74,23 @@ export class ProjectLifecycleService {
       project: result.project,
       replay: result.replay,
     };
+  }
+
+  async purge(input: {
+    projectId: string;
+    expectedVersion: number;
+    idempotencyKey: string;
+    requestHash: string;
+    actor: string;
+  }) {
+    const result = await this.repository.purge({ ...input, now: this.clock() });
+    return {
+      project: result.project,
+      replay: result.replay,
+    };
+  }
+
+  async findPurgeCommand(input: { projectId: string; idempotencyKey: string }) {
+    return this.repository.findPurgeCommand(input);
   }
 }

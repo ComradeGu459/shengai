@@ -9,7 +9,12 @@ const sameDescriptor = (left: AsrAdapterDescriptor, right: AsrAdapterDescriptor)
   && left.configDigest === right.configDigest
   && left.hotwordCapabilities.supported === right.hotwordCapabilities.supported
   && left.hotwordCapabilities.maxEntries === right.hotwordCapabilities.maxEntries
-  && left.hotwordCapabilities.maxCharacters === right.hotwordCapabilities.maxCharacters;
+  && left.hotwordCapabilities.maxCharacters === right.hotwordCapabilities.maxCharacters
+  && left.billing.billingClass === right.billing.billingClass
+  && left.billing.currency === right.billing.currency
+  && left.billing.maximumAmount === right.billing.maximumAmount
+  && left.billing.billingUnit === right.billing.billingUnit
+  && left.billing.maximumQuantity === right.billing.maximumQuantity;
 
 export class AsrAdapterRegistry {
   private readonly adapters = new Map<string, AsrAdapter>();
@@ -28,6 +33,14 @@ export class AsrAdapterRegistry {
 
   get defaultDescriptor(): Readonly<AsrAdapterDescriptor> {
     return this.adapters.get(this.defaultAdapterId)!.descriptor;
+  }
+
+  get(adapterKey: string): AsrAdapter | undefined {
+    return this.adapters.get(adapterKey);
+  }
+
+  descriptors(): ReadonlyArray<Readonly<AsrAdapterDescriptor>> {
+    return [...this.adapters.values()].map((adapter) => adapter.descriptor);
   }
 
   resolve(saved: AsrAdapterDescriptor): AsrAdapter {

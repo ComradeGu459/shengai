@@ -145,8 +145,27 @@ describe('整剧素材配对确认页', () => {
     const request = fetchMock.mock.calls[1]!;
     const body = JSON.parse(String(request[1]?.body));
     expect(body).toMatchObject({ expectedVersion: 0, rootName: '匿名测试剧' });
-    expect(body.bindings).toHaveLength(4);
-    expect(body.bindings.every((binding: Record<string, unknown>) => !('content' in binding))).toBe(true);
+    expect(body.bindings).toHaveLength(6);
+    const bindingsByEpisode = new Map<number, Array<Record<string, unknown>>>();
+    for (const binding of body.bindings as Array<Record<string, unknown>>) {
+      const episode = Number(binding.episodeNumber);
+      bindingsByEpisode.set(episode, [...(bindingsByEpisode.get(episode) ?? []), binding]);
+    }
+    expect([...bindingsByEpisode.keys()].sort()).toEqual([1, 2]);
+    for (const episode of [1, 2]) {
+      expect((bindingsByEpisode.get(episode) ?? []).map((binding) => binding.role).sort()).toEqual([
+        'asr_video', 'company_srt', 'screen_video',
+      ]);
+      const episodeVideos = (bindingsByEpisode.get(episode) ?? []).filter((binding) => binding.mediaType === 'video');
+      expect(episodeVideos).toHaveLength(2);
+      expect(episodeVideos[0]?.relativePath).toBe(episodeVideos[1]?.relativePath);
+    }
+    const videoBindings = (body.bindings as Array<Record<string, unknown>>).filter((binding) => binding.mediaType === 'video');
+    expect(new Set(videoBindings.map((binding) => binding.relativePath))).toEqual(new Set([
+      '匿名测试剧/中文视频/EP01.mp4', '匿名测试剧/中文视频/EP02.mp4',
+    ]));
+    expect(new Set(videoBindings.map((binding) => binding.relativePath)).size).toBe(2);
+    expect(JSON.stringify(body)).not.toContain('content');
     expect((request[1]?.headers as Record<string, string>)['idempotency-key']).toBeTruthy();
   });
 

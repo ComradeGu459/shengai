@@ -1,4 +1,7 @@
 import type { CreateProjectBody, Project, ProjectList } from '@qimao-terms-cloud/contracts';
+import { employeeApiFetch } from '../../platform/employeeApi.js';
+
+export const projectsQueryKey = ['projects'] as const;
 
 interface ApiFailure {
   error?: {
@@ -16,7 +19,7 @@ export const listProjects = async (search: string): Promise<ProjectList> => {
   if (search.trim()) {
     query.set('search', search.trim());
   }
-  const response = await fetch(`/api/projects?${query.toString()}`);
+  const response = await employeeApiFetch(`/api/projects?${query.toString()}`);
   if (!response.ok) {
     throw new Error(await readFailure(response));
   }
@@ -29,7 +32,7 @@ export interface CreateProjectRequest {
 }
 
 export const createProject = async ({ body, idempotencyKey }: CreateProjectRequest): Promise<Project> => {
-  const response = await fetch('/api/projects', {
+  const response = await employeeApiFetch('/api/projects', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',

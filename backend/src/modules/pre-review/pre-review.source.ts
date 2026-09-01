@@ -7,7 +7,7 @@ import type { UploadStorage } from '../uploads/upload-storage.js';
 import { TermSourceRepository } from '../terms/term-source.repository.js';
 import { TermSourceService } from '../terms/term-source.service.js';
 import { preReviewConflict, preReviewInvalid, preReviewNotFound } from './pre-review.errors.js';
-import { PRE_EDIT_ALGORITHM_VERSION, PRE_EDIT_FORMAT_POLICY_VERSION, sha256 } from './pre-review.domain.js';
+import { sha256 } from './pre-review.domain.js';
 
 interface ProjectRow extends QueryResultRow {
   id: string;
@@ -56,6 +56,14 @@ export interface PreReviewEpisodeSource {
   };
 }
 
+export interface PreReviewScreenTextReleaseSource {
+  id: string;
+  version: number;
+  releaseDigest: string;
+  partial: boolean;
+  excludedEpisodes: Array<Record<string, unknown>>;
+}
+
 export interface PreReviewSourceSnapshot {
   projectId: string;
   projectVersion: number;
@@ -66,6 +74,7 @@ export interface PreReviewSourceSnapshot {
   algorithmVersion: string;
   formatPolicyVersion: string;
   sourceDigest: string;
+  screenTextRelease: PreReviewScreenTextReleaseSource;
   episodes: PreReviewEpisodeSource[];
 }
 
@@ -78,6 +87,7 @@ const sourceDigest = (snapshot: Omit<PreReviewSourceSnapshot, 'sourceDigest'>) =
   manifestVersion: snapshot.manifestVersion,
   algorithmVersion: snapshot.algorithmVersion,
   formatPolicyVersion: snapshot.formatPolicyVersion,
+  screenTextRelease: snapshot.screenTextRelease,
   episodes: snapshot.episodes,
 }));
 
@@ -119,7 +129,10 @@ export class PreReviewSourceService {
       throw preReviewConflict('PRE_EDIT_TERM_VERSION_STALE', '必须使用当前最新已确认术语版本创建审改会话。', 'confirm_terms');
     }
     const termVersion = await this.pool.query<{ source_srt_set_digest: string }>(
-      'SELECT source_srt_set_digest FROM term_versions WHERE id = $1',
+      `SELECT version.source_srt_set_digest
+         FROM term_versions version
+         JOIN term_drafts draft ON draft.id = version.draft_id
+        WHERE version.id = $1 AND draft.status = 'confirmed'`,
       [termVersionId],
     );
     if (termVersion.rows[0]?.source_srt_set_digest !== ready.state.sourceSrtSetDigest) {
@@ -156,7 +169,7 @@ export class PreReviewSourceService {
            JOIN videos video ON video.episode_number = result.episode_number
                             AND video.video_asset_id = result.asset_id
       LEFT JOIN asr_usage usage ON usage.attempt_id = result.attempt_id
-          WHERE result.project_id = $1 AND result.term_version_id = $4
+          WHERE result.project_id = $1 AND result.term_version_id = $4 AND job.status = 'completed'
             AND result.quality_status IN ('pass', 'warning')
           GROUP BY result.episode_number, result.id, batch.id, usage.media_duration_ms
           ORDER BY result.episode_number, result.created_at DESC, result.id DESC
@@ -214,6 +227,39 @@ export class PreReviewSourceService {
     if (!episodes.some((episode) => episode.asr)) {
       throw preReviewInvalid('PRE_EDIT_SOURCE_NOT_READY', '当前术语版本下没有任何可用 ASR 结果。', 'run_asr');
     }
+    const screenText = await this.pool.query<{
+      id: string; version: number; release_digest: string; manifest_id: string; term_version_id: string;
+      partial: boolean; excluded_episodes: unknown;
+    }>(
+      `SELECT id, version, release_digest, manifest_id, term_version_id, partial, excluded_episodes
+         FROM screen_text_releases
+        WHERE project_id = $1
+        ORDER BY version DESC, id DESC
+        LIMIT 1`,
+      [projectId],
+    );
+    const screenTextRow = screenText.rows[0];
+    if (!screenTextRow) {
+      throw preReviewInvalid('PRE_EDIT_SOURCE_NOT_READY', '当前项目没有已发布画面字 Release。', 'publish_screen_text_release');
+    }
+    if (screenTextRow.manifest_id !== ready.state.manifestId || screenTextRow.term_version_id !== termVersionId) {
+      throw preReviewConflict('PRE_EDIT_SOURCE_CHANGED', '已发布画面字 Release 与当前术语或素材来源不一致。', 'publish_screen_text_release');
+    }
+    const screenTextRelease: PreReviewScreenTextReleaseSource = {
+      id: screenTextRow.id,
+      version: screenTextRow.version,
+      releaseDigest: screenTextRow.release_digest,
+      partial: screenTextRow.partial,
+      excludedEpisodes: Array.isArray(screenTextRow.excluded_episodes) ? screenTextRow.excluded_episodes.map((item: any) => ({
+        episodeNumber: item.episodeNumber,
+        jobId: item.jobId,
+        status: item.status,
+        attemptId: item.attemptId ?? null,
+        errorCode: item.errorCode ?? null,
+        effectClass: item.effectClass ?? null,
+        providerRequestId: item.providerRequestId ?? null,
+      })) : [],
+    };
     const identity = {
       projectId,
       projectVersion: row.version,
@@ -221,8 +267,9 @@ export class PreReviewSourceService {
       termVersionId,
       manifestId: ready.state.manifestId,
       manifestVersion: row.manifest_version,
-      algorithmVersion: PRE_EDIT_ALGORITHM_VERSION,
-      formatPolicyVersion: PRE_EDIT_FORMAT_POLICY_VERSION,
+      algorithmVersion: 'strategy-bound',
+      formatPolicyVersion: 'strategy-bound',
+      screenTextRelease,
       episodes,
     };
     return { ...identity, sourceDigest: sourceDigest(identity) };

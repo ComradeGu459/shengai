@@ -20,9 +20,10 @@ interface SessionRow extends QueryResultRow {
   part_size_bytes: string;
   total_parts: number;
   storage_upload_id: string;
+  transport_kind: UploadSession['transportKind'];
   file_fingerprint: string;
   checksum_algorithm: 'sha256';
-  checksum_value: string;
+  checksum_value: string | null;
   status: UploadSession['status'];
   expires_at: Date;
   error_code: string | null;
@@ -83,6 +84,9 @@ interface ManifestSlotRow extends QueryResultRow {
   media_type: UploadSession['mediaKind'];
   asset_id: string | null;
   active_upload_id: string | null;
+  active_upload_transport_kind: UploadSession['transportKind'] | null;
+  active_upload_status: UploadSession['status'] | null;
+  active_upload_has_parts: boolean | null;
 }
 
 export interface InternalUploadSession extends UploadSession {
@@ -98,7 +102,8 @@ export class UploadSessionExpiredError extends Error {}
 export class UploadMaterialBindingError extends Error {
   constructor(
     readonly code: 'MATERIAL_UPLOAD_BINDING_INVALID' | 'MATERIAL_MANIFEST_VERSION_CONFLICT'
-      | 'MATERIAL_SLOT_ALREADY_BOUND' | 'MATERIAL_SLOT_UPLOAD_ACTIVE' | 'FILE_FINGERPRINT_MISMATCH',
+      | 'MATERIAL_SLOT_ALREADY_BOUND' | 'MATERIAL_SLOT_UPLOAD_ACTIVE' | 'FILE_FINGERPRINT_MISMATCH'
+      | 'UPLOAD_REPLACEMENT_UNSAFE',
     message: string,
   ) {
     super(message);
@@ -108,6 +113,7 @@ export class UploadMaterialBindingError extends Error {
 const sessionColumns = `
   id, project_id, object_key, original_filename, media_kind, size_bytes,
   part_size_bytes, total_parts, storage_upload_id, file_fingerprint,
+  transport_kind,
   checksum_algorithm, checksum_value, status, expires_at, error_code,
   error_detail, version, asset_id
 `;
@@ -172,9 +178,11 @@ const loadSession = async (client: PoolClient, uploadId: string): Promise<Intern
       }
     : null;
   const confirmedNumbers = new Set(confirmedParts.map((part) => part.partNumber));
-  return {
+  const session: InternalUploadSession = {
     id: row.id,
     storageUploadId: row.storage_upload_id,
+    transportKind: row.transport_kind,
+    tusEndpoint: row.transport_kind === 'tus' ? '/api/uploads/tus' : null,
     projectId: row.project_id,
     objectKey: row.object_key,
     originalFileName: row.original_filename,
@@ -196,6 +204,8 @@ const loadSession = async (client: PoolClient, uploadId: string): Promise<Intern
     asset,
     materialBinding,
   };
+  Object.defineProperty(session, 'storageUploadId', { value: row.storage_upload_id, enumerable: row.transport_kind === 'tus' });
+  return session;
 };
 
 const validateMaterialBinding = async (
@@ -207,6 +217,7 @@ const validateMaterialBinding = async (
     sizeBytes: number;
     fileFingerprint: string;
     materialBinding: UploadMaterialBindingIntent;
+    replaceUploadId?: string;
   },
 ) => {
   const slotResult = await client.query<ManifestSlotRow>(
@@ -218,7 +229,10 @@ const validateMaterialBinding = async (
             ) AS is_latest,
             slot.episode_number, slot.role, slot.file_name, slot.size_bytes,
             slot.fingerprint, slot.media_type, asset_binding.asset_id,
-            active_upload.id AS active_upload_id
+            active_upload.id AS active_upload_id,
+            active_upload.transport_kind AS active_upload_transport_kind,
+            active_upload.status AS active_upload_status,
+            active_upload.has_parts AS active_upload_has_parts
        FROM material_manifests manifest
        JOIN material_manifest_bindings slot ON slot.manifest_id = manifest.id
        LEFT JOIN material_asset_bindings asset_binding
@@ -226,7 +240,11 @@ const validateMaterialBinding = async (
         AND asset_binding.episode_number = slot.episode_number
         AND asset_binding.role = slot.role
        LEFT JOIN LATERAL (
-         SELECT upload.id
+         SELECT upload.id, upload.transport_kind, upload.status,
+                EXISTS (
+                  SELECT 1 FROM upload_parts part
+                   WHERE part.upload_session_id = upload.id
+                ) AS has_parts
            FROM upload_session_material_targets target
            JOIN upload_sessions upload ON upload.id = target.upload_session_id
           WHERE target.manifest_id = slot.manifest_id
@@ -264,6 +282,13 @@ const validateMaterialBinding = async (
       '同一物理文件必须一次覆盖最新清单中共享该文件的全部角色。',
     );
   }
+  const activeUploadIds = new Set(selected.flatMap((slot) => slot.active_upload_id ? [slot.active_upload_id] : []));
+  if (input.replaceUploadId && (activeUploadIds.size !== 1 || !activeUploadIds.has(input.replaceUploadId))) {
+    throw new UploadMaterialBindingError(
+      'UPLOAD_REPLACEMENT_UNSAFE',
+      '指定的旧上传会话不是当前素材槽唯一的活动上传。',
+    );
+  }
   for (const slot of selected) {
     if (slot.file_name !== input.originalFileName || Number(slot.size_bytes) !== input.sizeBytes
       || slot.media_type !== input.mediaKind) {
@@ -273,9 +298,57 @@ const validateMaterialBinding = async (
       throw new UploadMaterialBindingError('MATERIAL_SLOT_ALREADY_BOUND', '该素材槽位已经绑定已校验文件，无需重复上传。');
     }
     if (slot.active_upload_id) {
-      throw new UploadMaterialBindingError('MATERIAL_SLOT_UPLOAD_ACTIVE', '该素材槽位已有进行中的上传任务。');
+      const replaceable = input.replaceUploadId === slot.active_upload_id
+        && slot.active_upload_transport_kind === 'tus'
+        && slot.active_upload_status === 'created'
+        && slot.active_upload_has_parts === false;
+      if (!replaceable) {
+        throw new UploadMaterialBindingError('MATERIAL_SLOT_UPLOAD_ACTIVE', '该素材槽位已有进行中的上传任务。');
+      }
     }
   }
+  if (!input.replaceUploadId) return null;
+
+  const locked = await client.query<{ id: string }>(
+    `SELECT id FROM upload_sessions
+      WHERE id = $1 AND project_id = $2 AND transport_kind = 'tus'
+        AND status = 'created' AND asset_id IS NULL
+        AND original_filename = $3 AND media_kind = $4
+        AND size_bytes = $5 AND file_fingerprint = $6
+        AND NOT EXISTS (
+          SELECT 1 FROM upload_parts part WHERE part.upload_session_id = upload_sessions.id
+        )
+      FOR UPDATE`,
+    [input.replaceUploadId, input.projectId, input.originalFileName, input.mediaKind,
+      input.sizeBytes, input.fileFingerprint],
+  );
+  if (!locked.rows[0]) {
+    throw new UploadMaterialBindingError(
+      'UPLOAD_REPLACEMENT_UNSAFE',
+      '旧上传会话已有进度、状态已变化或不属于当前文件，不能安全替换。',
+    );
+  }
+  const replacement = await loadSession(client, input.replaceUploadId);
+  const expectedTargets = [...input.materialBinding.targets]
+    .sort((left, right) => left.episodeNumber - right.episodeNumber || left.role.localeCompare(right.role));
+  const actualTargets = [...(replacement?.materialBinding?.targets ?? [])]
+    .sort((left, right) => left.episodeNumber - right.episodeNumber || left.role.localeCompare(right.role));
+  if (!replacement || replacement.materialBinding?.manifestId !== input.materialBinding.manifestId
+    || JSON.stringify(actualTargets) !== JSON.stringify(expectedTargets)) {
+    throw new UploadMaterialBindingError(
+      'UPLOAD_REPLACEMENT_UNSAFE',
+      '旧上传会话的素材清单身份与本次上传不一致。',
+    );
+  }
+  await client.query(
+    `UPDATE upload_sessions
+        SET status = 'aborted', version = version + 1,
+            error_code = 'UPLOAD_TRANSPORT_SUPERSEDED', error_detail = NULL,
+            updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1`,
+    [input.replaceUploadId],
+  );
+  return replacement.storageUploadId;
 };
 
 const lockSessionAndProject = async (
@@ -322,6 +395,66 @@ export class UploadRepository {
     const client = await this.pool.connect();
     try {
       return await loadSession(client, uploadId);
+    } finally {
+      client.release();
+    }
+  }
+
+  async findByStorageUploadId(storageUploadId: string) {
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query<{ id: string }>(
+        'SELECT id FROM upload_sessions WHERE storage_upload_id = $1',
+        [storageUploadId],
+      );
+      const row = result.rows[0];
+      return row ? await loadSession(client, row.id) : null;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * 按 create_upload 的全局 Idempotency-Key 读取已提交事实。
+   * 项目条件是数据隔离门：同一 key 属于其它项目时返回 null，不能泄露
+   * upload/session 身份；此读取不扫描项目上传列表，也不产生写副作用。
+   */
+  async findCreateCommand(projectId: string, commandId: string) {
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query<{ upload_session_id: string }>(
+        `SELECT command.upload_session_id
+           FROM upload_commands command
+           JOIN upload_sessions session ON session.id = command.upload_session_id
+          WHERE command.idempotency_key = $1
+            AND command.command_kind = 'create_upload'
+            AND session.project_id = $2`,
+        [commandId, projectId],
+      );
+      const row = result.rows[0];
+      return row ? await loadSession(client, row.upload_session_id) : null;
+    } finally {
+      client.release();
+    }
+  }
+
+  /** POST create_upload 在触达 provider 前读取同一命令，避免响应丢失后的第二个 multipart。 */
+  async findCreateCommandDetails(projectId: string, commandId: string) {
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query<{ request_hash: string; upload_session_id: string }>(
+        `SELECT command.request_hash, command.upload_session_id
+           FROM upload_commands command
+           JOIN upload_sessions session ON session.id = command.upload_session_id
+          WHERE command.idempotency_key = $1
+            AND command.command_kind = 'create_upload'
+            AND session.project_id = $2`,
+        [commandId, projectId],
+      );
+      const row = result.rows[0];
+      if (!row) return null;
+      const session = await loadSession(client, row.upload_session_id);
+      return session ? { requestHash: row.request_hash, session } : null;
     } finally {
       client.release();
     }
@@ -382,9 +515,11 @@ export class UploadRepository {
     totalParts: number;
     storageUploadId: string;
     fileFingerprint: string;
-    checksumValue: string;
+    checksumValue: string | null;
+    transportKind: UploadSession['transportKind'];
     expiresAt: Date;
     materialBinding?: UploadMaterialBindingIntent;
+    replaceUploadId?: string;
   }) {
     const client = await this.pool.connect();
     try {
@@ -403,7 +538,7 @@ export class UploadRepository {
         const session = await loadSession(client, command.upload_session_id);
         if (!session) throw new Error('幂等上传会话不存在。');
         await client.query('COMMIT');
-        return { session, created: false };
+        return { session, created: false, supersededTusStorageUploadId: null };
       }
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`material-upload:${input.projectId}`]);
       const projectResult = await client.query<{ lifecycle_status: string }>(
@@ -413,26 +548,34 @@ export class UploadRepository {
       if (projectResult.rows[0]?.lifecycle_status !== 'active') {
         throw new UploadProjectInactiveError('项目当前不可继续上传素材。');
       }
-      if (input.materialBinding) {
-        await validateMaterialBinding(client, {
+      if (input.replaceUploadId && (!input.materialBinding || input.transportKind !== 'multipart')) {
+        throw new UploadMaterialBindingError(
+          'UPLOAD_REPLACEMENT_UNSAFE',
+          '旧会话替换只允许用于带素材清单身份的 multipart 上传。',
+        );
+      }
+      const supersededTusStorageUploadId = input.materialBinding
+        ? await validateMaterialBinding(client, {
           projectId: input.projectId,
           originalFileName: input.originalFileName,
           mediaKind: input.mediaKind,
           sizeBytes: input.sizeBytes,
           fileFingerprint: input.fileFingerprint,
           materialBinding: input.materialBinding,
-        });
-      }
+          ...(input.replaceUploadId ? { replaceUploadId: input.replaceUploadId } : {}),
+        })
+        : null;
       const inserted = await client.query<SessionRow>(
         `INSERT INTO upload_sessions
            (project_id, object_key, original_filename, media_kind, size_bytes,
             part_size_bytes, total_parts, storage_upload_id, file_fingerprint,
+            transport_kind,
             checksum_algorithm, checksum_value, expires_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'sha256',$10,$11)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'sha256',$11,$12)
          RETURNING ${sessionColumns}`,
         [input.projectId, input.objectKey, input.originalFileName, input.mediaKind,
           input.sizeBytes, input.partSizeBytes, input.totalParts, input.storageUploadId,
-          input.fileFingerprint, input.checksumValue, input.expiresAt],
+          input.fileFingerprint, input.transportKind, input.checksumValue, input.expiresAt],
       );
       const row = inserted.rows[0];
       if (!row) throw new Error('上传会话写入后未返回记录。');
@@ -457,7 +600,7 @@ export class UploadRepository {
       const session = await loadSession(client, row.id);
       if (!session) throw new Error('上传会话写入后无法读取。');
       await client.query('COMMIT');
-      return { session, created: true };
+      return { session, created: true, supersededTusStorageUploadId };
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
@@ -612,11 +755,26 @@ export class UploadRepository {
         if (state.lifecycle_status !== 'active') {
           throw new UploadProjectInactiveError('项目当前不可继续上传素材。');
         }
-        if (replay.status !== 'completing' && replay.status !== 'failed') {
+        if (replay.status !== 'verifying' && replay.status !== 'failed') {
           throw new UploadStateConflictError('当前上传状态不能恢复完成。');
         }
+        if (replay.status === 'failed') {
+          await client.query(
+            `UPDATE upload_completion_jobs
+                SET status = 'scheduled', lease_owner = NULL, lease_expires_at = NULL,
+                    next_attempt_at = CURRENT_TIMESTAMP, completed_at = NULL, updated_at = CURRENT_TIMESTAMP
+              WHERE upload_session_id = $1 AND idempotency_key = $2
+                AND status IN ('retryable', 'failed')`,
+            [input.uploadId, input.idempotencyKey],
+          );
+          await client.query(
+            `UPDATE upload_sessions SET status = 'verifying', version = version + 1,
+                error_code = NULL, error_detail = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+            [input.uploadId],
+          );
+        }
         await client.query('COMMIT');
-        return { session: replay, replay: false, recovery: true };
+        return { session: replay.status === 'failed' ? await loadSession(client, input.uploadId) : replay, replay: false, recovery: true };
       }
       if (state.lifecycle_status !== 'active') {
         throw new UploadProjectInactiveError('项目当前不可继续上传素材。');
@@ -624,8 +782,11 @@ export class UploadRepository {
       const session = await loadSession(client, input.uploadId);
       if (!session) throw new Error('锁定后上传会话不存在。');
       if (session.version !== input.expectedVersion) throw new UploadVersionConflictError('上传会话版本已变化。');
-      if (!['created', 'uploading', 'failed'].includes(session.status)) {
+      if (!['created', 'uploading'].includes(session.status)) {
         throw new UploadStateConflictError('当前上传状态不能完成。');
+      }
+      if (session.transportKind !== 'multipart') {
+        throw new UploadStateConflictError('TUS 会话必须由兼容完成链处理。');
       }
       if (session.missingPartNumbers.length) {
         await client.query('COMMIT');
@@ -638,7 +799,13 @@ export class UploadRepository {
         [input.idempotencyKey, input.requestHash, input.uploadId],
       );
       await client.query(
-        `UPDATE upload_sessions SET status = 'completing', version = version + 1,
+        `INSERT INTO upload_completion_jobs
+           (upload_session_id, idempotency_key, request_hash, status, stage, next_attempt_at)
+         VALUES ($1, $2, $3, 'scheduled', 'queued', CURRENT_TIMESTAMP)`,
+        [input.uploadId, input.idempotencyKey, input.requestHash],
+      );
+      await client.query(
+        `UPDATE upload_sessions SET status = 'verifying', version = version + 1,
             error_code = NULL, error_detail = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
         [input.uploadId],
       );
@@ -654,7 +821,60 @@ export class UploadRepository {
     }
   }
 
-  async complete(input: { uploadId: string; idempotencyKey: string; requestHash: string }) {
+  /** 兼容既有 tus 完成链：不创建 multipart completion job，仍使用同一 command/Asset 事务。 */
+  async prepareTusCompletion(input: { uploadId: string; idempotencyKey: string; requestHash: string; expectedVersion: number }) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`upload:${input.uploadId}`]);
+      const state = await lockSessionAndProject(client, input.uploadId);
+      if (!state) {
+        await client.query('COMMIT');
+        return { session: null, replay: false };
+      }
+      const commandResult = await client.query<CommandRow>(
+        `SELECT command_kind, request_hash, upload_session_id FROM upload_commands WHERE idempotency_key = $1`,
+        [input.idempotencyKey],
+      );
+      const command = commandResult.rows[0];
+      if (command) {
+        if (command.command_kind !== 'complete_upload' || command.request_hash !== input.requestHash || command.upload_session_id !== input.uploadId) {
+          throw new UploadIdempotencyConflictError('该幂等键已用于另一上传命令。');
+        }
+        const replay = await loadSession(client, input.uploadId);
+        if (!replay) throw new Error('幂等上传会话不存在。');
+        await client.query('COMMIT');
+        return { session: replay, replay: replay.status === 'completed' };
+      }
+      if (state.lifecycle_status !== 'active') throw new UploadProjectInactiveError('项目当前不可继续上传素材。');
+      const session = await loadSession(client, input.uploadId);
+      if (!session) throw new Error('锁定后上传会话不存在。');
+      if (session.version !== input.expectedVersion) throw new UploadVersionConflictError('上传会话版本已变化。');
+      if (session.transportKind !== 'tus' || !['created', 'uploading'].includes(session.status)) {
+        throw new UploadStateConflictError('当前上传状态不能完成。');
+      }
+      await client.query(
+        `INSERT INTO upload_commands (idempotency_key, command_kind, request_hash, upload_session_id)
+         VALUES ($1, 'complete_upload', $2, $3)`,
+        [input.idempotencyKey, input.requestHash, input.uploadId],
+      );
+      await client.query(
+        `UPDATE upload_sessions SET status = 'verifying', version = version + 1,
+            error_code = NULL, error_detail = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [input.uploadId],
+      );
+      const prepared = await loadSession(client, input.uploadId);
+      await client.query('COMMIT');
+      return { session: prepared, replay: false };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async complete(input: { uploadId: string; idempotencyKey: string; requestHash: string; checksumValue: string }) {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -683,7 +903,7 @@ export class UploadRepository {
         await client.query('COMMIT');
         return completed;
       }
-      if (session.status !== 'completing' && session.status !== 'failed') {
+      if (session.status !== 'verifying' && session.status !== 'failed') {
         throw new UploadStateConflictError('当前上传状态不能落账完成。');
       }
       const assetResult = await client.query<AssetRow>(
@@ -694,15 +914,15 @@ export class UploadRepository {
          RETURNING id, project_id, object_key, original_filename, media_kind,
                    size_bytes, checksum_algorithm, checksum_value, verified_at`,
         [session.project_id, session.object_key, session.original_filename, session.media_kind,
-          session.size_bytes, session.checksum_value],
+          session.size_bytes, input.checksumValue],
       );
       const asset = assetResult.rows[0];
       if (!asset) throw new Error('素材写入后未返回记录。');
       await client.query(
-        `UPDATE upload_sessions SET status = 'completed', asset_id = $2,
+        `UPDATE upload_sessions SET status = 'completed', checksum_value = $3, asset_id = $2,
             version = version + 1, error_code = NULL, error_detail = NULL,
             updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
-        [input.uploadId, asset.id],
+        [input.uploadId, asset.id, input.checksumValue],
       );
       const targetCount = await client.query<{ count: string }>(
         `SELECT COUNT(*) AS count FROM upload_session_material_targets
@@ -780,7 +1000,7 @@ export class UploadRepository {
         `UPDATE upload_sessions SET status = 'failed',
             version = CASE WHEN status = 'failed' THEN version ELSE version + 1 END,
             error_code = $2, error_detail = $3, updated_at = CURRENT_TIMESTAMP
-          WHERE id = $1 AND status IN ('completing', 'failed')`,
+          WHERE id = $1 AND status IN ('verifying', 'failed')`,
         [uploadId, code, detail],
       );
       if (result.rowCount) await recomputeProjectWorkflowStatus(client, projectId);

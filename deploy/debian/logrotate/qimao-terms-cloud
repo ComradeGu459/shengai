@@ -1,0 +1,11 @@
+/var/log/qimao-terms-cloud/*.log {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su qimao qimao
+    create 0640 qimao qimao
+}

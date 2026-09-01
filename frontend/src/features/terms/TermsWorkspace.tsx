@@ -7,9 +7,10 @@ FORM: Operate 高密度工作台，继承冷灰/白/靛青外壳，不引入术�
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { PublishTermVersionBody, TermCandidate, TermCandidateStatus, TermType } from '@qimao-terms-cloud/contracts';
 import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
-import { Link, useParams } from 'react-router';
+import { Link, useNavigate, useParams } from 'react-router';
 
 import { projectModules } from '../../modules.js';
+import { createUuid } from '../../platform/randomUuid.js';
 import { getProjectMaterialState } from '../materials/api.js';
 import {
   batchDecideTerms,
@@ -44,7 +45,7 @@ type FailedCandidate = { candidate: TermCandidate; action: 'approve' | 'reject' 
 type PublishIntent = { signature: string; key: string; body: PublishTermVersionBody };
 
 const newIntent = (current: { signature: string; key: string } | null, signature: string) =>
-  current?.signature === signature ? current : { signature, key: crypto.randomUUID() };
+  current?.signature === signature ? current : { signature, key: createUuid() };
 
 const invalidateTerms = async (queryClient: ReturnType<typeof useQueryClient>, projectId: string) => {
   await Promise.all([
@@ -68,6 +69,7 @@ const RequestError = ({ error, retry }: { error: Error; retry?: () => void }) =>
 
 export const TermsWorkspace = () => {
   const { projectId = '' } = useParams();
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [search, setSearch] = useState('');
   const [status, setStatus] = useState<TermCandidateStatus | ''>('');
@@ -304,7 +306,7 @@ export const TermsWorkspace = () => {
         templateVersionId: activeTemplate.id,
       };
       const signature = JSON.stringify(publishBody);
-      publishIntent.current = { signature, key: crypto.randomUUID(), body: publishBody };
+      publishIntent.current = { signature, key: createUuid(), body: publishBody };
       const released = await publishTermVersion({
         projectId,
         body: publishIntent.current.body,
@@ -329,6 +331,7 @@ export const TermsWorkspace = () => {
       setResultMessage(`术语 V${result.version.version} 已创建，并按 ${result.exported.templateName} · V${result.exported.templateVersion} 生成 XLSX。`);
       setSelectedVersionId(result.version.id);
       await invalidateTerms(queryClient, projectId);
+      navigate(`/projects/${projectId}/asr`);
     },
     onError: async (error) => {
       if (!(error instanceof TermApiError) || error.retryable) return;
@@ -391,7 +394,6 @@ export const TermsWorkspace = () => {
         <div><span>待确认</span><strong>{draft?.pendingCount ?? 0} 项</strong></div>
         <div><span>当前模板</span><strong>{activeTemplate ? `${activeTemplate.name} · V${activeTemplate.version}` : '未配置'}</strong></div>
         <button ref={templateTriggerRef as RefObject<HTMLButtonElement>} type="button" onClick={() => setTemplateOpen(true)}>{writable ? '管理模板' : '查看模板'}</button>
-        {draft && draft.pendingCount === 0 && canConfirm && <button ref={confirmTriggerRef as RefObject<HTMLButtonElement>} className={styles.primaryButton} type="button" onClick={(event) => openConfirm(event.currentTarget)}>确认并导出</button>}
       </section>
 
       {!lifecycleReady && <div className={styles.pageNotice} role="alert"><div><strong>项目当前不可编辑</strong><p>项目已进入回收或清理生命周期，术语页只保留后端历史事实。</p></div></div>}
@@ -430,6 +432,17 @@ export const TermsWorkspace = () => {
 
       {draft && (
         <>
+          <section className={styles.workflowNext} aria-label="术语审核最终流程">
+            <div>
+              <strong>最终流程：生成术语版本并进入中文识别</strong>
+              <p>{draft.pendingCount > 0 ? `还需裁决 ${draft.pendingCount} 项，完成后才能生成不可变版本。` : '当前草稿已无待确认项，可生成不可变版本并进入中文识别。'}</p>
+            </div>
+            {draft.pendingCount > 0 ? (
+              <button type="button" disabled={!writable} onClick={() => { setSearch(''); setType(''); setStatus('pending'); setPage(0); }}>查看待确认项</button>
+            ) : (
+              <button ref={confirmTriggerRef as RefObject<HTMLButtonElement>} className={styles.primaryButton} type="button" disabled={!canConfirm} onClick={(event) => openConfirm(event.currentTarget)}>生成术语版本并进入中文识别</button>
+            )}
+          </section>
           {writable && (selected.length || allPendingSelected) ? (
             <div className={styles.batchBar}>
               <div><strong>{allPendingSelected ? `已选择全部 ${draft.pendingCount} 项待确认候选` : `已选择当前页 ${selected.length} 项`}</strong><span>{allPendingSelected ? '范围独立于当前搜索与筛选。' : '逐项保存，局部失败不会回滚已成功项。'}</span></div>
@@ -505,7 +518,7 @@ export const TermsWorkspace = () => {
         title={allPendingSelected ? '全部采用并导出 XLSX？' : '确认当前草稿并导出？'}
         description={`${workspace.data.source.episodeCount} 集公司 SRT · ${allPendingSelected ? `${draft.pendingCount} 项待确认将逐项采用` : '当前没有待确认项'}。`}
         detail={`将创建不可变术语 V${(workspace.data.latestVersion?.version ?? 0) + 1}，并绑定 ${activeTemplate.name} · V${activeTemplate.version}。任一候选失败时不会创建版本或文件。`}
-        confirmLabel={allPendingSelected ? '全部采用并导出 XLSX' : '确认并导出'}
+        confirmLabel={allPendingSelected ? '全部采用并导出 XLSX' : '生成术语版本并进入中文识别'}
         pending={confirmMutation.isPending}
         error={confirmMutation.error}
         returnFocus={confirmTriggerRef}

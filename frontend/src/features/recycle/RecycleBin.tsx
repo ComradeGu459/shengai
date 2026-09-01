@@ -3,290 +3,123 @@ import { useDeferredValue, useEffect, useRef, useState } from 'react';
 import type { CleanupJobStatus, RecycleBinItem, RecycleBinQuery } from '@qimao-terms-cloud/contracts';
 
 import { RetryIcon, SearchIcon } from '../../components/Icons.js';
-import { listRecycleBin, RecycleApiError, restoreProject } from './api.js';
+import { createUuid } from '../../platform/randomUuid.js';
+import { findPurgeCommand, listAllRecycleBin, listRecycleBin, purgeProject, RecycleApiError, restoreProject } from './api.js';
 import styles from './RecycleBin.module.css';
 
 type LifecycleFilter = '' | 'recycled' | 'purging';
 type CleanupFilter = '' | CleanupJobStatus;
 type SortBy = NonNullable<RecycleBinQuery['sortBy']>;
 type SortDirection = NonNullable<RecycleBinQuery['sortDirection']>;
+type BatchItemState = 'queued' | 'submitting' | 'checking' | 'accepted' | 'failed';
+interface SinglePurgeIntent { item: RecycleBinItem; idempotencyKey: string; typedName: string; acknowledged: boolean; }
+interface BatchPurgeIntent { snapshot: RecycleBinItem[]; nonprocessableCount: number; typedName: string; acknowledged: boolean; }
+interface BatchProgress { items: Array<{ item: RecycleBinItem; state: BatchItemState; commandId?: string; error?: RecycleApiError | undefined }>; running: boolean; }
 
-const dateFormatter = new Intl.DateTimeFormat('zh-CN', {
-  year: 'numeric',
-  month: '2-digit',
-  day: '2-digit',
-  hour: '2-digit',
-  minute: '2-digit',
-  hour12: false,
-});
-
+const dateFormatter = new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
 const formatDate = (value: string) => dateFormatter.format(new Date(value));
-
+const focusable = 'button:not([disabled]), input:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])';
 const formatRemaining = (expiresAt: string) => {
   const milliseconds = new Date(expiresAt).getTime() - Date.now();
   if (milliseconds <= 0) return '已到截止时间，等待后台处理';
-  const totalMinutes = Math.ceil(milliseconds / 60_000);
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
+  const totalMinutes = Math.ceil(milliseconds / 60_000); const hours = Math.floor(totalMinutes / 60); const minutes = totalMinutes % 60;
   if (hours >= 24) return `剩余 ${Math.floor(hours / 24)} 天 ${hours % 24} 小时`;
-  if (hours > 0) return `剩余 ${hours} 小时 ${minutes} 分钟`;
-  return `剩余 ${minutes} 分钟`;
+  return hours > 0 ? `剩余 ${hours} 小时 ${minutes} 分钟` : `剩余 ${minutes} 分钟`;
 };
-
 const statusPresentation = (item: RecycleBinItem) => {
-  if (item.lifecycleStatus === 'recycled') {
-    return { label: '已回收', className: styles.recycled, description: '仍在后端恢复窗口内' };
-  }
-  if (item.cleanupJob.status === 'retryable') {
-    return { label: '等待后台重试', className: styles.retryable, description: '清理失败，系统将按计划重试' };
-  }
-  if (item.cleanupJob.status === 'failed') {
-    return { label: '清理最终失败', className: styles.failed, description: '清理未完成，等待系统处理' };
-  }
+  if (item.lifecycleStatus === 'recycled') return { label: '已回收', className: styles.recycled, description: '仍在后端恢复窗口内' };
+  if (item.cleanupJob.status === 'retryable') return { label: '等待后台重试', className: styles.retryable, description: '清理失败，系统将按计划重试' };
+  if (item.cleanupJob.status === 'failed') return { label: '清理最终失败', className: styles.failed, description: '清理未完成，等待系统处理' };
   return { label: '清理中', className: styles.purging, description: '后台已开始处理，项目不可恢复' };
+};
+const snapshotIdentity = (items: RecycleBinItem[]) => items.map((item) => `${item.id}:${item.version}`).sort().join('|');
+const errorDetails = (error: unknown) => error instanceof RecycleApiError ? error : new RecycleApiError(error instanceof Error ? error.message : '请求未完成。');
+const trapFocus = (event: React.KeyboardEvent<HTMLElement>, container: HTMLElement | null, locked: boolean) => {
+  if (event.key !== 'Tab' || !container) return;
+  if (locked) { event.preventDefault(); container.focus(); return; }
+  const nodes = Array.from(container.querySelectorAll<HTMLElement>(focusable)); const first = nodes[0]; const last = nodes.at(-1);
+  if (!first || !last) { event.preventDefault(); container.focus(); return; }
+  if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+  if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
 };
 
 export const RecycleBin = () => {
   const queryClient = useQueryClient();
-  const [search, setSearch] = useState('');
-  const [lifecycleStatus, setLifecycleStatus] = useState<LifecycleFilter>('');
-  const [cleanupJobStatus, setCleanupJobStatus] = useState<CleanupFilter>('');
-  const [sortBy, setSortBy] = useState<SortBy>('recycleExpiresAt');
-  const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
-  const [notice, setNotice] = useState('');
-  const deferredSearch = useDeferredValue(search);
-  const restoreIntents = useRef(new Map<string, { version: number; idempotencyKey: string }>());
-  const previousPurging = useRef<{
-    signature: string;
-    isCompleteResult: boolean;
-    items: Map<string, string>;
-  } | null>(null);
+  const [search, setSearch] = useState(''); const [lifecycleStatus, setLifecycleStatus] = useState<LifecycleFilter>(''); const [cleanupJobStatus, setCleanupJobStatus] = useState<CleanupFilter>('');
+  const [sortBy, setSortBy] = useState<SortBy>('recycleExpiresAt'); const [sortDirection, setSortDirection] = useState<SortDirection>('asc'); const [notice, setNotice] = useState('');
+  const [singlePurge, setSinglePurge] = useState<SinglePurgeIntent | null>(null); const [batchPurge, setBatchPurge] = useState<BatchPurgeIntent | null>(null); const [batchVerificationError, setBatchVerificationError] = useState(''); const [batchVerifying, setBatchVerifying] = useState(false); const [batchProgress, setBatchProgress] = useState<BatchProgress | null>(null); const [statusFocusId, setStatusFocusId] = useState<string | null>(null);
+  const deferredSearch = useDeferredValue(search); const restoreIntents = useRef(new Map<string, { version: number; idempotencyKey: string }>()); const triggerRef = useRef<HTMLElement | null>(null);
+  const singleDialogRef = useRef<HTMLElement | null>(null); const singleReturnRef = useRef<HTMLButtonElement | null>(null); const singleErrorRef = useRef<HTMLDivElement | null>(null); const batchDialogRef = useRef<HTMLElement | null>(null); const batchReturnRef = useRef<HTMLButtonElement | null>(null); const batchErrorRef = useRef<HTMLDivElement | null>(null); const progressTitleRef = useRef<HTMLHeadingElement | null>(null); const statusRefs = useRef(new Map<string, HTMLSpanElement>());
+  const previousPurging = useRef<{ signature: string; isCompleteResult: boolean; items: Map<string, string> } | null>(null);
   const querySignature = JSON.stringify({ deferredSearch, lifecycleStatus, cleanupJobStatus, sortBy, sortDirection });
-
-  const recycleBin = useQuery({
-    queryKey: ['recycle-bin', deferredSearch, lifecycleStatus, cleanupJobStatus, sortBy, sortDirection],
-    queryFn: () => listRecycleBin({
-      search: deferredSearch,
-      lifecycleStatus,
-      cleanupJobStatus,
-      sortBy,
-      sortDirection,
-    }),
-    refetchInterval: 30_000,
-  });
+  const recycleBin = useQuery({ queryKey: ['recycle-bin', deferredSearch, lifecycleStatus, cleanupJobStatus, sortBy, sortDirection], queryFn: () => listRecycleBin({ search: deferredSearch, lifecycleStatus, cleanupJobStatus, sortBy, sortDirection }), refetchInterval: 30_000 });
+  const allRecycleBin = useQuery({ queryKey: ['recycle-bin', 'all'], queryFn: listAllRecycleBin });
+  const restoreMutation = useMutation({ mutationFn: async (item: RecycleBinItem) => { const current = restoreIntents.current.get(item.id); const intent = current?.version === item.version ? current : { version: item.version, idempotencyKey: createUuid() }; restoreIntents.current.set(item.id, intent); return { item, result: await restoreProject(item.id, item.version, intent.idempotencyKey) }; }, onMutate: () => setNotice(''), onSuccess: async ({ item }) => { restoreIntents.current.delete(item.id); setNotice(`项目“${item.name}”已恢复。已完成素材和清单仍然保留；先前终止的未完成上传不会自动恢复，请重新选择文件并新建上传任务。`); await refreshFacts(); } });
+  const purgeMutation = useMutation({ mutationFn: async (intent: SinglePurgeIntent) => ({ item: intent.item, result: await purgeProject(intent.item.id, intent.item.version, intent.idempotencyKey) }), onSuccess: async ({ item }) => { setSinglePurge(null); setStatusFocusId(item.id); setNotice(`项目“${item.name}”已进入清理流程，现已不可恢复。`); await refreshFacts(); } });
+  const commandLookupMutation = useMutation({ mutationFn: async (intent: SinglePurgeIntent) => ({ item: intent.item, result: await findPurgeCommand(intent.item.id, intent.idempotencyKey) }), onSuccess: async ({ item }) => { purgeMutation.reset(); setSinglePurge(null); setStatusFocusId(item.id); setNotice(`项目“${item.name}”已进入清理流程，现已不可恢复。`); await refreshFacts(); } });
 
   useEffect(() => {
     if (!recycleBin.isSuccess) return;
-    const currentIds = new Set(recycleBin.data.items.map((item) => item.id));
-    const isCompleteResult = recycleBin.data.total === recycleBin.data.items.length;
-    const previous = previousPurging.current;
-    if (
-      !cleanupJobStatus
-      && previous?.signature === querySignature
-      && previous.isCompleteResult
-      && isCompleteResult
-    ) {
-      const cleaned = [...previous.items].find(([id]) => !currentIds.has(id));
-      if (cleaned) setNotice(`项目“${cleaned[1]}”已清理，已从普通回收站列表移除。`);
-    }
-    previousPurging.current = {
-      signature: querySignature,
-      isCompleteResult,
-      items: new Map(
-        recycleBin.data.items
-          .filter((item) => item.lifecycleStatus === 'purging')
-          .map((item) => [item.id, item.name]),
-      ),
-    };
+    const currentIds = new Set(recycleBin.data.items.map((item) => item.id)); const isCompleteResult = recycleBin.data.total === recycleBin.data.items.length; const previous = previousPurging.current;
+    if (!cleanupJobStatus && previous?.signature === querySignature && previous.isCompleteResult && isCompleteResult) { const cleaned = [...previous.items].find(([id]) => !currentIds.has(id)); if (cleaned) setNotice(`项目“${cleaned[1]}”已清理，已从普通回收站列表移除。`); }
+    previousPurging.current = { signature: querySignature, isCompleteResult, items: new Map(recycleBin.data.items.filter((item) => item.lifecycleStatus === 'purging').map((item) => [item.id, item.name])) };
   }, [cleanupJobStatus, querySignature, recycleBin.data, recycleBin.isSuccess]);
+  useEffect(() => { if (statusFocusId && recycleBin.isSuccess && recycleBin.data.items.some((item) => item.id === statusFocusId && item.lifecycleStatus === 'purging')) { statusRefs.current.get(statusFocusId)?.focus(); setStatusFocusId(null); } }, [recycleBin.data, recycleBin.isSuccess, statusFocusId]);
+  const singlePending = purgeMutation.isPending || commandLookupMutation.isPending;
+  useEffect(() => { if (singlePurge) (singlePending ? singleDialogRef.current : singleReturnRef.current)?.focus(); }, [singlePurge, singlePending]);
+  useEffect(() => { if (purgeMutation.error || commandLookupMutation.error) singleErrorRef.current?.focus(); }, [commandLookupMutation.error, purgeMutation.error]);
+  useEffect(() => { if (batchPurge) (batchVerifying ? batchDialogRef.current : batchReturnRef.current)?.focus(); }, [batchPurge, batchVerifying]);
+  useEffect(() => { if (batchVerificationError) batchErrorRef.current?.focus(); }, [batchVerificationError]);
+  useEffect(() => { if (batchProgress) progressTitleRef.current?.focus(); }, [batchProgress?.running]);
 
-  const restoreMutation = useMutation({
-    mutationFn: async (item: RecycleBinItem) => {
-      const current = restoreIntents.current.get(item.id);
-      const intent = current?.version === item.version
-        ? current
-        : { version: item.version, idempotencyKey: crypto.randomUUID() };
-      restoreIntents.current.set(item.id, intent);
-      const result = await restoreProject(item.id, item.version, intent.idempotencyKey);
-      return { item, result };
-    },
-    onMutate: () => setNotice(''),
-    onSuccess: async ({ item }) => {
-      restoreIntents.current.delete(item.id);
-      setNotice(`项目“${item.name}”已恢复。已完成素材和清单仍然保留；先前终止的未完成上传不会自动恢复，请重新选择文件并新建上传任务。`);
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['recycle-bin'] }),
-        queryClient.invalidateQueries({ queryKey: ['projects'] }),
-      ]);
-    },
-  });
+  const refreshFacts = async () => { await Promise.all([queryClient.invalidateQueries({ queryKey: ['recycle-bin'] }), queryClient.invalidateQueries({ queryKey: ['projects'] })]); };
 
-  const mutationItemId = restoreMutation.variables?.id;
-  const mutationError = restoreMutation.error instanceof RecycleApiError ? restoreMutation.error : null;
+  const closeDialog = (kind: 'single' | 'batch') => { if (kind === 'single') { if (singlePending) return; setSinglePurge(null); purgeMutation.reset(); commandLookupMutation.reset(); } else { if (batchVerifying) return; setBatchPurge(null); setBatchVerificationError(''); } triggerRef.current?.focus(); };
+  const openSinglePurge = (item: RecycleBinItem, trigger: HTMLElement) => { triggerRef.current = trigger; setNotice(''); purgeMutation.reset(); commandLookupMutation.reset(); setSinglePurge({ item, idempotencyKey: createUuid(), typedName: '', acknowledged: false }); };
+  const openBatchPurge = async (trigger: HTMLElement) => { if (batchProgress?.running) return; triggerRef.current = trigger; setNotice(''); setBatchProgress(null); setBatchVerificationError(''); const result = await allRecycleBin.refetch(); if (result.isError) { setNotice(`无法读取全量回收站：${errorDetails(result.error).message}`); return; } const allItems = result.data ?? []; const recyclable = allItems.filter((item) => item.lifecycleStatus === 'recycled'); setBatchPurge({ snapshot: recyclable, nonprocessableCount: allItems.length - recyclable.length, typedName: '', acknowledged: false }); };
+  const submitSinglePurge = () => { if (!singlePurge || purgeMutation.isPending || purgeMutation.error instanceof RecycleApiError && purgeMutation.error.resultUnknown || singlePurge.typedName !== singlePurge.item.name || !singlePurge.acknowledged) return; purgeMutation.mutate(singlePurge); };
+  const replaceBatchSnapshot = (items: RecycleBinItem[], message: string) => { const recyclable = items.filter((item) => item.lifecycleStatus === 'recycled'); setBatchPurge({ snapshot: recyclable, nonprocessableCount: items.length - recyclable.length, typedName: '', acknowledged: false }); setBatchVerificationError(message); };
+  const submitBatchPurge = async () => {
+    if (!batchPurge || batchVerifying || batchPurge.typedName !== '清空回收站' || !batchPurge.acknowledged) return;
+    setBatchVerifying(true); setBatchVerificationError(''); let currentItems: RecycleBinItem[];
+    try { currentItems = await listAllRecycleBin(); } catch (error) { setBatchVerificationError(`确认前无法重新读取服务端范围：${errorDetails(error).message}`); setBatchVerifying(false); return; }
+    const currentRecyclable = currentItems.filter((item) => item.lifecycleStatus === 'recycled');
+    if (snapshotIdentity(currentRecyclable) !== snapshotIdentity(batchPurge.snapshot)) { replaceBatchSnapshot(currentItems, '回收站中的可清理项目已变化。已清除原确认，请重新核对数量并再次确认。'); setBatchVerifying(false); await queryClient.invalidateQueries({ queryKey: ['recycle-bin'] }); return; }
+    setBatchPurge(null); setBatchProgress({ running: true, items: currentRecyclable.map((item) => ({ item, state: 'queued' })) }); setBatchVerifying(false);
+    for (const item of currentRecyclable) {
+      const commandId = createUuid();
+      setBatchProgress((current) => current && ({ ...current, items: current.items.map((entry) => entry.item.id === item.id ? { ...entry, state: 'submitting', commandId } : entry) }));
+      try { await purgeProject(item.id, item.version, commandId); setBatchProgress((current) => current && ({ ...current, items: current.items.map((entry) => entry.item.id === item.id ? { ...entry, state: 'accepted' } : entry) })); }
+      catch (error) { const apiError = errorDetails(error); setBatchProgress((current) => current && ({ ...current, items: current.items.map((entry) => entry.item.id === item.id ? { ...entry, state: 'failed', error: apiError } : entry) })); }
+    }
+    setBatchProgress((current) => current && ({ ...current, running: false })); await refreshFacts();
+  };
+  const resolveBatchUnknown = async (projectId: string, commandId: string) => {
+    setBatchProgress((current) => current && ({ ...current, items: current.items.map((entry) => entry.item.id === projectId ? { ...entry, state: 'checking' } : entry) }));
+    try {
+      await findPurgeCommand(projectId, commandId);
+      setBatchProgress((current) => current && ({ ...current, items: current.items.map((entry) => entry.item.id === projectId ? { ...entry, state: 'accepted', error: undefined } : entry) }));
+      await refreshFacts();
+    } catch (error) {
+      const apiError = errorDetails(error);
+      setBatchProgress((current) => current && ({ ...current, items: current.items.map((entry) => entry.item.id === projectId ? { ...entry, state: 'failed', error: apiError } : entry) }));
+    }
+  };
 
-  return (
-    <section className={styles.page} aria-label="项目回收站">
-      <div className={styles.intro}>
-        <div>
-          <strong>{recycleBin.data?.total ?? 0}</strong>
-          <span>个回收中的项目</span>
-        </div>
-        <p>项目在恢复窗口内可恢复；后台开始清理后不可恢复。</p>
-      </div>
+  const mutationItemId = restoreMutation.variables?.id; const restoreError = restoreMutation.error instanceof RecycleApiError ? restoreMutation.error : null; const singleError = commandLookupMutation.error ? errorDetails(commandLookupMutation.error) : purgeMutation.error ? errorDetails(purgeMutation.error) : null; const singleUnknown = purgeMutation.error instanceof RecycleApiError && purgeMutation.error.resultUnknown; const writeLocked = restoreMutation.isPending || singlePending || batchVerifying || batchProgress?.running === true;
+  const allItems = allRecycleBin.data ?? []; const recyclableCount = allItems.filter((item) => item.lifecycleStatus === 'recycled').length;
+  const progressCounts = batchProgress && { processed: batchProgress.items.filter((item) => item.state === 'accepted' || item.state === 'failed').length, success: batchProgress.items.filter((item) => item.state === 'accepted').length, failed: batchProgress.items.filter((item) => item.state === 'failed').length, unknown: batchProgress.items.some((item) => item.error?.resultUnknown) };
 
-      {notice && <div className={styles.notice} role="status">{notice}</div>}
-
-      <div className={styles.filters} aria-label="回收站筛选和排序">
-        <label className={styles.searchField}>
-          <SearchIcon />
-          <span className="sr-only">搜索回收站项目</span>
-          <input
-            type="search"
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder="搜索项目名称"
-          />
-        </label>
-        <label>
-          <span>生命周期</span>
-          <select value={lifecycleStatus} onChange={(event) => setLifecycleStatus(event.target.value as LifecycleFilter)}>
-            <option value="">全部状态</option>
-            <option value="recycled">已回收</option>
-            <option value="purging">清理中</option>
-          </select>
-        </label>
-        <label>
-          <span>后台处理</span>
-          <select value={cleanupJobStatus} onChange={(event) => setCleanupJobStatus(event.target.value as CleanupFilter)}>
-            <option value="">全部处理状态</option>
-            <option value="scheduled">等待到期</option>
-            <option value="leased">正在清理</option>
-            <option value="retryable">等待后台重试</option>
-            <option value="failed">清理最终失败</option>
-          </select>
-        </label>
-        <label>
-          <span>排序</span>
-          <select value={sortBy} onChange={(event) => setSortBy(event.target.value as SortBy)}>
-            <option value="recycleExpiresAt">恢复窗口</option>
-            <option value="name">项目名称</option>
-            <option value="recycledAt">回收时间</option>
-          </select>
-        </label>
-        <label>
-          <span>方向</span>
-          <select value={sortDirection} onChange={(event) => setSortDirection(event.target.value as SortDirection)}>
-            <option value="asc">升序</option>
-            <option value="desc">降序</option>
-          </select>
-        </label>
-      </div>
-
-      <div className={styles.tableFrame} aria-live="polite">
-        {recycleBin.isError ? (
-          <div className={styles.statePanel} role="alert">
-            <strong>回收站暂时无法加载</strong>
-            <p>{recycleBin.error.message}</p>
-            <button type="button" onClick={() => recycleBin.refetch()}><RetryIcon />重新加载</button>
-          </div>
-        ) : (
-          <div className={styles.tableWrap}>
-            <table>
-              <thead>
-                <tr>
-                  <th>项目</th>
-                  <th>状态</th>
-                  <th>回收时间</th>
-                  <th>恢复窗口</th>
-                  <th>处理说明</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {recycleBin.isLoading && <RecycleTableSkeleton />}
-                {recycleBin.isSuccess && recycleBin.data.items.length === 0 && (
-                  <tr className={styles.emptyRow}>
-                    <td colSpan={6}>
-                      <strong>{search || lifecycleStatus || cleanupJobStatus ? '没有匹配的回收项目' : '回收站为空'}</strong>
-                      <span>当前没有可恢复或正在清理的项目。</span>
-                    </td>
-                  </tr>
-                )}
-                {recycleBin.data?.items.map((item) => {
-                  const presentation = statusPresentation(item);
-                  const isMutating = restoreMutation.isPending && mutationItemId === item.id;
-                  const rowError = mutationItemId === item.id ? mutationError : null;
-                  return (
-                    <tr key={item.id}>
-                      <td>
-                        <strong>{item.name}</strong>
-                        <span className={styles.projectId}>ID {item.id.slice(0, 8)}</span>
-                      </td>
-                      <td>
-                        <span className={`${styles.status} ${presentation.className}`}>{presentation.label}</span>
-                        <span className={styles.cellNote}>{presentation.description}</span>
-                      </td>
-                      <td className={styles.numeric}>{formatDate(item.recycledAt)}</td>
-                      <td>
-                        <strong className={styles.windowLabel}>
-                          {item.lifecycleStatus === 'recycled' ? formatRemaining(item.recycleExpiresAt) : '已到期 / 不可恢复'}
-                        </strong>
-                        <span className={styles.cellNote}>截止 {formatDate(item.recycleExpiresAt)}</span>
-                      </td>
-                      <td>
-                        <CleanupFacts item={item} />
-                        {rowError && (
-                          <span className={styles.rowError} role="alert">
-                            恢复失败：{rowError.message}
-                            {rowError.requestId && <>；请求标识 {rowError.requestId}</>}
-                            {rowError.resultUnknown && '；结果未知，请使用同一操作重试'}
-                          </span>
-                        )}
-                      </td>
-                      <td>
-                        {item.lifecycleStatus === 'recycled' ? (
-                          <button
-                            className={styles.restoreButton}
-                            type="button"
-                            disabled={restoreMutation.isPending}
-                            onClick={() => restoreMutation.mutate(item)}
-                          >
-                            {isMutating ? '正在恢复…' : '恢复项目'}
-                          </button>
-                        ) : <span className={styles.unavailable}>不可恢复</span>}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-    </section>
-  );
+  return <section className={styles.page} aria-label="项目回收站">
+    <div className={styles.intro}><div><strong>{recycleBin.data?.total ?? 0}</strong><span>个回收中的项目</span></div><p>项目在恢复窗口内可恢复；后台开始清理后不可恢复。</p><div className={styles.purgeHeaderAction}><button className={styles.clearButton} type="button" disabled={writeLocked || allRecycleBin.isFetching || recyclableCount === 0} onClick={(event) => void openBatchPurge(event.currentTarget)}>清空回收站</button>{recyclableCount === 0 && <span>没有可清理的已回收项目。</span>}</div></div>
+    {notice && <div className={styles.notice} role="status">{notice}</div>}
+    {batchProgress && progressCounts && <section className={styles.progressPanel} aria-labelledby="batch-purge-progress-title"><h2 id="batch-purge-progress-title" ref={progressTitleRef} tabIndex={-1}>清空回收站进度</h2><p role="status">已处理 {progressCounts.processed} / 总数 {batchProgress.items.length}，成功 {progressCounts.success}，失败 {progressCounts.failed}</p>{progressCounts.failed > 0 && !batchProgress.running && <div className={styles.progressError} role="alert" tabIndex={-1} ref={batchErrorRef}><strong>部分项目未进入清理</strong><span>{progressCounts.unknown ? '含结果未知项目：只可查询原命令，未重复提交。' : '请重新核对仍为已回收的项目后，再进入高风险确认。'}</span></div>}<ul className={styles.progressList}>{batchProgress.items.map((entry) => <li key={entry.item.id}><strong>{entry.item.name}</strong><span className={styles[`progress${entry.state}`]}>{entry.state === 'queued' ? '排队中' : entry.state === 'submitting' ? '正在提交' : entry.state === 'checking' ? '正在查询' : entry.state === 'accepted' ? '已进入清理' : '失败'}</span>{entry.error && <span className={styles.progressReason}>{entry.error.message}{entry.error.requestId && `；请求标识 ${entry.error.requestId}`}{entry.error.resultUnknown && '；结果未知，未再次提交'}</span>}{entry.error?.resultUnknown && entry.commandId && <button className={styles.queryCommandButton} type="button" onClick={() => { if (entry.commandId) void resolveBatchUnknown(entry.item.id, entry.commandId); }}>查询本次命令</button>}</li>)}</ul>{!batchProgress.running && progressCounts.failed > 0 && !progressCounts.unknown && <button className={styles.retryBatchButton} type="button" onClick={(event) => void openBatchPurge(event.currentTarget)}>继续处理未完成项</button>}</section>}
+    <div className={styles.filters} aria-label="回收站筛选和排序"><label className={styles.searchField}><SearchIcon /><span className="sr-only">搜索回收站项目</span><input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索项目名称" /></label><label><span>生命周期</span><select value={lifecycleStatus} onChange={(event) => setLifecycleStatus(event.target.value as LifecycleFilter)}><option value="">全部状态</option><option value="recycled">已回收</option><option value="purging">清理中</option></select></label><label><span>后台处理</span><select value={cleanupJobStatus} onChange={(event) => setCleanupJobStatus(event.target.value as CleanupFilter)}><option value="">全部处理状态</option><option value="scheduled">等待到期</option><option value="leased">正在清理</option><option value="retryable">等待后台重试</option><option value="failed">清理最终失败</option></select></label><label><span>排序</span><select value={sortBy} onChange={(event) => setSortBy(event.target.value as SortBy)}><option value="recycleExpiresAt">恢复窗口</option><option value="name">项目名称</option><option value="recycledAt">回收时间</option></select></label><label><span>方向</span><select value={sortDirection} onChange={(event) => setSortDirection(event.target.value as SortDirection)}><option value="asc">升序</option><option value="desc">降序</option></select></label></div>
+    <div className={styles.tableFrame} aria-live="polite">{recycleBin.isError ? <div className={styles.statePanel} role="alert"><strong>回收站暂时无法加载</strong><p>{recycleBin.error.message}</p><button type="button" onClick={() => recycleBin.refetch()}><RetryIcon />重新加载</button></div> : <div className={styles.tableWrap}><table><thead><tr><th>项目</th><th>状态</th><th>回收时间</th><th>恢复窗口</th><th>处理说明</th><th>操作</th></tr></thead><tbody>{recycleBin.isLoading && <RecycleTableSkeleton />}{recycleBin.isSuccess && recycleBin.data.items.length === 0 && <tr className={styles.emptyRow}><td colSpan={6}><strong>{search || lifecycleStatus || cleanupJobStatus ? '没有匹配的回收项目' : '回收站为空'}</strong><span>当前没有可恢复或正在清理的项目。</span></td></tr>}{recycleBin.data?.items.map((item) => { const presentation = statusPresentation(item); const isRestoring = restoreMutation.isPending && mutationItemId === item.id; const rowRestoreError = mutationItemId === item.id ? restoreError : null; return <tr key={item.id}><td><strong>{item.name}</strong><span className={styles.projectId}>ID {item.id.slice(0, 8)}</span></td><td><span ref={(node) => { if (node) statusRefs.current.set(item.id, node); else statusRefs.current.delete(item.id); }} tabIndex={-1} className={`${styles.status} ${presentation.className}`}>{presentation.label}</span><span className={styles.cellNote}>{presentation.description}</span></td><td className={styles.numeric}>{formatDate(item.recycledAt)}</td><td><strong className={styles.windowLabel}>{item.lifecycleStatus === 'recycled' ? formatRemaining(item.recycleExpiresAt) : '已到期 / 不可恢复'}</strong><span className={styles.cellNote}>截止 {formatDate(item.recycleExpiresAt)}</span></td><td><CleanupFacts item={item} />{rowRestoreError && <span className={styles.rowError} role="alert">恢复失败：{rowRestoreError.message}{rowRestoreError.requestId && <>；请求标识 {rowRestoreError.requestId}</>}{rowRestoreError.resultUnknown && '；结果未知，请使用同一操作重试'}</span>}</td><td>{item.lifecycleStatus === 'recycled' ? <div className={styles.rowActions}><button className={styles.restoreButton} type="button" disabled={writeLocked} onClick={() => restoreMutation.mutate(item)}>{isRestoring ? '正在恢复…' : '恢复项目'}</button><button className={styles.purgeButton} type="button" disabled={writeLocked} onClick={(event) => openSinglePurge(item, event.currentTarget)}>永久删除</button></div> : <span className={styles.unavailable}>不可恢复</span>}</td></tr>; })}</tbody></table></div>}</div>
+    {singlePurge && <div className={styles.modalBackdrop} onMouseDown={(event) => { if (event.target === event.currentTarget) closeDialog('single'); }}><section className={styles.modal} role="dialog" aria-modal="true" aria-labelledby="single-purge-title" tabIndex={-1} ref={singleDialogRef} onKeyDown={(event) => { trapFocus(event, singleDialogRef.current, singlePending); if (event.key === 'Escape' && !singlePending) { event.preventDefault(); closeDialog('single'); } }}><button ref={singleReturnRef} className={styles.returnButton} type="button" disabled={singlePending} onClick={() => closeDialog('single')}>返回回收站</button><h2 id="single-purge-title">永久删除「{singlePurge.item.name}」？</h2><p>项目将立即进入不可恢复的清理流程。项目资料、素材清单和已完成 Asset 将按服务端清理；未完成上传不会恢复；该操作不能撤销。</p>{singleError && <div className={styles.modalError} role="alert" tabIndex={-1} ref={singleErrorRef}><strong>{singleUnknown ? '永久删除结果未知' : '永久删除未提交'}</strong><span>{singleError.message}</span>{singleError.requestId && <span>请求标识：{singleError.requestId}</span>}{singleUnknown && <span>未重复提交；只能查询原永久删除命令。</span>}{singleUnknown && <button className={styles.queryCommandButton} type="button" disabled={singlePending} onClick={() => commandLookupMutation.mutate(singlePurge)}>{commandLookupMutation.isPending ? '正在查询本次命令…' : '查询本次命令'}</button>}</div>}<label className={styles.confirmField}><span>请输入完整项目名以确认：</span><strong>{singlePurge.item.name}</strong><input disabled={singlePending} value={singlePurge.typedName} onChange={(event) => setSinglePurge({ ...singlePurge, typedName: event.target.value })} /></label><label className={styles.checkField}><input type="checkbox" disabled={singlePending} checked={singlePurge.acknowledged} onChange={(event) => setSinglePurge({ ...singlePurge, acknowledged: event.target.checked })} />我已了解进入清理后无法恢复</label>{singlePending && <p className={styles.pendingMessage}>{commandLookupMutation.isPending ? '正在查询本次永久删除命令……' : '正在提交永久删除……'}</p>}<div className={styles.modalActions}><button className={styles.secondaryButton} type="button" disabled={singlePending} onClick={() => closeDialog('single')}>取消</button><button className={styles.dangerButton} type="button" disabled={singlePending || singleUnknown || singlePurge.typedName !== singlePurge.item.name || !singlePurge.acknowledged} onClick={submitSinglePurge}>{purgeMutation.isPending ? '正在提交…' : '永久删除'}</button></div></section></div>}
+    {batchPurge && <div className={styles.modalBackdrop} onMouseDown={(event) => { if (event.target === event.currentTarget) closeDialog('batch'); }}><section className={styles.modal} role="dialog" aria-modal="true" aria-labelledby="batch-purge-title" tabIndex={-1} ref={batchDialogRef} onKeyDown={(event) => { trapFocus(event, batchDialogRef.current, batchVerifying); if (event.key === 'Escape' && !batchVerifying) { event.preventDefault(); closeDialog('batch'); } }}><button ref={batchReturnRef} className={styles.returnButton} type="button" disabled={batchVerifying} onClick={() => closeDialog('batch')}>返回回收站</button><h2 id="batch-purge-title">清空回收站？</h2><p>将处理服务端全量快照中的 {batchPurge.snapshot.length} 个已回收项目；当前不可处理 {batchPurge.nonprocessableCount} 个。这不是一次原子操作，成功项目会进入不可恢复的清理流程。</p>{batchVerificationError && <div className={styles.modalError} role="alert" tabIndex={-1} ref={batchErrorRef}><strong>需要重新核对</strong><span>{batchVerificationError}</span></div>}<label className={styles.confirmField}><span>请输入“清空回收站”以确认：</span><input disabled={batchVerifying} value={batchPurge.typedName} onChange={(event) => setBatchPurge({ ...batchPurge, typedName: event.target.value })} /></label><label className={styles.checkField}><input type="checkbox" disabled={batchVerifying} checked={batchPurge.acknowledged} onChange={(event) => setBatchPurge({ ...batchPurge, acknowledged: event.target.checked })} />我已核对项目数量并了解成功项目无法恢复</label>{batchVerifying && <p className={styles.pendingMessage}>正在重新核对服务端范围……</p>}<div className={styles.modalActions}><button className={styles.secondaryButton} type="button" disabled={batchVerifying} onClick={() => closeDialog('batch')}>取消</button><button className={styles.dangerButton} type="button" disabled={batchVerifying || batchPurge.snapshot.length === 0 || batchPurge.typedName !== '清空回收站' || !batchPurge.acknowledged} onClick={() => void submitBatchPurge()}>{batchVerifying ? '正在核对…' : '开始清空'}</button></div></section></div>}
+  </section>;
 };
 
-const CleanupFacts = ({ item }: { item: RecycleBinItem }) => {
-  if (item.lifecycleStatus === 'recycled') {
-    return <span className={styles.cellNote}>后台清理尚未开始</span>;
-  }
-  return (
-    <span className={styles.cleanupFacts}>
-      {item.cleanupJob.lastError && <span>原因：{item.cleanupJob.lastError}</span>}
-      <span>尝试 {item.cleanupJob.attemptCount} 次</span>
-      {item.cleanupJob.nextAttemptAt && <span>下次重试 {formatDate(item.cleanupJob.nextAttemptAt)}</span>}
-      <span>请求标识 {item.cleanupJob.id}</span>
-    </span>
-  );
-};
-
-const RecycleTableSkeleton = () => (
-  <>
-    {[0, 1, 2].map((row) => (
-      <tr className={styles.skeletonRow} key={row} aria-label="正在加载回收站项目">
-        <td colSpan={6}><span /></td>
-      </tr>
-    ))}
-  </>
-);
+const CleanupFacts = ({ item }: { item: RecycleBinItem }) => item.lifecycleStatus === 'recycled' ? <span className={styles.cellNote}>后台清理尚未开始</span> : <span className={styles.cleanupFacts}>{item.cleanupJob.lastError && <span>原因：{item.cleanupJob.lastError}</span>}<span>尝试 {item.cleanupJob.attemptCount} 次</span>{item.cleanupJob.nextAttemptAt && <span>下次重试 {formatDate(item.cleanupJob.nextAttemptAt)}</span>}<span>请求标识 {item.cleanupJob.id}</span></span>;
+const RecycleTableSkeleton = () => <>{[0, 1, 2].map((row) => <tr className={styles.skeletonRow} key={row} aria-label="正在加载回收站项目"><td colSpan={6}><span /></td></tr>)}</>;

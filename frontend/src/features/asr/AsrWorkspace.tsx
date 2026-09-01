@@ -38,6 +38,7 @@ import {
 import {
   batchStatusLabels,
   formatDateTime,
+  formatRuntimeSnapshot,
   formatScope,
   formatUsage,
   isUnknownAsrResult,
@@ -45,18 +46,20 @@ import {
   qualityStatusLabels,
   receiptLabels,
   stableIntent,
+  type AsrRuntimeSnapshot,
 } from './model.js';
 import styles from './AsrWorkspace.module.css';
 
 type ConfirmState =
-  | { kind: 'create'; body: CreateAsrBatchBody; reusableCount: number }
+  | { kind: 'create'; body: CreateAsrBatchBody; reusableCount: number; runtime: AsrRuntimeSnapshot }
   | { kind: 'cancel'; batch: AsrBatchDetail }
   | { kind: 'retry'; batch: AsrBatchDetail; episodeNumbers: number[] };
 
 type EvidenceState =
   | { kind: 'hotwords'; batch: AsrBatchDetail }
   | { kind: 'quality'; batch: AsrBatchDetail; job: AsrJob }
-  | { kind: 'reconciliation'; batch: AsrBatchDetail; job?: AsrJob };
+  | { kind: 'reconciliation'; batch: AsrBatchDetail; job?: AsrJob }
+  | { kind: 'srtCompare'; batch: AsrBatchDetail };
 
 interface Intent {
   signature: string;
@@ -69,6 +72,10 @@ const lifecycleLabels = {
 
 const batchStatuses = Object.keys(batchStatusLabels) as AsrBatchStatus[];
 const batchPageSize = 20;
+const adminBudgetSettingsUrl = 'https://milaidi.top/budgets';
+
+const latestAttemptOf = (job: AsrJob) => job.attempts.at(-1);
+const isLocalPolicyBlockedJob = (job: AsrJob) => latestAttemptOf(job)?.localPolicyBlocked === true;
 
 export const AsrWorkspace = () => {
   const { projectId = '' } = useParams();
@@ -164,6 +171,7 @@ export const AsrWorkspace = () => {
     enabled: Boolean(createOpen && termReady && latestTermVersion),
   });
   const visibleBatches = batches.data?.items ?? [];
+  const summaryRuntime = preparation.data ?? visibleBatches[0] ?? null;
   const pageCount = Math.max(1, Math.ceil((batches.data?.total ?? 0) / batchPageSize));
 
   useEffect(() => {
@@ -209,7 +217,7 @@ export const AsrWorkspace = () => {
       setExpandedId(created.id);
       queryClient.setQueryData(['asr-batch', projectId, created.id], created);
       await invalidateAsr(created.id);
-      announce(`模拟识别批次 ${created.id.slice(0, 8)} 已创建，状态为${batchStatusLabels[created.status]}。`);
+      announce(`识别批次 ${created.id.slice(0, 8)} 已创建；运行配置：${formatRuntimeSnapshot(created)}；状态为${batchStatusLabels[created.status]}。`);
     },
     onError: async (error) => {
       if (!isUnknownAsrResult(error)) await invalidateAsr();
@@ -251,13 +259,14 @@ export const AsrWorkspace = () => {
         throw error;
       }
     },
-    onSuccess: async (created) => {
+    onSuccess: async (created, variables) => {
       retryIntent.current = null;
       setConfirm(null);
       setExpandedId(created.id);
       queryClient.setQueryData(['asr-batch', projectId, created.id], created);
       await invalidateAsr(created.id);
-      announce(`失败集重试批次 ${created.id.slice(0, 8)} 已创建；既有成功结果保持不变。`);
+      const policyRecovery = variables.episodeNumbers.every((episodeNumber) => variables.batch.jobs.some((job) => job.episodeNumber === episodeNumber && isLocalPolicyBlockedJob(job)));
+      announce(`${policyRecovery ? '预算阻断恢复' : '失败集重试'}批次 ${created.id.slice(0, 8)} 已创建；既有成功结果保持不变。`);
     },
     onError: async (error) => { if (!isUnknownAsrResult(error)) await invalidateAsr(expandedId ?? undefined); },
   });
@@ -313,13 +322,13 @@ export const AsrWorkspace = () => {
       <section className={styles.gateSummary} aria-label="中文识别门禁摘要">
         <div><span>术语门禁</span><strong>{termReady ? `已确认 V${latestTermVersion!.version}` : '尚未满足'}</strong><small>{terms.data?.sourceIsCurrent ? '当前来源一致' : '来源变化，需重新确认'}</small></div>
         <div><span>素材门禁</span><strong>{episodeRows.filter((item) => item.ready).length} / {episodeRows.length} 集</strong><small>已校验中文识别视频</small></div>
-        <div><span>识别模式</span><strong>模拟识别</strong><small>零外部网络</small></div>
+        <div><span>运行配置</span><strong>{summaryRuntime?.provider ?? '服务端配置'}</strong><small>{summaryRuntime ? `${summaryRuntime.adapter} · ${summaryRuntime.model}` : '等待服务端运行快照'}</small></div>
         <div><span>运行中批次</span><strong>{activeBatchCount.isLoading ? '—' : activeBatchCount.data ?? 0}</strong><small>来自后端权威状态</small></div>
-        <button ref={createTriggerRef} className={styles.primaryButton} type="button" disabled={!termReady || !sourceReady} onClick={openCreate}>新建模拟识别批次</button>
+        <button ref={createTriggerRef} className={styles.primaryButton} type="button" disabled={!termReady || !sourceReady} onClick={openCreate}>新建识别批次</button>
       </section>
 
       <div className={styles.simulationNotice}>
-        <strong>模拟识别</strong><span>不连接外部供应商，只用于验证创建、运行、取消和恢复链路；不代表真实识别准确率。</span>
+        <strong>服务端运行配置</strong><span>Provider、适配器、模型与配置摘要均以当前准备结果和批次快照为准。</span>
       </div>
 
       {!termReady && <div className={styles.pageNotice} role="alert"><div><strong>术语门禁尚未满足</strong><p>需要当前公司 SRT 来源对应的不可变术语版本。</p></div><Link to={`/projects/${projectId}/terms`}>返回术语确认</Link></div>}
@@ -336,17 +345,17 @@ export const AsrWorkspace = () => {
       </div>
 
       {batches.isError && <div className={styles.listError} role="alert"><strong>批次读取失败</strong><p>{batches.error.message}</p>{batches.error instanceof AsrApiError && batches.error.requestId && <small>请求标识：{batches.error.requestId}</small>}<span>已经形成的成功结果不会因读取失败被删除。</span><button type="button" onClick={() => void batches.refetch()}>重新读取</button></div>}
-      {batches.isSuccess && batches.data.total === 0 && <div className={styles.emptyState} role="status"><strong>{search || status ? '当前查询没有匹配批次' : '尚无中文识别批次'}</strong><p>{search || status ? '请调整批次编号或状态条件后重新查看。' : '双门禁满足后，可以从整剧、选中集或单集创建第一个模拟识别批次。'}</p>{!search && !status && <button type="button" disabled={!termReady || !sourceReady} onClick={openCreate}>新建模拟识别批次</button>}</div>}
+      {batches.isSuccess && batches.data.total === 0 && <div className={styles.emptyState} role="status"><strong>{search || status ? '当前查询没有匹配批次' : '尚无中文识别批次'}</strong><p>{search || status ? '请调整批次编号或状态条件后重新查看。' : '双门禁满足后，可以从整剧、选中集或单集创建第一个识别批次。'}</p>{!search && !status && <button type="button" disabled={!termReady || !sourceReady} onClick={openCreate}>新建识别批次</button>}</div>}
 
       {batches.isSuccess && batches.data.total > 0 && (
         <div className={styles.tableFrame}>
           <div className={styles.tableWrap}>
             <table>
-              <thead><tr><th>批次</th><th>范围</th><th>模式</th><th>状态</th><th>集数进度</th><th>质量</th><th>处理用量</th><th>更新时间</th><th>操作</th></tr></thead>
+              <thead><tr><th>批次</th><th>范围</th><th>运行配置</th><th>状态</th><th>集数进度</th><th>质量</th><th>处理用量</th><th>更新时间</th><th>操作</th></tr></thead>
               <tbody>
                 {visibleBatches.map((batch) => (
                   <Fragment key={batch.id}>
-                    <BatchRow batch={batch} expanded={expandedId === batch.id} onToggle={() => setExpandedId((current) => current === batch.id ? null : batch.id)} />
+                    <BatchRow batch={batch} detail={expandedId === batch.id ? detail.data : null} expanded={expandedId === batch.id} onToggle={() => setExpandedId((current) => current === batch.id ? null : batch.id)} />
                     {expandedId === batch.id && (
                       <tr className={styles.detailRow}><td colSpan={9}>
                         {detail.isLoading && <div className={styles.inlineLoading} aria-busy="true">正在读取批次逐集事实…</div>}
@@ -387,7 +396,7 @@ export const AsrWorkspace = () => {
         returnFocus={createTriggerRef}
         onForceNewRecognitionChange={setPrepareForceNew}
         onRetryPreparation={() => void preparation.refetch()}
-        onContinue={(body, reusableCount) => openConfirm({ kind: 'create', body, reusableCount })}
+        onContinue={(body, reusableCount, runtime) => openConfirm({ kind: 'create', body, reusableCount, runtime })}
         onClose={() => setCreateOpen(false)}
       />}
 
@@ -404,8 +413,10 @@ export const AsrWorkspace = () => {
   );
 };
 
-const BatchRow = ({ batch, expanded, onToggle }: { batch: AsrBatchSummary; expanded: boolean; onToggle: () => void }) => {
+const BatchRow = ({ batch, detail, expanded, onToggle }: { batch: AsrBatchSummary; detail: AsrBatchDetail | null | undefined; expanded: boolean; onToggle: () => void }) => {
   const completed = batch.counts.completed;
+  const localPolicyBlockedCount = detail?.jobs.filter(isLocalPolicyBlockedJob).length ?? 0;
+  const otherFailedCount = Math.max(0, batch.counts.failed - localPolicyBlockedCount);
   const quality = batch.status === 'completed' ? '结果已形成'
     : batch.status === 'partial' ? '含可用结果'
       : batch.status === 'reconciliation_required' ? '结果或用量未知' : '尚未完成';
@@ -417,9 +428,9 @@ const BatchRow = ({ batch, expanded, onToggle }: { batch: AsrBatchSummary; expan
         : batch.scopeKind === 'selected'
           ? { kind: 'selected', episodeNumbers: batch.episodeNumbers }
           : { kind: 'all' })}<small>{batch.episodeNumbers.length} 集</small></td>
-      <td><span className={styles.modeTag}>模拟识别</span><small>{batch.forceNewRecognition ? '新结果修订' : '允许同源复用'}</small></td>
+      <td><span className={styles.modeTag}>{batch.provider}</span><small>{batch.adapter} · {batch.model} · {batch.forceNewRecognition ? '新结果修订' : '允许同源复用'}</small></td>
       <td><StatusTag status={batch.status} label={batchStatusLabels[batch.status]} /></td>
-      <td>{completed} / {batch.counts.total}<small>{batch.counts.failed ? `${batch.counts.failed} 集失败` : batch.counts.reconciliationRequired ? `${batch.counts.reconciliationRequired} 集需对账` : '后端权威进度'}</small></td>
+      <td>{completed} / {batch.counts.total}<small>{localPolicyBlockedCount ? `${localPolicyBlockedCount} 集预算阻断${otherFailedCount ? ` · ${otherFailedCount} 集失败` : ''}` : batch.counts.failed ? `${batch.counts.failed} 集待处理` : batch.counts.reconciliationRequired ? `${batch.counts.reconciliationRequired} 集需对账` : '后端权威进度'}</small></td>
       <td>{quality}<small>{batch.termVersionIsLatest ? '术语版本当前' : '术语版本已过期'}</small></td>
       <td>{batch.status === 'reconciliation_required' ? '待对账' : `${batch.counts.total} 个任务`}<small>详情内查看时长</small></td>
       <td>{formatDateTime(batch.updatedAt)}</td>
@@ -436,27 +447,45 @@ interface BatchDetailProps {
 }
 
 const BatchDetail = ({ batch, onCancel, onRetry, onEvidence }: BatchDetailProps) => {
-  const failedEpisodes = batch.jobs.filter((job) => job.status === 'failed').map((job) => job.episodeNumber);
+  const failedJobs = batch.jobs.filter((job) => job.status === 'failed');
+  const retryableJobs = failedJobs.filter((job) => latestAttemptOf(job)?.retryable === true);
+  const retryableEpisodes = retryableJobs.map((job) => job.episodeNumber);
+  const localPolicyBlockedJobs = failedJobs.filter(isLocalPolicyBlockedJob);
+  const localPolicyBlockedCount = localPolicyBlockedJobs.length;
+  const nonPolicyFailedCount = Math.max(0, batch.counts.failed - localPolicyBlockedCount);
   const usages = batch.jobs.flatMap((job) => job.attempts.map((attempt) => attempt.usage));
   const canCancel = batch.status === 'queued' || batch.status === 'running';
-  const canRetry = (batch.status === 'partial' || batch.status === 'failed') && failedEpisodes.length > 0;
+  const canRetry = (batch.status === 'partial' || batch.status === 'failed') && retryableEpisodes.length > 0;
+  const onlyPolicyRecovery = canRetry && retryableJobs.every(isLocalPolicyBlockedJob);
   return (
     <section className={styles.batchDetail} aria-label={`批次 ${batch.id.slice(0, 8)} 详情`}>
       <header>
-        <div><strong>批次 #{batch.id.slice(0, 8)}</strong><span>固定术语 {batch.termVersionId.slice(0, 8)} · 素材清单 V{batch.manifestVersion} · 结果修订不可变</span></div>
+        <div><strong>批次 #{batch.id.slice(0, 8)}</strong><span>固定术语 {batch.termVersionId ? batch.termVersionId.slice(0, 8) : '未绑定'} · 素材清单 V{batch.manifestVersion} · 结果修订不可变</span></div>
         <div>
           <button type="button" onClick={(event) => onEvidence({ kind: 'hotwords', batch }, event)}>本批次热词</button>
+          <button type="button" onClick={(event) => onEvidence({ kind: 'srtCompare', batch }, event)}>查看 SRT 对照</button>
           {batch.status === 'reconciliation_required' && <button type="button" onClick={(event) => onEvidence({ kind: 'reconciliation', batch }, event)}>查看对账说明</button>}
           {canCancel && <button type="button" onClick={onCancel}>取消批次</button>}
-          {canRetry && <button className={styles.primaryButton} type="button" onClick={(event) => onRetry(failedEpisodes, event)}>仅重试失败集</button>}
+          {canRetry && <button className={styles.primaryButton} type="button" onClick={(event) => onRetry(retryableEpisodes, event)}>{onlyPolicyRecovery ? `恢复 ${retryableEpisodes.length} 个预算阻断任务` : '仅重试可恢复集'}</button>}
         </div>
       </header>
       {!batch.termVersionIsLatest && <div className={styles.staleNotice}>术语版本已过期。历史结果保持原版本；如需更新，请显式创建新批次。</div>}
       {batch.blockers.length > 0 && <div className={styles.blockerList} role="alert"><strong>批次未执行：{batch.blockers.length} 集被阻断</strong>{batch.blockers.map((blocker) => <span key={`${blocker.episodeNumber}-${blocker.code}`}>第 {blocker.episodeNumber} 集 · {blocker.message}</span>)}</div>}
+      {localPolicyBlockedCount > 0 && <section className={styles.policyBlockNotice} role="alert" aria-label="本地预算策略阻断">
+        <header><div><strong>本地预算策略阻断 {localPolicyBlockedCount} 集</strong><span>这些任务未调用识别供应商，不属于识别失败。</span></div><a href={adminBudgetSettingsUrl} target="_blank" rel="noreferrer">打开管理员预算设置</a></header>
+        <div className={styles.policyBlockFacts}>
+          <div><span>阻断状态</span><strong>本地预算硬门已阻断</strong></div>
+          <div><span>日/月限额</span><strong>在管理员预算页查看</strong><small>以服务端当前策略和账本为准</small></div>
+          <div><span>本次供应商用量</span><strong>未产生</strong><small>没有识别供应商请求</small></div>
+          <div><span>下一步</span><strong>调整策略后显式恢复 {localPolicyBlockedCount} 集</strong></div>
+        </div>
+        <p>系统不会自动重试。管理员关闭硬门、补齐规则或调整限额后，再使用本批次的恢复操作。</p>
+      </section>}
       <div className={styles.detailFacts}>
         <div><span>请求标识</span><strong>{batch.id}</strong></div>
+        <div><span>运行配置</span><strong>{formatRuntimeSnapshot(batch)}</strong></div>
         <div><span>处理用量</span><strong>{formatUsage(usages)}</strong></div>
-        <div><span>质量/结果</span><strong>{batch.counts.completed} 集可用（其中复用 {batch.counts.reused}）· {batch.counts.failed} 集失败</strong></div>
+        <div><span>质量/结果</span><strong>{batch.counts.completed} 集可用（其中复用 {batch.counts.reused}）{localPolicyBlockedCount ? ` · ${localPolicyBlockedCount} 集预算阻断` : ''}{nonPolicyFailedCount ? ` · ${nonPolicyFailedCount} 集失败` : ''}</strong></div>
         <div><span>热词摘要</span><strong>{batch.hotwords.digest.slice(0, 12)}… · {batch.hotwords.termCount + batch.hotwords.aliasCount} 项</strong></div>
       </div>
       <div className={`${styles.tableWrap} ${styles.jobTableWrap}`}>
@@ -473,18 +502,19 @@ const JobRow = ({ batch, job, onEvidence }: { batch: AsrBatchDetail; job: AsrJob
   const result = job.currentResult;
   const attempts = job.attempts;
   const latestAttempt = attempts.at(-1);
+  const localPolicyBlocked = latestAttempt?.localPolicyBlocked === true;
   return (
     <tr>
       <td><strong>第 {job.episodeNumber} 集</strong>{job.reusedResult && <small>明确复用同源结果</small>}</td>
       <td>{job.assetOriginalFilename}<small>{job.assetChecksum.slice(0, 12)}…</small></td>
-      <td><StatusTag status={job.status} label={jobStatusLabels[job.status]} /></td>
-      <td>{result ? <span className={`${styles.qualityTag} ${styles[result.qualityStatus]}`}>{qualityStatusLabels[result.qualityStatus]}</span> : '尚未形成'}</td>
+      <td><StatusTag status={job.status} label={localPolicyBlocked ? '本地预算策略阻断' : jobStatusLabels[job.status]} /></td>
+      <td>{localPolicyBlocked ? '未进入识别' : result ? <span className={`${styles.qualityTag} ${styles[result.qualityStatus]}`}>{qualityStatusLabels[result.qualityStatus]}</span> : '尚未形成'}</td>
       <td>{result ? `${result.qualitySummary.cueCount} Cue` : '—'}<small>{result ? `结果 R${result.revision}` : '等待结果'}</small></td>
-      <td>{formatUsage(attempts.map((attempt) => attempt.usage))}</td>
-      <td>{attempts.length} 次<small>{latestAttempt?.hotwordReceipt ? receiptLabels[latestAttempt.hotwordReceipt] : '尚无回执'}</small></td>
+      <td>{localPolicyBlocked ? '未产生供应商用量' : formatUsage(attempts.map((attempt) => attempt.usage))}</td>
+      <td>{attempts.length} 次<small>{localPolicyBlocked ? '可显式恢复' : latestAttempt?.hotwordReceipt ? receiptLabels[latestAttempt.hotwordReceipt] : '尚无回执'}</small></td>
       <td>{job.status === 'reconciliation_required'
         ? <button className={styles.rowAction} type="button" onClick={(event) => onEvidence({ kind: 'reconciliation', batch, job }, event)}>查看对账说明</button>
-        : <button className={styles.rowAction} type="button" onClick={(event) => onEvidence({ kind: 'quality', batch, job }, event)}>查看质量</button>}</td>
+        : <button className={styles.rowAction} type="button" onClick={(event) => onEvidence({ kind: 'quality', batch, job }, event)}>{localPolicyBlocked ? '查看阻断详情' : '查看质量'}</button>}</td>
     </tr>
   );
 };
@@ -499,10 +529,10 @@ const confirmDialogCopy = (confirm: ConfirmState) => {
       : confirm.body.scope.kind === 'single' ? `第 ${confirm.body.scope.episodeNumber} 集`
         : `${confirm.body.scope.episodeNumbers.length} 个选中集`;
     return {
-      title: '确认创建模拟识别批次',
-      description: '本次只运行零网络模拟识别。批次将固定当前素材清单、术语版本和热词投影。',
-      detail: `${episodes} · 术语 ${confirm.body.termVersionId.slice(0, 8)} · 预计 ${confirm.body.scope.kind === 'selected' ? confirm.body.scope.episodeNumbers.length : confirm.body.scope.kind === 'single' ? 1 : '整剧'} 个任务 · 当前历史中 ${confirm.reusableCount} 集可复用。服务端创建时会最终核对同源结果。`,
-      confirmLabel: '创建模拟识别批次',
+      title: '确认创建识别批次',
+      description: '批次将固定当前素材清单、术语版本、热词投影与以下服务端运行配置；执行状态以批次权威事实为准。',
+      detail: `${episodes} · 运行配置 ${formatRuntimeSnapshot(confirm.runtime)} · 配置摘要 ${confirm.runtime.configDigest.slice(0, 12)}… · 术语 ${confirm.body.termVersionId ? confirm.body.termVersionId.slice(0, 8) : '未绑定'} · 预计 ${confirm.body.scope.kind === 'selected' ? confirm.body.scope.episodeNumbers.length : confirm.body.scope.kind === 'single' ? 1 : '整剧'} 个任务 · 当前历史中 ${confirm.reusableCount} 集可复用。服务端创建时会最终核对同源结果。`,
+      confirmLabel: '创建识别批次',
     };
   }
   if (confirm.kind === 'cancel') return {
@@ -511,10 +541,18 @@ const confirmDialogCopy = (confirm: ConfirmState) => {
     detail: `批次 #${confirm.batch.id.slice(0, 8)} · 已完成结果和历史处理用量不会删除。`,
     confirmLabel: '保存取消意图',
   };
-  return {
-    title: '确认仅重试失败集',
-    description: '只为明确失败的集创建新尝试；成功、警告、复用、取消和需对账集不会重复。',
+  const policyRecovery = confirm.episodeNumbers.every((episodeNumber) => confirm.batch.jobs.some((job) => job.episodeNumber === episodeNumber && isLocalPolicyBlockedJob(job)));
+  return policyRecovery ? {
+    title: '确认恢复预算阻断任务',
+    description: '管理员调整预算策略后，显式为这些本地阻断任务创建恢复批次；系统不会自动重试，也不会重复已成功任务。',
+    detail: `批次 #${confirm.batch.id.slice(0, 8)} · 恢复第 ${confirm.episodeNumbers.join('、')} 集 · 使用同一稳定命令身份处理未知结果；历史尝试保持不变。`,
+    confirmLabel: '显式恢复预算阻断任务',
+    recoveryLabel: '查询同一恢复命令结果',
+  } : {
+    title: '确认仅重试可恢复集',
+    description: '只为服务端明确允许恢复的失败集创建新尝试；成功、警告、复用、取消和需对账集不会重复。',
     detail: `批次 #${confirm.batch.id.slice(0, 8)} · 重试第 ${confirm.episodeNumbers.join('、')} 集 · 历史尝试和既有结果保持不变。`,
-    confirmLabel: '仅重试失败集',
+    confirmLabel: '仅重试可恢复集',
+    recoveryLabel: '查询同一重试命令结果',
   };
 };

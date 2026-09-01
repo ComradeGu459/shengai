@@ -1,10 +1,10 @@
 import {
   AcceptanceCommandResultSchema, AcceptanceEditEventListSchema, AcceptanceEpisodeCommandResultSchema,
   AcceptanceEpisodeDetailSchema, AcceptancePlaybackGrantSchema, AcceptancePreflightSchema,
-  AcceptanceReleaseCommandResultSchema, AcceptanceReleaseListSchema, AcceptanceReworkCommandResultSchema,
+  AcceptanceReleaseListSchema, AcceptanceReworkCommandResultSchema,
   AcceptanceReworkListSchema, AcceptanceSessionDetailSchema, AcceptanceSessionListSchema,
   ApiErrorSchema, ApplyAcceptanceCueCommandBodySchema, CreateAcceptanceIssueBodySchema,
-  CreateAcceptancePlaybackGrantBodySchema, CreateAcceptanceReleaseBodySchema, CreateAcceptanceReworkBodySchema,
+  CreateAcceptancePlaybackGrantBodySchema, CreateAcceptanceReworkBodySchema,
   CreateAcceptanceSessionBodySchema, PassAcceptanceEpisodeBodySchema, PassAcceptanceEpisodesBodySchema,
   PassAcceptanceEpisodesResultSchema, RedoAcceptanceEditBodySchema, ResolveAcceptanceIssueBodySchema,
   SelectAcceptanceVideoBodySchema, UndoAcceptanceEditBodySchema,
@@ -48,7 +48,6 @@ export const subtitleAcceptanceRoutes: FastifyPluginAsyncTypebox = async (app) =
   app.post('/api/projects/:projectId/subtitle-acceptance/sessions/:sessionId/pass-eligible', { schema: { params: Session, headers: Idempotency, body: PassAcceptanceEpisodesBodySchema, response: { 200: PassAcceptanceEpisodesResultSchema, 201: PassAcceptanceEpisodesResultSchema } } }, async (request, reply) => handle(reply, request.id, async () => { const result = await service.passEligible(request.params.projectId, request.params.sessionId, request.body, request.headers['idempotency-key']); return reply.code(result.replay ? 200 : 201).send(result); }));
   app.post('/api/projects/:projectId/subtitle-acceptance/sessions/:sessionId/rework', { schema: { params: Session, headers: Idempotency, body: CreateAcceptanceReworkBodySchema, response: { 200: AcceptanceReworkCommandResultSchema, 201: AcceptanceReworkCommandResultSchema } } }, async (request, reply) => handle(reply, request.id, async () => { const result = await service.createRework(request.params.projectId, request.params.sessionId, request.body, request.headers['idempotency-key']); return reply.code(result.replay ? 200 : 201).send(result); }));
   app.get('/api/projects/:projectId/subtitle-acceptance/sessions/:sessionId/rework', { schema: { params: Session, response: { 200: AcceptanceReworkListSchema } } }, async (request, reply) => handle(reply, request.id, () => service.rework(request.params.projectId, request.params.sessionId)));
-  app.post('/api/projects/:projectId/subtitle-acceptance/sessions/:sessionId/releases', { schema: { params: Session, headers: Idempotency, body: CreateAcceptanceReleaseBodySchema, response: { 200: AcceptanceReleaseCommandResultSchema, 201: AcceptanceReleaseCommandResultSchema } } }, async (request, reply) => handle(reply, request.id, async () => { const result = await service.createRelease(request.params.projectId, request.params.sessionId, request.body, request.headers['idempotency-key']); return reply.code(result.replay ? 200 : 201).send(result); }));
   app.get('/api/projects/:projectId/subtitle-acceptance/releases', { schema: { params: Project, response: { 200: AcceptanceReleaseListSchema } } }, async (request) => service.listReleases(request.params.projectId));
   app.post('/api/projects/:projectId/subtitle-acceptance/sessions/:sessionId/episodes/:episodeNumber/playback', { schema: { params: Episode, body: CreateAcceptancePlaybackGrantBodySchema, response: { 201: AcceptancePlaybackGrantSchema } } }, async (request, reply) => handle(reply, request.id, async () => reply.code(201).send(await service.createPlaybackGrant(request.params.projectId, request.params.sessionId, Number(request.params.episodeNumber), request.body))));
   app.get('/api/subtitle-acceptance/playback/:token', { schema: { params: Playback } }, async (request, reply) => handle(reply, request.id, async () => reply.type('application/octet-stream').send(Buffer.from(await service.playback(request.params.token)))));

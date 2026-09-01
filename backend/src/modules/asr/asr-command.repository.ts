@@ -8,6 +8,9 @@ import type { AsrAdapterDescriptor } from './asr-adapter.js';
 import { asrConflict, asrInvalid, asrNotFound } from './asr-errors.js';
 import { applyAsrHotwordCapabilities, buildHotwordProjection } from './asr-hotwords.js';
 import { loadAsrBatchDetail } from './asr-read.repository.js';
+import type { AsrAdapterRegistry } from './asr-adapter-registry.js';
+import type { SystemControlRoutingService } from '../system-control/system-control.routing.service.js';
+import { SystemControlRoutingError } from '../system-control/system-control.routing.errors.js';
 
 interface CommandRow extends QueryResultRow {
   request_hash: string;
@@ -104,7 +107,8 @@ export const refreshAsrBatchStatus = async (client: PoolClient, batchId: string)
 export class AsrCommandRepository {
   constructor(
     private readonly pool: DatabasePool,
-    private readonly adapterDescriptor: Readonly<AsrAdapterDescriptor>,
+    private readonly routingService: SystemControlRoutingService,
+    private readonly adapterRegistry: AsrAdapterRegistry,
   ) {}
 
   async create(input: {
@@ -181,20 +185,38 @@ export class AsrCommandRepository {
       else episodes = scope.episodeNumbers;
       if (!episodes.length) throw asrInvalid('ASR_BATCH_SCOPE_EMPTY', '所选范围没有中文识别视频槽位。');
 
-      const termVersion = await client.query(
-        'SELECT id FROM term_versions WHERE id = $1 AND project_id = $2',
-        [input.body.termVersionId, input.projectId],
-      );
-      if (!termVersion.rows[0]) {
+      const termVersion = input.body.termVersionId !== undefined && input.body.termVersionId !== null
+        ? await client.query<{ id: string }>(
+          'SELECT version.id FROM term_versions version JOIN term_drafts draft ON draft.id = version.draft_id WHERE version.id = $1 AND version.project_id = $2 AND draft.status = \'confirmed\'',
+          [input.body.termVersionId, input.projectId],
+        )
+        : await client.query<{ id: string }>(
+          `SELECT version.id FROM term_versions version
+             JOIN term_drafts draft ON draft.id = version.draft_id
+            WHERE version.project_id = $1 AND draft.status = 'confirmed'
+            ORDER BY version.version DESC LIMIT 1`,
+          [input.projectId],
+        );
+      const lockedTermVersionId = input.body.termVersionId === null
+        ? null
+        : termVersion.rows[0]?.id ?? null;
+      if (input.body.termVersionId !== undefined && input.body.termVersionId !== null && !lockedTermVersionId) {
         throw asrInvalid(
           'ASR_TERM_VERSION_NOT_FOUND',
           '必须选择属于当前项目的已确认术语版本。',
           'select_term_version',
         );
       }
-      const adapter = this.adapterDescriptor;
+      let active: Awaited<ReturnType<SystemControlRoutingService['resolveActiveTarget']>>;
+      try {
+        active = await this.routingService.resolveActiveTarget('asr', 'asr_api', this.adapterRegistry, client);
+      } catch (error) {
+        if (!(error instanceof SystemControlRoutingError)) throw error;
+        throw asrConflict('ASR_ROUTING_NOT_ACTIVE', error.message, 'publish_routing_policy');
+      }
+      const adapter = active.descriptor as Readonly<AsrAdapterDescriptor>;
       const hotwords = applyAsrHotwordCapabilities(
-        await buildHotwordProjection(client, input.body.termVersionId),
+        await buildHotwordProjection(client, lockedTermVersionId),
         adapter,
       );
       const sources = await loadSources(client, manifest.rows[0].id, episodes);
@@ -214,15 +236,15 @@ export class AsrCommandRepository {
       });
       const created = await client.query<{ id: string }>(
         `INSERT INTO asr_batches
-           (project_id, scope_kind, episode_numbers, term_version_id, manifest_id, manifest_version,
+           (project_id, scope_kind, episode_numbers, term_version_id, manifest_id, manifest_version, routing_version_id, route_digest,
             provider, adapter, model, language, config_digest, hotword_digest,
             hotword_term_count, hotword_alias_count, hotword_filtered_count, hotword_truncated_count,
             hotword_projection_version, hotword_max_entries, hotword_max_characters,
             hotword_supported, force_new_recognition, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
          RETURNING id`,
-        [input.projectId, scope.kind, episodes, input.body.termVersionId,
-          manifest.rows[0].id, manifest.rows[0].version,
+        [input.projectId, scope.kind, episodes, lockedTermVersionId,
+          manifest.rows[0].id, manifest.rows[0].version, active.routingVersionId, active.routeDigest,
           adapter.provider, adapter.adapter, adapter.model, adapter.language, adapter.configDigest,
           hotwords.summary.digest,
           hotwords.summary.termCount, hotwords.summary.aliasCount, hotwords.summary.filteredCount,
@@ -245,11 +267,11 @@ export class AsrCommandRepository {
           const reusable = await client.query<{ id: string }>(
             `SELECT id FROM asr_results
               WHERE project_id = $1 AND episode_number = $2 AND asset_id = $3
-                AND term_version_id = $4 AND config_digest = $5 AND hotword_digest = $6
+                AND term_version_id IS NOT DISTINCT FROM $4 AND config_digest = $5 AND hotword_digest = $6
                 AND quality_status IN ('pass','warning')
               ORDER BY revision DESC LIMIT 1`,
             [input.projectId, source.episode_number, source.asset_id,
-              input.body.termVersionId, adapter.configDigest, hotwords.summary.digest],
+              lockedTermVersionId, adapter.configDigest, hotwords.summary.digest],
           );
           const reusableResultId = reusable.rows[0]?.id ?? null;
           const reuseWithoutExecution = Boolean(reusableResultId) && !(input.body.forceNewRecognition ?? false);
@@ -257,11 +279,12 @@ export class AsrCommandRepository {
             `INSERT INTO asr_jobs
                (batch_id, project_id, episode_number, manifest_id, asset_id, asset_original_filename,
                 asset_checksum_algorithm, asset_checksum_value, term_version_id, config_digest,
-                hotword_digest, status, current_result_id, reused_result)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+                hotword_digest, routing_version_id, route_digest, status, current_result_id, reused_result)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
             [batchId, input.projectId, source.episode_number, manifest.rows[0].id, source.asset_id,
               source.original_filename, source.checksum_algorithm, source.checksum_value,
-              input.body.termVersionId, adapter.configDigest, hotwords.summary.digest,
+              lockedTermVersionId, adapter.configDigest, hotwords.summary.digest,
+              active.routingVersionId, active.routeDigest,
               reuseWithoutExecution ? 'completed' : 'queued', reusableResultId, reuseWithoutExecution],
           );
         }
@@ -392,25 +415,40 @@ export class AsrCommandRepository {
         throw asrConflict('ASR_PROJECT_NOT_ACTIVE', '项目已进入回收流程，不能重试识别。', 'restore_project');
       }
       const sourceBatch = await client.query<{
-        id: string; term_version_id: string; manifest_id: string; manifest_version: number;
+        id: string; term_version_id: string | null; manifest_id: string; manifest_version: number;
         provider: string; adapter: string; model: string; language: string;
         config_digest: string; hotword_digest: string; hotword_term_count: number;
         hotword_alias_count: number; hotword_filtered_count: number; hotword_truncated_count: number;
         hotword_projection_version: string; hotword_max_entries: number | null;
         hotword_max_characters: number | null; hotword_supported: boolean;
+        routing_version_id: string | null; route_digest: string | null;
       }>('SELECT * FROM asr_batches WHERE id = $1 AND project_id = $2 FOR UPDATE', [input.batchId, input.projectId]);
       if (!sourceBatch.rows[0]) throw asrNotFound('ASR_BATCH_NOT_FOUND', 'ASR 批次不存在。');
       const eligible = await client.query<{
         id: string; episode_number: number; manifest_id: string; asset_id: string;
         asset_original_filename: string; asset_checksum_algorithm: string; asset_checksum_value: string;
-        term_version_id: string; config_digest: string; hotword_digest: string; current_result_id: string | null;
+        term_version_id: string | null; config_digest: string; hotword_digest: string; current_result_id: string | null;
+        routing_version_id: string | null; route_digest: string | null;
       }>(
         `SELECT job.id, job.episode_number, job.manifest_id, job.asset_id,
                 job.asset_original_filename, job.asset_checksum_algorithm, job.asset_checksum_value,
-                job.term_version_id, job.config_digest, job.hotword_digest, job.current_result_id
+                job.term_version_id, job.config_digest, job.hotword_digest, job.current_result_id,
+                job.routing_version_id, job.route_digest
            FROM asr_jobs job
            JOIN asr_attempts attempt ON attempt.id = job.current_attempt_id
-          WHERE job.batch_id = $1 AND job.status = 'failed' AND attempt.retryable
+          WHERE job.batch_id = $1 AND job.status = 'failed'
+            AND (attempt.retryable OR attempt.error_code IN (
+              'SYSTEM_CONTROL_BUDGET_NO_ACTIVE_POLICY',
+              'SYSTEM_CONTROL_BUDGET_RULE_MISSING',
+              'SYSTEM_CONTROL_BUDGET_HARD_LIMIT'
+            ))
+            AND attempt.provider_request_id IS NULL
+            AND attempt.external_side_effect_possible = FALSE
+            AND NOT EXISTS (
+              SELECT 1 FROM asr_usage usage
+               WHERE usage.attempt_id = attempt.id
+                 AND usage.provider_request_id IS NOT NULL
+            )
           ORDER BY job.episode_number`,
         [input.batchId],
       );
@@ -436,14 +474,14 @@ export class AsrCommandRepository {
       const created = await client.query<{ id: string }>(
         `INSERT INTO asr_batches
            (project_id, retry_of_batch_id, scope_kind, episode_numbers, term_version_id,
-            manifest_id, manifest_version, provider, adapter, model, language, config_digest,
+            manifest_id, manifest_version, routing_version_id, route_digest, provider, adapter, model, language, config_digest,
             hotword_digest, hotword_term_count, hotword_alias_count, hotword_filtered_count,
             hotword_truncated_count, hotword_projection_version, hotword_max_entries,
             hotword_max_characters, hotword_supported, force_new_recognition, status)
-         VALUES ($1,$2,'selected',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,TRUE,'queued')
+         VALUES ($1,$2,'selected',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,TRUE,'queued')
          RETURNING id`,
         [input.projectId, input.batchId, episodes, source.term_version_id,
-          source.manifest_id, source.manifest_version,
+          source.manifest_id, source.manifest_version, source.routing_version_id, source.route_digest,
           source.provider, source.adapter, source.model, source.language,
           source.config_digest, source.hotword_digest,
           source.hotword_term_count, source.hotword_alias_count, source.hotword_filtered_count,
@@ -457,11 +495,11 @@ export class AsrCommandRepository {
           `INSERT INTO asr_jobs
              (batch_id, project_id, episode_number, manifest_id, asset_id, asset_original_filename,
               asset_checksum_algorithm, asset_checksum_value, term_version_id, config_digest,
-              hotword_digest, status, current_result_id)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'queued',$12)`,
+              hotword_digest, routing_version_id, route_digest, status, current_result_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'queued',$14)`,
           [retryBatchId, input.projectId, episode, job.manifest_id, job.asset_id,
             job.asset_original_filename, job.asset_checksum_algorithm, job.asset_checksum_value,
-            job.term_version_id, job.config_digest, job.hotword_digest, job.current_result_id],
+            job.term_version_id, job.config_digest, job.hotword_digest, job.routing_version_id, job.route_digest, job.current_result_id],
         );
       }
       await client.query(

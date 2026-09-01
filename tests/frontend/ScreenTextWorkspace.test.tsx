@@ -75,6 +75,23 @@ const releasableBatch = (revision = 5) => {
   };
 };
 
+const partialReleaseBatch = (revision = 5) => {
+  const current = batch('partial');
+  return {
+    ...current,
+    revision,
+    counts: { ...current.counts, reviewPending: 0, completed: 1, failed: 1 },
+    jobs: current.jobs.map((item, index) => index === 0
+      ? { ...item, status: 'completed', candidateCounts: { total: 0, pending: 0, approved: 0, edited: 0, rejected: 0 } }
+      : {
+          ...item,
+          status: 'failed',
+          candidateCounts: { total: 0, pending: 0, approved: 0, edited: 0, rejected: 0 },
+          latestAttempt: { errorCode: 'OCR_TIMEOUT', providerRequestId: 'REQ-ST-OCR-FAIL' },
+        }),
+  };
+};
+
 const summary = (status = 'review_pending') => {
   const detail = batch(status);
   const { execution: _execution, frameStrategyVersion: _frame, dedupeStrategyVersion: _dedupe, termProjection: _projection, usage: _usage, jobs: _jobs, ...item } = detail;
@@ -157,6 +174,10 @@ describe('ScreenTextWorkspace', () => {
     expect(screen.getByRole('complementary', { name: '候选证据与编辑' })).toBeInTheDocument();
     expect(screen.getAllByText('顾淮').length).toBeGreaterThan(0);
     expect(await screen.findByRole('img', { name: '第 1 集画面字代表截图' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '保留' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '忽略' })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: '拆分左右' })).not.toBeInTheDocument();
+    expect(screen.getByText('本条不纳入画面字字幕，可从已忽略恢复')).toBeInTheDocument();
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith(`/screen-text/candidates/${candidateId}/evidence`))).toBe(true);
     expect(fetchMock.mock.calls.some(([input]) => String(input).includes('sort=identity_first') && String(input).includes('episodeNumber=1'))).toBe(true);
   });
@@ -180,8 +201,11 @@ describe('ScreenTextWorkspace', () => {
     const rowCheckbox = await screen.findByRole('checkbox', { name: '选择候选 顾淮' });
     await waitFor(() => expect(evidenceCalls).toBe(1));
     expect(rowCheckbox).toBeDisabled();
+    expect(screen.getByRole('checkbox', { name: '选择当前页' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '人工新增' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: '保留并下一条' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '保留' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '忽略' })).toBeDisabled();
+    expect(screen.getByRole('textbox', { name: '文字' })).toBeDisabled();
 
     resolveFirst(response({ error: { code: 'SCREEN_TEXT_EVIDENCE_UNAVAILABLE', message: '代表截图对象暂不可读取。', retryable: true, action: 'reload_screen_text_evidence', requestId: 'REQ-ST-EVIDENCE-503' } }, 503));
     const alert = await screen.findByRole('alert');
@@ -200,7 +224,18 @@ describe('ScreenTextWorkspace', () => {
     await waitFor(() => expect(evidencePane).toHaveFocus());
     expect(rowCheckbox).toBeEnabled();
     expect(screen.getByRole('button', { name: '人工新增' })).toBeEnabled();
-    expect(screen.getByRole('button', { name: '保留并下一条' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '保留' })).toBeEnabled();
+  });
+
+  it('已忽略候选只提供恢复为待确认，不提供新的保留或忽略决定', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(defaultFetch());
+    renderPage();
+    await screen.findByRole('checkbox', { name: '选择候选 顾淮' });
+    fireEvent.change(screen.getByRole('combobox', { name: '候选状态' }), { target: { value: 'rejected' } });
+    await screen.findByRole('img', { name: '第 1 集画面字代表截图' });
+    await waitFor(() => expect(screen.getByRole('button', { name: '恢复为待确认' })).toBeEnabled());
+    expect(screen.queryByRole('button', { name: '保留' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '忽略' })).not.toBeInTheDocument();
   });
 
   it('来源门禁不满足时统一锁定候选选择、批量、决定、保存和人工新增', async () => {
@@ -218,10 +253,10 @@ describe('ScreenTextWorkspace', () => {
     expect(screen.getByRole('checkbox', { name: '选择候选 顾淮' })).toBeDisabled();
     screen.getAllByRole('button', { name: '处理' }).forEach((button) => expect(button).toBeDisabled());
     expect(screen.getByRole('button', { name: '忽略' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: '拆分左右' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: '保留并下一条' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: '拆分左右' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '保留' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '保存修改' })).toBeDisabled();
-    fireEvent.click(screen.getByRole('button', { name: '保留并下一条' }));
+    fireEvent.click(screen.getByRole('button', { name: '保留' }));
     expect(fetchMock.mock.calls.filter(([input, init]) => String(input).endsWith('/decisions') && init?.method === 'POST')).toHaveLength(0);
   });
 
@@ -243,16 +278,16 @@ describe('ScreenTextWorkspace', () => {
     const parentRow = (await screen.findByText('左侧文字 / 右侧文字')).closest('tr')!;
     await waitFor(() => expect(screen.getByRole('button', { name: '忽略' })).toBeEnabled());
     expect(screen.getByRole('button', { name: '拆分左右' })).toBeEnabled();
-    expect(screen.queryByRole('button', { name: '保留并下一条' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '保留' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '保存修改' })).not.toBeInTheDocument();
 
     const normalRow = screen.getByText('顾淮').closest('tr')!;
     fireEvent.click(within(normalRow).getByRole('button', { name: '处理' }));
-    await waitFor(() => expect(screen.getByRole('button', { name: '保留并下一条' })).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole('button', { name: '保留' })).toBeEnabled());
     expect(screen.getByRole('button', { name: '保存修改' })).toBeEnabled();
     const childRow = screen.getByText('左侧文字').closest('tr')!;
     fireEvent.click(within(childRow).getByRole('button', { name: '处理' }));
-    await waitFor(() => expect(screen.getByRole('button', { name: '保留并下一条' })).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole('button', { name: '保留' })).toBeEnabled());
     expect(screen.getByRole('button', { name: '保存修改' })).toBeEnabled();
 
     fireEvent.click(within(parentRow).getByRole('button', { name: '处理' }));
@@ -276,12 +311,13 @@ describe('ScreenTextWorkspace', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: '选择候选 顾淮' }));
     expect(screen.getByText('普通选择仅作用当前页')).toBeInTheDocument();
     fireEvent.change(screen.getByRole('combobox', { name: '候选排序' }), { target: { value: 'confidence_desc' } });
-    await waitFor(() => expect(screen.queryByText('普通选择仅作用当前页')).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('普通选择仅作用当前页')).toBeInTheDocument());
 
     fireEvent.change(screen.getByRole('textbox', { name: '搜索候选' }), { target: { value: '顾' } });
     fireEvent.change(screen.getByRole('combobox', { name: '候选状态' }), { target: { value: 'pending' } });
     fireEvent.change(screen.getByRole('combobox', { name: '候选分类' }), { target: { value: 'nameplate' } });
 
+    await waitFor(() => expect(screen.queryByText('普通选择仅作用当前页')).not.toBeInTheDocument());
     await waitFor(() => expect(fetchMock.mock.calls.some(([input]) => {
       const url = String(input);
       return url.includes('search=%E9%A1%BE') && url.includes('status=pending') && url.includes('category=nameplate') && url.includes('sort=confidence_desc');
@@ -296,7 +332,7 @@ describe('ScreenTextWorkspace', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: '选择候选 顾淮' }));
     expect(screen.getByText('普通选择仅作用当前页')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '选择全部 2 项待确认候选' }));
-    expect(screen.getByText('成员来自当前服务端筛选范围')).toBeInTheDocument();
+    expect(await screen.findByText('成员来自当前服务端筛选范围')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '批量保留' }));
 
     await waitFor(() => expect(fetchMock.mock.calls.filter(([input, init]) => String(input).endsWith('/decisions') && init?.method === 'POST')).toHaveLength(2));
@@ -314,7 +350,8 @@ describe('ScreenTextWorkspace', () => {
     expect(screen.queryByRole('button', { name: '人工新增' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '忽略' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '保存修改' })).not.toBeInTheDocument();
-    expect(screen.getByRole('checkbox', { name: '选择候选 顾淮' })).toBeDisabled();
+    const candidateCheckbox = await screen.findByRole('checkbox', { name: '选择候选 顾淮' });
+    expect(candidateCheckbox).toBeDisabled();
     expect(screen.getAllByRole('button', { name: '查看' }).length).toBeGreaterThan(0);
   });
 
@@ -363,7 +400,7 @@ describe('ScreenTextWorkspace', () => {
     expect(dialog).toBeInTheDocument();
     expect(createCalls).toBe(1);
     resolveCreate(response(batch('queued'), 201));
-    const success = await screen.findByText(/识别批次 15d7670f 已创建/);
+    const success = await screen.findByText(/识别批次已创建/);
     await waitFor(() => expect(success).toHaveFocus());
   });
 
@@ -482,6 +519,34 @@ describe('ScreenTextWorkspace', () => {
     expect(releaseCalls[1]?.body).toEqual({ batchId, expectedBatchRevision: 5 });
   });
 
+  it('仅在无待确认集时允许部分发布，确认列出排除集并提交 allowPartial', async () => {
+    const healthy = defaultFetch({ status: 'partial' });
+    const releaseCalls: Array<{ key: string | null; body: Record<string, unknown> }> = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith(`/screen-text/batches/${batchId}`) && init?.method !== 'POST') return response(partialReleaseBatch());
+      if (url.endsWith('/screen-text/releases') && init?.method === 'POST') {
+        releaseCalls.push({ key: new Headers(init.headers).get('idempotency-key'), body: JSON.parse(String(init.body)) as Record<string, unknown> });
+        return response({ id: '15d7670f-6a47-4498-ac53-3997cb04b040' }, 201);
+      }
+      return healthy(input, init);
+    });
+    renderPage();
+
+    const partialButton = await screen.findByRole('button', { name: '部分发布' });
+    expect(partialButton).toBeEnabled();
+    fireEvent.click(partialButton);
+    const dialog = screen.getByRole('dialog', { name: '确认部分发布' });
+    expect(within(dialog).getByText(/排除集不会重跑、删除/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/第 02 集 · 失败/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/错误：OCR_TIMEOUT/)).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole('button', { name: '确认部分发布' }));
+
+    await waitFor(() => expect(releaseCalls).toHaveLength(1));
+    expect(releaseCalls[0]?.body).toEqual({ batchId, expectedBatchRevision: 5, allowPartial: true });
+    expect(releaseCalls[0]?.key).toBeTruthy();
+  });
+
   it('明确空集确定性冲突清除旧意图，刷新后显式提交使用新 key 和新修订', async () => {
     const healthy = defaultFetch();
     let serverRevision = 5;
@@ -526,11 +591,13 @@ describe('ScreenTextWorkspace', () => {
   it('历史发布下载使用服务端恢复的 exportId 和 filename', async () => {
     const healthy = defaultFetch();
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
-      if (String(input).includes('/screen-text/releases')) return response({ items: [{ id: '15d7670f-6a47-4498-ac53-3997cb04b030', projectId, version: 2, batchId, termVersionId, manifestId, draftRevision: 5, releaseDigest: digest, cueCount: 1, exports: [{ id: '15d7670f-6a47-4498-ac53-3997cb04b031', episodeNumber: 1, filename: '画面字_第01集_V2.srt', sha256: digest, sizeBytes: 42, downloadPath: '/ignored' }], createdAt: '2026-08-15T03:00:00.000Z' }], total: 1, limit: 100, offset: 0 });
+      if (String(input).includes('/screen-text/releases')) return response({ items: [{ id: '15d7670f-6a47-4498-ac53-3997cb04b030', projectId, version: 2, batchId, termVersionId, manifestId, draftRevision: 5, releaseDigest: digest, cueCount: 1, partial: true, excludedEpisodes: [{ episodeNumber: 2, jobId, status: 'failed', attemptId: null, errorCode: 'OCR_TIMEOUT', effectClass: 'external_not_accepted', providerRequestId: 'REQ-ST-OCR-FAIL' }], exports: [{ id: '15d7670f-6a47-4498-ac53-3997cb04b031', episodeNumber: 1, filename: '画面字_第01集_V2.srt', sha256: digest, sizeBytes: 42, downloadPath: '/ignored' }], createdAt: '2026-08-15T03:00:00.000Z' }], total: 1, limit: 100, offset: 0 });
       return healthy(input, init);
     });
     renderPage();
     fireEvent.click(await screen.findByRole('button', { name: '历史版本' }));
+    expect(await screen.findByText('部分发布')).toBeInTheDocument();
+    expect(screen.getByText(/排除 1 集：第02集 失败（OCR_TIMEOUT）/)).toBeInTheDocument();
     const link = await screen.findByRole('link', { name: /画面字_第01集_V2.srt/ });
     expect(link).toHaveAttribute('href', `/api/projects/${projectId}/screen-text/exports/15d7670f-6a47-4498-ac53-3997cb04b031/download`);
   });

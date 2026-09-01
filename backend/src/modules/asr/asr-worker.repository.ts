@@ -3,6 +3,7 @@ import type { PoolClient, QueryResultRow } from 'pg';
 
 import type { DatabasePool } from '../../database/pool.js';
 import type { AsrAdapterDescriptor, AsrAdapterOutcome } from './asr-adapter.js';
+import type { BudgetUsageFacts } from '../system-control/system-control.budget.service.js';
 import { refreshAsrBatchStatus } from './asr-command.repository.js';
 import {
   applyAsrHotwordCapabilities,
@@ -26,7 +27,7 @@ interface ClaimRow extends QueryResultRow {
   asset_size_bytes: string;
   source_asset_checksum_algorithm: string;
   source_asset_checksum_value: string;
-  term_version_id: string;
+  term_version_id: string | null;
   config_digest: string;
   hotword_digest: string;
   current_attempt_id: string | null;
@@ -46,9 +47,30 @@ interface ClaimRow extends QueryResultRow {
   hotword_max_characters: number | null;
   hotword_supported: boolean;
   status: string;
+  routing_version_id: string | null;
+  route_digest: string | null;
+  routing_target_id: string;
+  routing_target_priority: number;
+  target_deployment_version_id: string;
+  target_provider: string;
+  target_adapter: string;
+  target_model: string;
+  target_language: string;
+  target_config_digest: string;
+  target_capabilities_snapshot: any;
+  deployment_version_id: string | null;
   attempt_provider_request_id: string | null;
   attempt_external_side_effect_possible: boolean | null;
+  billing_snapshot: AsrAdapterDescriptor['billing'] | null;
 }
+
+export const resolveAsrAdapterDescriptorDigest = (capabilitiesSnapshot: unknown): string => {
+  const digest = (capabilitiesSnapshot as { descriptorDigest?: unknown } | null)?.descriptorDigest;
+  if (typeof digest !== 'string' || !/^[0-9a-f]{64}$/u.test(digest)) {
+    throw new Error('ASR_ROUTING_TARGET_DESCRIPTOR_DIGEST_MISSING');
+  }
+  return digest;
+};
 
 export interface AsrWorkerClaim {
   jobId: string;
@@ -65,11 +87,16 @@ export interface AsrWorkerClaim {
     checksum: { algorithm: string; value: string };
   };
   adapterDescriptor: AsrAdapterDescriptor;
-  termVersionId: string;
+  termVersionId: string | null;
   configDigest: string;
   hotwordDigest: string;
   attemptId: string;
   attemptNumber: number;
+  providerRequestId: string | null;
+  deploymentVersionId: string;
+  routingTargetId: string;
+  routingTargetPriority: number;
+  billingSnapshot: AsrAdapterDescriptor['billing'];
   retryOfBatchId: string | null;
   hasPreviousResult: boolean;
   hotwords: HotwordProjection;
@@ -80,16 +107,24 @@ const recordUsage = async (
   client: PoolClient,
   attemptId: string,
   usage: AsrUsage,
+  budgetFacts?: BudgetUsageFacts,
 ) => {
+  const cnyNative = budgetFacts && !budgetFacts.conversionSnapshotId && budgetFacts.sourceCurrency === 'CNY';
   await client.query(
     `INSERT INTO asr_usage
        (attempt_id, provider, media_duration_ms, billing_unit, billing_quantity,
-        currency, estimated_amount, final_amount, reconciliation_status, provider_request_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        currency, estimated_amount, final_amount, reconciliation_status, provider_request_id,
+        conversion_snapshot_id, rate_digest, conversion_effective_at, original_currency,
+        original_estimated_amount, original_final_amount, estimated_amount_cny, final_amount_cny)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::numeric,$16::numeric,$17::numeric,$18::numeric)
      ON CONFLICT (attempt_id) DO NOTHING`,
     [attemptId, usage.provider, usage.mediaDurationMs, usage.billingUnit,
       usage.billingQuantity, usage.currency, usage.estimatedAmount, usage.finalAmount,
-      usage.reconciliationStatus, usage.providerRequestId],
+      usage.reconciliationStatus, usage.providerRequestId,
+      budgetFacts?.conversionSnapshotId ?? null, budgetFacts?.rateDigest ?? null,
+      budgetFacts?.conversionEffectiveAt ?? null, budgetFacts?.sourceCurrency ?? usage.currency,
+      usage.estimatedAmount, usage.finalAmount,
+      cnyNative ? usage.estimatedAmount : null, cnyNative ? usage.finalAmount : null],
   );
 };
 
@@ -115,6 +150,12 @@ const assertHotwordReceiptFacts = (claim: AsrWorkerClaim, outcome: AsrAdapterOut
   if (outcome.hotwordReceipt === 'unknown') {
     if (facts.submittedCount !== null || facts.omittedCount !== null || facts.reasonCode !== 'unknown') {
       throw new Error('ASR 适配器 unknown 热词回执不得推断提交数量。');
+    }
+    return;
+  }
+  if (outcome.hotwordReceipt === 'unused') {
+    if (facts.submittedCount !== 0 || facts.omittedCount !== 0 || facts.reasonCode !== 'no_confirmed_term_version' || payloadCount !== 0) {
+      throw new Error('ASR 适配器 unused 热词回执必须明确无 confirmed TermVersion 且没有提交。');
     }
     return;
   }
@@ -162,12 +203,18 @@ export class AsrWorkerRepository {
                 asset.checksum_algorithm AS source_asset_checksum_algorithm,
                 asset.checksum_value AS source_asset_checksum_value,
                 attempt.provider_request_id AS attempt_provider_request_id,
-                attempt.external_side_effect_possible AS attempt_external_side_effect_possible
+                attempt.external_side_effect_possible AS attempt_external_side_effect_possible,
+                route.routing_target_id, route.priority AS routing_target_priority,
+                route.max_concurrent_jobs, route.per_project_max, route.queue_limit,
+                route.deployment_version_id AS target_deployment_version_id,
+                route.target_provider, route.target_adapter, route.target_model, route.target_language,
+                route.target_config_digest, route.target_capabilities_snapshot
            FROM asr_jobs job
            JOIN asr_batches batch ON batch.id = job.batch_id
            JOIN projects project ON project.id = job.project_id
            JOIN assets asset ON asset.id = job.asset_id
-           LEFT JOIN asr_attempts attempt ON attempt.id = job.current_attempt_id
+          LEFT JOIN asr_attempts attempt ON attempt.id = job.current_attempt_id
+          JOIN LATERAL (SELECT t.routing_target_id,t.priority,t.deployment_version_id,t.max_concurrent_jobs,t.per_project_max,t.queue_limit,d.provider AS target_provider,d.adapter_key AS target_adapter,v.model AS target_model,v.language AS target_language,v.config_digest AS target_config_digest,v.capabilities_snapshot AS target_capabilities_snapshot FROM routing_policy_targets t JOIN engine_deployment_versions v ON v.id=t.deployment_version_id JOIN engine_deployments d ON d.id=v.deployment_id WHERE t.routing_version_id=job.routing_version_id AND t.pool_id='asr_api' AND t.priority = CASE WHEN job.current_attempt_id IS NOT NULL THEN (SELECT routing_target_priority FROM asr_attempts WHERE id=job.current_attempt_id) ELSE COALESCE((SELECT MAX(routing_target_priority) FROM asr_attempts WHERE job_id=job.id),0)+1 END ORDER BY t.priority LIMIT 1) route ON TRUE
           WHERE job.status IN ('leased','running','cancel_requested')
             AND attempt.lease_expires_at <= $1
           ORDER BY attempt.lease_expires_at, batch.created_at, job.episode_number, job.id
@@ -177,25 +224,6 @@ export class AsrWorkerRepository {
       );
       let job = expired.rows[0];
       if (!job) {
-        const inFlight = await client.query<{ count: string }>(
-          `SELECT COUNT(*)::text AS count FROM asr_jobs
-            WHERE status IN ('leased','running','cancel_requested')`,
-        );
-        if (Number(inFlight.rows[0]!.count) >= input.policy.maxGlobalInFlight) {
-          await client.query('COMMIT');
-          return null;
-        }
-        if (input.policy.maxStartsPerWindow !== null) {
-          const starts = await client.query<{ count: string }>(
-            `SELECT COUNT(*)::text AS count FROM asr_attempts
-              WHERE created_at >= $1`,
-            [new Date(input.now.getTime() - input.policy.rateWindowMs)],
-          );
-          if (Number(starts.rows[0]!.count) >= input.policy.maxStartsPerWindow) {
-            await client.query('COMMIT');
-            return null;
-          }
-        }
         const queued = await client.query<ClaimRow>(
           `SELECT job.*, project.lifecycle_status, batch.retry_of_batch_id,
                   batch.provider AS batch_provider, batch.adapter AS batch_adapter,
@@ -210,23 +238,60 @@ export class AsrWorkerRepository {
                   asset.checksum_algorithm AS source_asset_checksum_algorithm,
                   asset.checksum_value AS source_asset_checksum_value,
                   NULL::varchar AS attempt_provider_request_id,
-                  NULL::boolean AS attempt_external_side_effect_possible
+                  NULL::boolean AS attempt_external_side_effect_possible,
+                  route.routing_target_id, route.priority AS routing_target_priority,
+                  route.max_concurrent_jobs, route.per_project_max, route.queue_limit,
+                  route.deployment_version_id AS target_deployment_version_id,
+                  route.target_provider, route.target_adapter, route.target_model, route.target_language,
+                  route.target_config_digest, route.target_capabilities_snapshot
              FROM asr_jobs job
              JOIN asr_batches batch ON batch.id = job.batch_id
              JOIN projects project ON project.id = job.project_id
              JOIN assets asset ON asset.id = job.asset_id
              LEFT JOIN asr_project_scheduling scheduling ON scheduling.project_id = job.project_id
+             JOIN LATERAL (SELECT t.routing_target_id,t.priority,t.deployment_version_id,t.max_concurrent_jobs,t.per_project_max,t.queue_limit,d.provider AS target_provider,d.adapter_key AS target_adapter,v.model AS target_model,v.language AS target_language,v.config_digest AS target_config_digest,v.capabilities_snapshot AS target_capabilities_snapshot FROM routing_policy_targets t JOIN engine_deployment_versions v ON v.id=t.deployment_version_id JOIN engine_deployments d ON d.id=v.deployment_id WHERE t.routing_version_id=job.routing_version_id AND t.pool_id='asr_api' AND t.priority = COALESCE((SELECT MAX(routing_target_priority) FROM asr_attempts WHERE job_id=job.id),0)+1 ORDER BY t.priority LIMIT 1) route ON TRUE
             WHERE job.status = 'queued'
-              AND (
-                SELECT COUNT(*) FROM asr_jobs active
-                 WHERE active.project_id = job.project_id
-                   AND active.status IN ('leased','running','cancel_requested')
-              ) < $1
+              AND (SELECT COUNT(*) FROM asr_attempts active_attempt
+                   WHERE active_attempt.routing_target_id=route.routing_target_id
+                     AND active_attempt.status IN ('leased','running')) < route.max_concurrent_jobs
+              AND (SELECT COUNT(*) FROM asr_jobs queued_job
+                   JOIN asr_batches queued_batch ON queued_batch.id = queued_job.batch_id
+                   LEFT JOIN asr_project_scheduling queued_scheduling ON queued_scheduling.project_id = queued_job.project_id
+                   JOIN LATERAL (
+                     SELECT target.routing_target_id
+                       FROM routing_policy_targets target
+                      WHERE target.routing_version_id=queued_job.routing_version_id
+                        AND target.pool_id='asr_api'
+                        AND target.priority = CASE
+                          WHEN queued_job.current_attempt_id IS NOT NULL THEN
+                            (SELECT routing_target_priority FROM asr_attempts WHERE id=queued_job.current_attempt_id)
+                          ELSE COALESCE((SELECT MAX(routing_target_priority) FROM asr_attempts WHERE job_id=queued_job.id),0)+1
+                        END
+                      ORDER BY target.priority
+                      LIMIT 1
+                   ) queued_target ON TRUE
+                   WHERE queued_job.routing_version_id=job.routing_version_id
+                     AND queued_job.status='queued'
+                     AND queued_target.routing_target_id=route.routing_target_id
+                     AND (
+                       (CASE WHEN queued_scheduling.last_claim_sequence IS NULL THEN 0 ELSE 1 END,
+                        COALESCE(queued_scheduling.last_claim_sequence, 0), queued_batch.created_at,
+                        queued_job.episode_number, queued_job.id)
+                       <
+                       (CASE WHEN scheduling.last_claim_sequence IS NULL THEN 0 ELSE 1 END,
+                        COALESCE(scheduling.last_claim_sequence, 0), batch.created_at,
+                        job.episode_number, job.id)
+                     )) <= route.queue_limit
+              AND (SELECT COUNT(*) FROM asr_attempts active_project_attempt
+                   JOIN asr_jobs active_project_job ON active_project_job.id=active_project_attempt.job_id
+                   WHERE active_project_job.project_id=job.project_id
+                     AND active_project_attempt.routing_target_id=route.routing_target_id
+                     AND active_project_attempt.status IN ('leased','running')) < route.per_project_max
             ORDER BY scheduling.last_claim_sequence ASC NULLS FIRST,
                      batch.created_at, job.episode_number, job.id
             LIMIT 1
             FOR UPDATE OF job SKIP LOCKED`,
-          [input.policy.maxPerProjectInFlight],
+          [],
         );
         job = queued.rows[0];
       }
@@ -239,7 +304,7 @@ export class AsrWorkerRepository {
           job.attempt_provider_request_id || job.attempt_external_side_effect_possible,
         );
         await client.query(
-          `UPDATE asr_attempts SET status = $2, completed_at = $3,
+          `UPDATE asr_attempts SET status = $2, effect_class = CASE WHEN $2='reconciliation_required' THEN 'external_unknown' ELSE 'cancelled' END, completed_at = $3,
                   error_code = $4, error_detail = $5, retryable = FALSE
             WHERE id = $1`,
           [job.current_attempt_id, needsReconciliation ? 'reconciliation_required' : 'cancelled', input.now,
@@ -266,7 +331,7 @@ export class AsrWorkerRepository {
       if (job.status === 'running'
         && (job.attempt_provider_request_id || job.attempt_external_side_effect_possible)) {
         await client.query(
-          `UPDATE asr_attempts SET status = 'reconciliation_required', completed_at = $2,
+          `UPDATE asr_attempts SET status = 'reconciliation_required', effect_class = 'external_unknown', completed_at = $2,
                   error_code = 'ASR_LEASE_EXPIRED_UNKNOWN_RESULT',
                   error_detail = '运行中租约过期且外部结果未知，必须先对账。', retryable = FALSE
             WHERE id = $1`,
@@ -287,8 +352,11 @@ export class AsrWorkerRepository {
       }
       if (job.lifecycle_status !== 'active') {
         if (job.current_attempt_id) {
+          await client.query(`UPDATE budget_reservations br SET status='released',reconciliation_status='final',settled_at=$2,updated_at=$2
+            FROM asr_attempts a WHERE a.id=$1 AND br.id=a.budget_reservation_id AND br.status='reserved'
+              AND a.provider_request_id IS NULL AND a.external_side_effect_possible=FALSE`, [job.current_attempt_id, input.now]);
           await client.query(
-            `UPDATE asr_attempts SET status = 'cancelled', completed_at = $2,
+            `UPDATE asr_attempts SET status = 'cancelled', effect_class = 'cancelled', completed_at = $2,
                     error_code = 'ASR_PROJECT_NOT_ACTIVE', error_detail = '项目已进入回收流程。', retryable = FALSE
               WHERE id = $1`,
             [job.current_attempt_id, input.now],
@@ -304,8 +372,11 @@ export class AsrWorkerRepository {
         return null;
       }
       if (job.current_attempt_id) {
+        await client.query(`UPDATE budget_reservations br SET status='released',reconciliation_status='final',settled_at=$2,updated_at=$2
+          FROM asr_attempts a WHERE a.id=$1 AND br.id=a.budget_reservation_id AND br.status='reserved'
+            AND a.provider_request_id IS NULL AND a.external_side_effect_possible=FALSE`, [job.current_attempt_id, input.now]);
         await client.query(
-          `UPDATE asr_attempts SET status = 'failed', completed_at = $2,
+          `UPDATE asr_attempts SET status = 'failed', effect_class = 'external_not_accepted', completed_at = $2,
                   error_code = 'ASR_LEASE_EXPIRED', error_detail = 'Worker 租约过期，任务由新 Worker 接管。',
                   retryable = TRUE, external_side_effect_possible = FALSE
             WHERE id = $1 AND status IN ('leased','running')`,
@@ -319,18 +390,25 @@ export class AsrWorkerRepository {
         || job.source_asset_checksum_value !== job.asset_checksum_value) {
         throw new Error(`ASR Job 的不可变 Asset 快照不匹配：${job.id}`);
       }
+      if (!job.routing_version_id || !job.route_digest || !job.routing_target_id || !job.target_deployment_version_id) {
+        throw new Error(`ASR Job 缺少不可变路由版本身份：${job.id}`);
+      }
+      const billingResult = await client.query<{ billing_snapshot: AsrAdapterDescriptor['billing'] | null }>(
+        'SELECT billing_snapshot FROM engine_deployment_versions WHERE id=$1 FOR SHARE', [job.target_deployment_version_id],
+      );
+      const billingSnapshot = billingResult.rows[0]?.billing_snapshot;
+      if (!billingSnapshot) throw new Error('SYSTEM_CONTROL_BUDGET_BILLING_SNAPSHOT_MISSING');
+      const descriptorDigest = resolveAsrAdapterDescriptorDigest(job.target_capabilities_snapshot);
       const adapterDescriptor: AsrAdapterDescriptor = {
-        provider: job.batch_provider,
-        adapter: job.batch_adapter,
-        model: job.batch_model,
-        language: job.batch_language,
-        configDigest: job.config_digest,
-        hotwordCapabilities: {
-          supported: job.hotword_supported,
-          maxEntries: job.hotword_max_entries,
-          maxCharacters: job.hotword_max_characters,
-        },
+        provider: job.target_provider,
+        adapter: job.target_adapter,
+        model: job.target_model,
+        language: job.target_language,
+        configDigest: descriptorDigest,
+        hotwordCapabilities: job.target_capabilities_snapshot?.capabilities?.hotword,
+        billing: billingSnapshot,
       };
+      if (!adapterDescriptor.hotwordCapabilities || typeof adapterDescriptor.hotwordCapabilities.supported !== 'boolean') throw new Error('ASR_ROUTING_TARGET_CAPABILITIES_MISSING');
       const hotwords = applyAsrHotwordCapabilities(
         await buildHotwordProjection(client, job.term_version_id),
         adapterDescriptor,
@@ -347,9 +425,9 @@ export class AsrWorkerRepository {
       );
       const attempt = await client.query<{ id: string }>(
         `INSERT INTO asr_attempts
-           (job_id, attempt_number, status, lease_owner, lease_expires_at)
-         VALUES ($1,$2,'leased',$3,$4) RETURNING id`,
-        [job.id, next.rows[0]!.attempt_number, input.workerId, input.leaseExpiresAt],
+           (job_id, attempt_number, status, lease_owner, lease_expires_at, routing_version_id, routing_target_id, routing_target_priority, deployment_version_id)
+         VALUES ($1,$2,'leased',$3,$4,$5,$6,$7,$8) RETURNING id`,
+        [job.id, next.rows[0]!.attempt_number, input.workerId, input.leaseExpiresAt, job.routing_version_id, job.routing_target_id, job.routing_target_priority, job.target_deployment_version_id],
       );
       if (job.status === 'queued') {
         await client.query(
@@ -386,10 +464,15 @@ export class AsrWorkerRepository {
         },
         adapterDescriptor,
         termVersionId: job.term_version_id,
-        configDigest: job.config_digest,
+        configDigest: job.target_config_digest,
         hotwordDigest: job.hotword_digest,
         attemptId: attempt.rows[0]!.id,
         attemptNumber: next.rows[0]!.attempt_number,
+        providerRequestId: job.attempt_provider_request_id,
+        deploymentVersionId: job.target_deployment_version_id,
+        routingTargetId: job.routing_target_id,
+        routingTargetPriority: Number(job.routing_target_priority),
+        billingSnapshot,
         retryOfBatchId: job.retry_of_batch_id,
         hasPreviousResult: job.current_result_id !== null,
         hotwords,
@@ -436,7 +519,22 @@ export class AsrWorkerRepository {
     return result.rowCount === 1;
   }
 
-  async finish(claim: AsrWorkerClaim, outcome: AsrAdapterOutcome, now: Date) {
+  async rejectBeforeExecution(claim: AsrWorkerClaim, errorCode: string, errorDetail: string, now: Date) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const owned = await client.query(`SELECT 1 FROM asr_jobs WHERE id=$1 AND current_attempt_id=$2 FOR UPDATE`, [claim.jobId, claim.attemptId]);
+      if (!owned.rows[0]) { await client.query('ROLLBACK'); return false; }
+      await client.query(`UPDATE asr_attempts SET status='failed',effect_class='external_not_accepted',provider_request_id=NULL,error_code=$3,error_detail=$4,retryable=false,external_side_effect_possible=false,completed_at=$5 WHERE id=$1 AND lease_owner=$2 AND status='running'`, [claim.attemptId, claim.leaseOwner, errorCode, errorDetail, now]);
+      await client.query(`UPDATE asr_jobs SET status='failed',cancel_requested=false,updated_at=$2 WHERE id=$1 AND current_attempt_id=$3`, [claim.jobId, now, claim.attemptId]);
+      await refreshAsrBatchStatus(client, claim.batchId);
+      await client.query('COMMIT');
+      return true;
+    } catch (error) { await client.query('ROLLBACK'); throw error; }
+    finally { client.release(); }
+  }
+
+  async finish(claim: AsrWorkerClaim, outcome: AsrAdapterOutcome, now: Date, budgetFacts?: BudgetUsageFacts) {
     assertHotwordReceiptFacts(claim, outcome);
     const client = await this.pool.connect();
     try {
@@ -486,15 +584,15 @@ export class AsrWorkerRepository {
                   completed_at = $3, retryable = $4,
                   error_code = $5, error_detail = $6, hotword_receipt_status = $7,
                   hotword_submitted_count = $8, hotword_omitted_count = $9,
-                  hotword_receipt_reason_code = $10
+                  hotword_receipt_reason_code = $10, effect_class = $11
             WHERE id = $1`,
           [claim.attemptId, outcome.providerRequestId, now, outcome.qualityStatus === 'rejected',
             outcome.qualityStatus === 'rejected' ? 'ASR_QUALITY_REJECTED' : null,
             outcome.qualityStatus === 'rejected' ? '质量门拒绝该结果，历史更好结果保持可用。' : null,
             outcome.hotwordReceipt, outcome.hotwordReceiptFacts.submittedCount,
-            outcome.hotwordReceiptFacts.omittedCount, outcome.hotwordReceiptFacts.reasonCode],
+            outcome.hotwordReceiptFacts.omittedCount, outcome.hotwordReceiptFacts.reasonCode, outcome.effectClass],
         );
-        await recordUsage(client, claim.attemptId, outcome.usage);
+        await recordUsage(client, claim.attemptId, outcome.usage, budgetFacts);
         await client.query(
           `UPDATE asr_jobs
               SET status = $2, current_result_id = CASE WHEN $3 THEN current_result_id ELSE $4 END,
@@ -504,25 +602,35 @@ export class AsrWorkerRepository {
             outcome.qualityStatus === 'rejected', result.rows[0]!.id, now],
         );
       } else if (outcome.kind === 'failed') {
-        const cancelled = locked.rows[0].cancel_requested && !outcome.externalSideEffectPossible;
+        const canAdvance = outcome.effectClass === 'external_not_accepted' && !outcome.externalSideEffectPossible;
+        const cancelled = locked.rows[0].cancel_requested && canAdvance;
         await client.query(
           `UPDATE asr_attempts SET status = $2, provider_request_id = $3,
                   error_code = $4, error_detail = $5, retryable = $6,
                   external_side_effect_possible = $7, completed_at = $8,
                   hotword_receipt_status = $9, hotword_submitted_count = $10,
-                  hotword_omitted_count = $11, hotword_receipt_reason_code = $12
+                  hotword_omitted_count = $11, hotword_receipt_reason_code = $12,
+                  effect_class = $13
             WHERE id = $1`,
           [claim.attemptId, cancelled ? 'cancelled' : 'failed', outcome.providerRequestId,
             cancelled ? 'ASR_CANCELLED' : outcome.errorCode,
             cancelled ? '用户取消且本次执行未产生外部副作用。' : outcome.errorDetail,
             cancelled ? false : outcome.retryable, outcome.externalSideEffectPossible, now,
             outcome.hotwordReceipt, outcome.hotwordReceiptFacts.submittedCount,
-            outcome.hotwordReceiptFacts.omittedCount, outcome.hotwordReceiptFacts.reasonCode],
+            outcome.hotwordReceiptFacts.omittedCount, outcome.hotwordReceiptFacts.reasonCode,
+            cancelled ? 'cancelled' : outcome.effectClass],
         );
-        await recordUsage(client, claim.attemptId, outcome.usage);
+        await recordUsage(client, claim.attemptId, outcome.usage, budgetFacts);
+        const nextTarget = !cancelled && canAdvance
+          ? await client.query<{ routing_target_id: string }>(`SELECT routing_target_id FROM routing_policy_targets WHERE routing_version_id=(SELECT routing_version_id FROM asr_jobs WHERE id=$1) AND pool_id='asr_api' AND priority>$2 ORDER BY priority LIMIT 1`, [claim.jobId, claim.routingTargetPriority])
+          : { rows: [] as Array<{ routing_target_id: string }> };
+        const advance = nextTarget.rows[0]?.routing_target_id ?? null;
+        if (advance) {
+          await client.query(`INSERT INTO routing_advance_events(job_id,attempt_id,from_target_id,to_target_id,classification,provider_request_id,request_id) VALUES($1,$2,$3,$4,'external_not_accepted', $5,$6)`, [claim.jobId, claim.attemptId, claim.routingTargetId, advance, outcome.providerRequestId, claim.jobId]);
+        }
         await client.query(
-          `UPDATE asr_jobs SET status = $2, cancel_requested = FALSE, updated_at = $3 WHERE id = $1`,
-          [claim.jobId, cancelled ? 'cancelled' : 'failed', now],
+          `UPDATE asr_jobs SET status = $2, current_attempt_id = CASE WHEN $4 THEN NULL ELSE current_attempt_id END, cancel_requested = FALSE, updated_at = $3 WHERE id = $1`,
+          [claim.jobId, cancelled ? 'cancelled' : advance ? 'queued' : 'failed', now, Boolean(advance)],
         );
       } else {
         await client.query(
@@ -530,13 +638,13 @@ export class AsrWorkerRepository {
                   error_code = $3, error_detail = $4, retryable = FALSE,
                   external_side_effect_possible = TRUE, completed_at = $5,
                   hotword_receipt_status = $6, hotword_submitted_count = $7,
-                  hotword_omitted_count = $8, hotword_receipt_reason_code = $9
+                  hotword_omitted_count = $8, hotword_receipt_reason_code = $9, effect_class = 'external_unknown'
             WHERE id = $1`,
           [claim.attemptId, outcome.providerRequestId, outcome.errorCode, outcome.errorDetail, now,
             outcome.hotwordReceipt, outcome.hotwordReceiptFacts.submittedCount,
             outcome.hotwordReceiptFacts.omittedCount, outcome.hotwordReceiptFacts.reasonCode],
         );
-        await recordUsage(client, claim.attemptId, outcome.usage);
+        await recordUsage(client, claim.attemptId, outcome.usage, budgetFacts);
         await client.query(
           `UPDATE asr_jobs SET status = 'reconciliation_required', cancel_requested = FALSE,
                   updated_at = $2 WHERE id = $1`,

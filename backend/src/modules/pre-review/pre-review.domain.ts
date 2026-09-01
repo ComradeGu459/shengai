@@ -8,8 +8,15 @@ import type {
   PreEditFormatIssue,
 } from '@qimao-terms-cloud/contracts';
 
-export const PRE_EDIT_ALGORITHM_VERSION = 'pre-edit-align-v1';
-export const PRE_EDIT_FORMAT_POLICY_VERSION = 'pre-edit-format-v1';
+export interface PreReviewRulePack {
+  alignmentNearbyGapMs: number;
+  alignmentSimilarityThreshold: number;
+  maxCharacters: number;
+  forbidSentencePunctuation: boolean;
+  forbidMarkup: boolean;
+  forbidBrackets: boolean;
+  requireSpeakerDashForMultipleLines: boolean;
+}
 
 export const sha256 = (value: string | Uint8Array) =>
   createHash('sha256').update(value).digest('hex');
@@ -49,23 +56,25 @@ export interface AlignmentGroupSeed {
 const overlapMs = (left: AlignmentCue, right: AlignmentCue) =>
   Math.max(0, Math.min(left.endMs, right.endMs) - Math.max(left.startMs, right.startMs));
 
-const related = (left: AlignmentCue, right: AlignmentCue) => {
+const related = (left: AlignmentCue, right: AlignmentCue, rulePack: PreReviewRulePack) => {
   const overlap = overlapMs(left, right);
   if (overlap > 0) return true;
   const leftCenter = (left.startMs + left.endMs) / 2;
   const rightCenter = (right.startMs + right.endMs) / 2;
-  return Math.abs(leftCenter - rightCenter) <= 350 && textSimilarity(left.text, right.text) >= 0.75;
+  return Math.abs(leftCenter - rightCenter) <= rulePack.alignmentNearbyGapMs
+    && textSimilarity(left.text, right.text) >= rulePack.alignmentSimilarityThreshold;
 };
 
 export const alignEpisode = (
   companyCues: AlignmentCue[],
   asrCues: AlignmentCue[],
+  rulePack: PreReviewRulePack,
 ): AlignmentGroupSeed[] => {
   const companyEdges = companyCues.map(() => new Set<number>());
   const asrEdges = asrCues.map(() => new Set<number>());
   companyCues.forEach((company, companyIndex) => {
     asrCues.forEach((asr, asrIndex) => {
-      if (!related(company, asr)) return;
+      if (!related(company, asr, rulePack)) return;
       companyEdges[companyIndex]!.add(asrIndex);
       asrEdges[asrIndex]!.add(companyIndex);
     });
@@ -95,7 +104,7 @@ export const alignEpisode = (
       asrCueIds: asr.map((cue) => cue.cueId),
       overlap,
       similarity: Number(similarity.toFixed(5)),
-      algorithmVersion: PRE_EDIT_ALGORITHM_VERSION,
+      algorithmVersion: `pre-review-rule-pack:${sha256(JSON.stringify(rulePack)).slice(0, 16)}`,
     };
     groups.push({ ...identity, companyCues: company, asrCues: asr, timeOverlapMs: overlap,
       textSimilarity: identity.similarity, digest: sha256(JSON.stringify(identity)) });
@@ -144,6 +153,7 @@ export const alignEpisode = (
 
 export const scanFormatIssues = (
   text: string,
+  rulePack: PreReviewRulePack,
   timing?: { startMs: number; endMs: number; videoDurationMs?: number | null },
 ): PreEditFormatIssue[] => {
   const issues: PreEditFormatIssue[] = [];
@@ -155,20 +165,21 @@ export const scanFormatIssues = (
   if (timing?.videoDurationMs && timing.endMs > timing.videoDurationMs) {
     add({ code: 'after_video_end', message: '字幕结束时间晚于视频终点。', blocking: true, overridable: false });
   }
-  if (/[，。？！,.?!]/u.test(text)) {
+  if (rulePack.forbidSentencePunctuation && /[，。？！,.?!]/u.test(text)) {
     add({ code: 'hard_punctuation', message: '普通台词不得包含中英文句末标点。', blocking: true, overridable: false });
   }
-  if (/<[^>]+>|\{\\[^}]+\}/u.test(text)) {
+  if (rulePack.forbidMarkup && /<[^>]+>|\{\\[^}]+\}/u.test(text)) {
     add({ code: 'markup', message: '台词包含 HTML/ASS 格式字符。', blocking: true, overridable: false });
   }
-  if (/[()（）\[\]【】{}]/u.test(text)) {
+  if (rulePack.forbidBrackets && /[()（）\[\]【】{}]/u.test(text)) {
     add({ code: 'brackets', message: '普通台词不得包含括号。', blocking: true, overridable: false });
   }
-  if (text.replace(/\s/gu, '').length > 28) {
-    add({ code: 'long_line', message: '去空白后超过 28 字。', blocking: true, overridable: true });
+  if (text.replace(/\s/gu, '').length > rulePack.maxCharacters) {
+    add({ code: 'long_line', message: `去空白后超过 ${rulePack.maxCharacters} 字。`, blocking: true, overridable: true });
   }
   const lines = text.split(/\r?\n/u).filter((line) => line.trim());
-  if (lines.length > 1 && lines.some((line) => !line.trimStart().startsWith('-'))) {
+  if (rulePack.requireSpeakerDashForMultipleLines
+    && lines.length > 1 && lines.some((line) => !line.trimStart().startsWith('-'))) {
     add({ code: 'speaker_dash', message: '多人同轴每行必须以半角 - 开头。', blocking: true, overridable: false });
   }
   return issues;

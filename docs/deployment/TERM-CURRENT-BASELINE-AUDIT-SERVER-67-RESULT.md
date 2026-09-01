@@ -1,0 +1,26 @@
+# TERM-CURRENT-BASELINE-AUDIT-SERVER-67
+
+- artifact_written: true
+- outcome: passed
+- evidence:
+  - task: `TERM-CURRENT-BASELINE-AUDIT-SERVER-67`
+  - frozen_manifest: `3000555 bytes / 61372755bb1ac1a6bbe22aaf57ea98bd0a5afba78f44c4ff3b508dc615ec6f07`
+  - frozen_archive: `9471776 bytes / 020437197f6fef783fa04a1789ba727cf293a152d140b38630122a9677c3b925`
+  - local_checker: `Node v24.19.0; 4518 bytes / 0aa038f4443088296d02bdad0ff163712d62dca30201aedd1e74d9de434de533; same SHA as SERVER-63; local contract passed`
+  - transfer_setup: `one SSH setup; fixed transfer created as qimao-deploy:qimao-deploy:700:directory`
+  - scp: `1; exit=0; checker+manifest+archive only`
+  - transient: `0`
+  - root_checker: `exit=0; archive_contract=1; summary_members=15024; files=12350; root=verified; all manifest-listed file bytes/SHA matched`
+  - current: `link=/opt/qimao-terms-cloud/releases/term-provider-usage-20260830-r1; realpath=/opt/qimao-terms-cloud/releases/term-provider-usage-20260830-r1; target identity exact`
+  - static: `link=/srv/qimao-terms-cloud/system-frontend-term-provider-usage-20260830-r1; target exists=1; SERVER-38 canonical target`
+  - entries: `backend/dist/server.js, backend/dist/database/migrate.js, backend/dist/workers/term-extraction.worker.entry.js, backend/dist/workers/system-control.secret-validation.worker.entry.js, backend/dist/workers/system-control.connection-test.worker.entry.js; each TYPE=regular file; each qimao read exit=0`
+  - units: `qimao-backend.service PID=570844 active/running NRestarts=0 ExecMainStatus=0; term-extraction PID=570845 active/running NRestarts=0 ExecMainStatus=0; secret-validation PID=570929 active/running NRestarts=0 ExecMainStatus=0; connection-test PID=570846 active/running NRestarts=0 ExecMainStatus=0`
+  - health: `HTTP=200`
+  - active_route: `one safe terms_api projection; routing_version=8e76ffde-83f6-4cad-b8ff-0f2bf620f38d; target=56d6f40f-608e-4c2a-9628-32599779d984; deployment_version=d149bfec-e95f-4a57-8aea-40655a458053; priority=1; role=preferred; provider=deepseek; adapter_key=terms_api; capability=terms; model=deepseek-v4-flash; version=1; status=active`
+  - mutation_boundary: `no解包/rename/current/static/env/DB/route/permission mutation, unit restart, Secret read, Provider/COS/Tencent/business API call`
+  - cleanup: `one exact cleanup SSH; audit_transfer_absent=1; exit=0`
+  - local_cleanup: `the exact SERVER-67 checker temporary directory was removed after evidence capture`
+- remaining_gap: `none for the requested baseline audit`
+- next_owner: `PLANNER to enter the budget candidate publication gate`
+- residual: `audit transfer absent; no transient/staging; immutable target and production baseline unchanged`
+- requires_user: false

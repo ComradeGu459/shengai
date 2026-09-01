@@ -17,6 +17,7 @@ export type SubtitleAcceptanceErrorCode =
   | 'ACCEPTANCE_RELEASE_NOT_FOUND'
   | 'ACCEPTANCE_PLAYBACK_NOT_AVAILABLE'
   | 'ACCEPTANCE_PLAYBACK_GRANT_INVALID'
+  | 'ACCEPTANCE_REWORK_REASON_INVALID'
   | 'ACCEPTANCE_IDEMPOTENCY_KEY_REUSED';
 
 export class SubtitleAcceptanceError extends Error {

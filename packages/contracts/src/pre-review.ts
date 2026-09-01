@@ -1,5 +1,7 @@
 import { Static, Type } from '@sinclair/typebox';
 
+import { ScreenTextReleaseSourceSchema } from './screen-text.js';
+
 const Uuid = () => Type.String({ format: 'uuid' });
 const Digest = () => Type.String({ pattern: '^[0-9a-f]{64}$' });
 const Timestamp = () => Type.String({ format: 'date-time' });
@@ -105,8 +107,11 @@ export const PreEditSessionSchema = Type.Object({
   manifestId: Uuid(),
   manifestVersion: Type.Integer({ minimum: 1 }),
   sourceDigest: Digest(),
+  strategyVersionId: Type.Union([Uuid(), Type.Null()]),
+  strategyContentDigest: Type.Union([Digest(), Type.Null()]),
   algorithmVersion: Type.String(),
   formatPolicyVersion: Type.String(),
+  screenTextRelease: Type.Union([ScreenTextReleaseSourceSchema, Type.Null()]),
   status: PreEditSessionStatusSchema,
   defaultPolicy: PreEditBaselinePolicySchema,
   revision: Type.Integer({ minimum: 1 }),

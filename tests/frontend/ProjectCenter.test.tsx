@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router';
 
 import { ProjectCenter } from '../../frontend/src/features/projects/ProjectCenter.js';
+import { UploadQueue } from '../../frontend/src/features/uploads/UploadQueue.js';
+import { installRandomUuidFallback } from '../../frontend/src/platform/randomUuid.js';
 
 const project = (index = 1) => ({
   id: `ca65378e-8935-4c4a-9e8b-13efca3d31${String(index).padStart(2, '0')}`,
@@ -51,6 +53,18 @@ const json = (body: unknown, status = 200, headers?: Record<string, string>) => 
 const renderProjectCenter = () => {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   return render(<QueryClientProvider client={queryClient}><MemoryRouter><ProjectCenter /></MemoryRouter></QueryClientProvider>);
+};
+
+const renderSharedProjectAndUploadPages = () => {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter>
+        <ProjectCenter />
+        <UploadQueue />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
 };
 
 afterEach(() => { cleanup(); sessionStorage.clear(); vi.restoreAllMocks(); });
@@ -149,6 +163,65 @@ describe('项目中心多剧派发', () => {
     fireEvent.click(screen.getByRole('button', { name: '创建项目' }));
     fireEvent.click(screen.getByRole('button', { name: '确认创建' }));
     expect(await screen.findByText('请输入项目名称。')).toBeInTheDocument();
+  });
+
+  it('纯 HTTP 缺少原生 randomUUID 时仍只创建一次并发送合法幂等键', async () => {
+    const cryptoApi = globalThis.crypto as Crypto & { randomUUID?: () => string };
+    const originalDescriptor = Object.getOwnPropertyDescriptor(cryptoApi, 'randomUUID');
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.startsWith('/api/projects?')) return json({ total: 0, items: [] });
+      if (url.startsWith('/api/asr/eligibility?')) return json({ total: 0, items: [] });
+      if (url === '/api/projects' && init?.method === 'POST') return json(project(21), 201);
+      throw new Error(`unexpected ${url}`);
+    });
+    try {
+      Object.defineProperty(cryptoApi, 'randomUUID', { configurable: true, writable: true, value: undefined });
+      installRandomUuidFallback();
+      renderProjectCenter();
+      await screen.findByText('没有符合条件的项目');
+      fireEvent.click(screen.getByRole('button', { name: '创建项目' }));
+      fireEvent.change(screen.getByLabelText('项目名称'), { target: { value: 'HTTP 项目' } });
+      fireEvent.click(screen.getByRole('button', { name: '确认创建' }));
+      await waitFor(() => expect(fetchMock.mock.calls.filter(([url, options]) => String(url) === '/api/projects' && options?.method === 'POST')).toHaveLength(1));
+      const call = fetchMock.mock.calls.find(([url, options]) => String(url) === '/api/projects' && options?.method === 'POST');
+      expect(call?.[1]?.headers).toMatchObject({ 'idempotency-key': expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i) });
+    } finally {
+      if (originalDescriptor) Object.defineProperty(cryptoApi, 'randomUUID', originalDescriptor);
+      else delete cryptoApi.randomUUID;
+    }
+  });
+
+  it('项目创建 201 后同一 QueryClient 立即同步上传页选择器，再由项目 GET 权威对账', async () => {
+    const initial = project(22);
+    const created = { ...project(23), name: '刚创建项目' };
+    let projectReads = 0;
+    let resolveReconcile!: (response: Response) => void;
+    const pendingReconcile = new Promise<Response>((resolve) => { resolveReconcile = resolve; });
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.startsWith('/api/projects?')) {
+        projectReads += 1;
+        return projectReads === 1 ? json({ total: 1, items: [initial] }) : pendingReconcile;
+      }
+      if (url.startsWith('/api/asr/eligibility?')) return json({ total: 1, items: [eligibilityItem(initial)] });
+      if (url === `/api/projects/${initial.id}/material-manifest`) return json({ project: initial, manifest: null });
+      if (url === `/api/projects/${initial.id}/uploads`) return json({ items: [] });
+      if (url === '/api/projects' && init?.method === 'POST') return json(created, 201);
+      throw new Error(`unexpected ${url} ${init?.method ?? 'GET'}`);
+    });
+
+    renderSharedProjectAndUploadPages();
+    await screen.findByRole('option', { name: initial.name });
+    fireEvent.click(screen.getByRole('button', { name: '创建项目' }));
+    fireEvent.change(screen.getByLabelText('项目名称'), { target: { value: created.name } });
+    fireEvent.click(screen.getByRole('button', { name: '确认创建' }));
+
+    await screen.findByRole('option', { name: created.name });
+    expect(fetchMock.mock.calls.filter(([url, options]) => String(url) === '/api/projects' && options?.method === 'POST')).toHaveLength(1);
+    expect(projectReads).toBeGreaterThanOrEqual(2);
+    resolveReconcile(json({ total: 2, items: [created, initial] }));
+    await waitFor(() => expect(projectReads).toBeGreaterThanOrEqual(2));
   });
 
   it('回收确认保持三项影响、pending 焦点和后端数量反馈', async () => {

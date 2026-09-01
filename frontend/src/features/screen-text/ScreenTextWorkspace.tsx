@@ -26,6 +26,7 @@ import type {
 } from '@qimao-terms-cloud/contracts';
 
 import { projectModules } from '../../modules.js';
+import { createUuid } from '../../platform/randomUuid.js';
 import { getProjectMaterialState } from '../materials/api.js';
 import { getTermWorkspace } from '../terms/api.js';
 import {
@@ -45,6 +46,7 @@ import {
   screenTextExportDownloadUrl,
   ScreenTextApiError,
   type ScreenTextCandidateList,
+  type ScreenTextReleaseList as ScreenTextReleaseListResponse,
 } from './api.js';
 import {
   CandidateEvidence,
@@ -74,7 +76,7 @@ const candidateLabels: Record<ScreenTextCandidateStatus, string> = {
 
 const activeBatchStatuses = new Set<ScreenTextBatchStatus>(['queued', 'running', 'cancel_requested']);
 const cancellableStatuses = new Set<ScreenTextBatchStatus>(['queued', 'running', 'review_pending', 'partial']);
-const randomKey = () => globalThis.crypto?.randomUUID?.() ?? `screen-text-${Date.now()}-${Math.random()}`;
+const randomKey = () => createUuid();
 const statusTone = (status: string) => status.includes('failed') || status.includes('reconciliation') || status === 'stale' || status === 'rejected'
   ? styles.danger
   : status.includes('running') || status.includes('queued') || status.includes('pending') || status === 'cancel_requested'
@@ -97,7 +99,7 @@ type DialogState =
   | { kind: 'retry'; episodes: number[] }
   | { kind: 'empty'; episode: number }
   | { kind: 'manual'; episode: number }
-  | { kind: 'release' }
+  | { kind: 'release'; allowPartial: boolean }
   | { kind: 'history' }
   | null;
 
@@ -166,6 +168,7 @@ export const ScreenTextWorkspace = () => {
   const batchRetryRef = useRef<HTMLButtonElement>(null);
   const detailRetryRef = useRef<HTMLButtonElement>(null);
   const candidateRetryRef = useRef<HTMLButtonElement>(null);
+  const decisionRetryRef = useRef<HTMLButtonElement>(null);
   const createIntent = useRef<Intent<{ scope: ScreenTextScope; termVersionId: string }> | null>(null);
   const commandIntent = useRef<Intent<CommandInput> | null>(null);
   const decisionIntent = useRef<Intent<CreateScreenTextDecisionBody> | null>(null);
@@ -227,7 +230,12 @@ export const ScreenTextWorkspace = () => {
   const selectedCandidates = candidates.data?.items.filter((item) => selectedPageIds.has(item.id) && item.status === 'pending') ?? [];
   const failedEpisodes = batch?.jobs.filter((job) => job.status === 'failed').map((job) => job.episodeNumber) ?? [];
   const batchPendingCount = batch?.jobs.reduce((sum, job) => sum + job.candidateCounts.pending, 0) ?? 0;
-  const releaseReady = Boolean(batch && !readOnly && gatesReady && batch.jobs.every((job) => job.status === 'completed' || job.status === 'confirmed_empty') && batch.counts.failed === 0 && batch.counts.reconciliationRequired === 0 && batchPendingCount === 0);
+  const partialExcludedJobs = batch?.jobs.filter((job) => !['completed', 'confirmed_empty'].includes(job.status)) ?? [];
+  // 发布资格由服务端批次状态决定；前端不从集计数或候选状态推导完成/发布资格。
+  const strictReleaseReady = Boolean(batch && !readOnly && gatesReady && batch.status === 'completed');
+  const partialReleaseReady = Boolean(batch && !readOnly && gatesReady && batch.status === 'partial');
+  const releaseReady = strictReleaseReady || partialReleaseReady;
+  const releaseLabel = partialReleaseReady ? '部分发布' : '发布画面字版本';
 
   useEffect(() => {
     if (!batchId && batches.data?.items[0]) setBatchId(batches.data.items[0].id);
@@ -247,7 +255,7 @@ export const ScreenTextWorkspace = () => {
   useEffect(() => {
     setSelectedId('');
     setSelectedPageIds(new Set());
-  }, [batchId, episodeNumber, search, status, category, sort, page]);
+  }, [batchId, episodeNumber, search, status, category]);
   useEffect(() => {
     setAllPendingSelected(false);
   }, [batchId, episodeNumber, search, status, category]);
@@ -308,7 +316,7 @@ export const ScreenTextWorkspace = () => {
       setDialog(null);
       setBatchId(batch.id);
       await refresh();
-      announce(`识别批次 ${batch.id.slice(0, 8)} 已创建，当前状态：${batchLabels[batch.status]}。`);
+      announce(`识别批次已创建，当前状态：${batchLabels[batch.status]}。`);
     },
     onError: async (error) => {
       if (!isReplayable(error)) {
@@ -341,6 +349,10 @@ export const ScreenTextWorkspace = () => {
       }
     },
   });
+
+  useLayoutEffect(() => {
+    if (decisionMutation.isError) decisionRetryRef.current?.focus();
+  }, [decisionMutation.isError]);
 
   const batchDecisionMutation = useMutation({
     mutationFn: async ({ entries, blockedParentCount }: { entries: Array<{ candidate: ScreenTextCandidate; intent: Intent<CreateScreenTextDecisionBody> }>; blockedParentCount: number }) => {
@@ -452,7 +464,7 @@ export const ScreenTextWorkspace = () => {
       <div><span>术语版本</span><strong>{latestTerm ? `V${latestTerm.version} · 已固定` : '尚未确认'}</strong><small>{terms.data?.sourceIsCurrent ? '来源与最新公司稿一致' : '公司稿来源已变化'}</small></div>
       <div><span>画面字视频</span><strong>{screenEpisodes.length} / {manifest?.episodeCount ?? 0} 集就绪</strong><small>{manifest ? `素材清单 V${manifest.version}` : '尚无已确认素材清单'}</small></div>
       <div><span>当前批次</span><strong>{batch ? `${batch.id.slice(0, 8)} · ${batchLabels[batch.status]}` : '尚未创建'}</strong><small>{batch ? `${batch.counts.completed} / ${batch.counts.total} 集完成` : '门禁满足后可创建'}</small></div>
-      <div><span>发布门禁</span><strong>{releaseReady ? '可以发布' : `${batchPendingCount} 项待确认`}</strong><small>{batch?.counts.failed ? `${batch.counts.failed} 集失败` : batch?.counts.reconciliationRequired ? `${batch.counts.reconciliationRequired} 集需对账` : '以服务端批次事实为准'}</small></div>
+      <div><span>发布门禁</span><strong>{strictReleaseReady ? '可以发布' : partialReleaseReady ? '可以部分发布' : `${batchPendingCount} 项待确认`}</strong><small>{partialReleaseReady ? `将排除 ${partialExcludedJobs.length} 集，确认时复核` : batch?.counts.failed ? `${batch.counts.failed} 集失败` : batch?.counts.reconciliationRequired ? `${batch.counts.reconciliationRequired} 集需对账` : '以服务端批次事实为准'}</small></div>
       <div className={styles.gateActions}>
         <button ref={primaryRef} className={styles.primary} type="button" disabled={!gatesReady} onClick={(event) => openDialog({ kind: 'create' }, event.currentTarget)}>{batch?.status === 'stale' ? '从新来源新建批次' : '新建识别批次'}</button>
         <button type="button" onClick={(event) => openDialog({ kind: 'history' }, event.currentTarget)}>历史版本</button>
@@ -467,12 +479,12 @@ export const ScreenTextWorkspace = () => {
 
     {batch && <>
       <div className={styles.batchNotice}>
-        <div><span className={`${styles.statusTag} ${statusTone(batch.status)}`}>{batchLabels[batch.status]}</span><strong>{batch.scope.kind === 'all' ? '整剧范围' : batch.scope.kind === 'selected' ? `选中 ${batch.scope.episodeNumbers.length} 集` : `第 ${batch.scope.episodeNumber} 集`} · 已完成 {batch.counts.completed} / {batch.counts.total} 集</strong><span>术语 V{batch.termVersion} · 已发送 {batch.termProjection.includedCount} 条 · {usageLabel(batch)} · 素材清单 V{batch.manifestVersion} · 请求标识 {batch.requestId}</span></div>
+        <div><span className={`${styles.statusTag} ${statusTone(batch.status)}`}>{batchLabels[batch.status]}</span><strong>{batch.scope.kind === 'all' ? '整剧范围' : batch.scope.kind === 'selected' ? `选中 ${batch.scope.episodeNumbers.length} 集` : `第 ${batch.scope.episodeNumber} 集`} · 已完成 {batch.counts.completed} / {batch.counts.total} 集</strong><span>术语 V{batch.termVersion} · 已发送 {batch.termProjection.includedCount} 条 · {usageLabel(batch)} · 素材清单 V{batch.manifestVersion}</span></div>
         <div className={styles.noticeActions}>
           {cancellableStatuses.has(batch.status) && !readOnly && <button type="button" onClick={(event) => openDialog({ kind: 'cancel' }, event.currentTarget)}>取消未终结集</button>}
           {failedEpisodes.length > 0 && !readOnly && <button type="button" onClick={(event) => openDialog({ kind: 'retry', episodes: failedEpisodes }, event.currentTarget)}>重新识别失败集</button>}
           {batch.status === 'reconciliation_required' && <span>结果或用量未知，普通重试已暂停。</span>}
-          <button type="button" disabled={!releaseReady} onClick={(event) => openDialog({ kind: 'release' }, event.currentTarget)}>发布画面字版本</button>
+          <button type="button" disabled={!releaseReady} onClick={(event) => openDialog({ kind: 'release', allowPartial: partialReleaseReady }, event.currentTarget)}>{releaseLabel}</button>
         </div>
       </div>
 
@@ -506,7 +518,7 @@ export const ScreenTextWorkspace = () => {
           {candidates.isPending && <div className={styles.regionState} role="status">正在读取第 {episodeNumber} 集候选…</div>}
           {candidates.isError && <ErrorBlock title="候选读取失败" error={candidates.error} action="重新读取候选" actionRef={candidateRetryRef} pending={candidates.isFetching} onAction={() => { setCandidateRecovery(true); void candidates.refetch(); }} />}
           {detail.isError && <ErrorBlock title="批次详情读取失败" error={detail.error} action="重新读取批次详情" actionRef={detailRetryRef} pending={detail.isFetching} onAction={() => { setDetailRecovery(true); void detail.refetch(); }} />}
-          {decisionMutation.isError && <ErrorBlock title="候选决定提交失败" error={decisionMutation.error} action={recoveryLabel(decisionMutation.error, '重试同一决定')} pending={decisionMutation.isPending} disabled={writeLocked} onAction={() => {
+          {decisionMutation.isError && <ErrorBlock title="候选决定提交失败" error={decisionMutation.error} action={recoveryLabel(decisionMutation.error, '重试同一决定')} actionRef={decisionRetryRef} pending={decisionMutation.isPending} disabled={writeLocked} onAction={() => {
             const target = decisionTarget.current;
             const intent = decisionIntent.current;
             if (target && intent && isReplayable(decisionMutation.error)) decisionMutation.mutate({ candidate: target, intent });
@@ -538,7 +550,7 @@ export const ScreenTextWorkspace = () => {
             ? { kind: 'empty', batchId: batch!.id, episodeNumber: dialog.episode, body: { expectedBatchRevision: batch!.revision } }
             : dialog.kind === 'manual'
               ? { kind: 'manual', batchId: batch!.id, episodeNumber: dialog.episode, body: body! }
-              : { kind: 'release', body: { batchId: batch!.id, expectedBatchRevision: batch!.revision } };
+            : { kind: 'release', body: { batchId: batch!.id, expectedBatchRevision: batch!.revision, ...(dialog.allowPartial ? { allowPartial: true } : {}) } };
       const intent = { key: randomKey(), body: input };
       commandIntent.current = intent;
       commandMutation.mutate(intent);
@@ -570,24 +582,45 @@ const CommandDialog = ({ dialog, batch, pending, writeLocked, error, triggerRef,
   const [evidenceCapturedAtMs, setEvidenceCapturedAtMs] = useState(0);
   const [category, setCategory] = useState<ScreenTextCategory>('other');
   const [position, setPosition] = useState<'left' | 'center' | 'right' | 'full'>('center');
-  const title = dialog.kind === 'cancel' ? '确认取消未终结集' : dialog.kind === 'retry' ? '确认重新识别失败集' : dialog.kind === 'empty' ? '确认本集无画面字' : dialog.kind === 'release' ? '发布不可变画面字版本' : '人工新增画面字';
+  const title = dialog.kind === 'cancel' ? '确认取消未终结集' : dialog.kind === 'retry' ? '确认重新识别失败集' : dialog.kind === 'empty' ? '确认本集无画面字' : dialog.kind === 'release' ? dialog.allowPartial ? '确认部分发布' : '发布不可变画面字版本' : '人工新增画面字';
   const valid = dialog.kind !== 'manual' || Boolean(text.trim() && startMs < endMs);
-  return <Modal title={title} pending={pending} onClose={onClose} triggerRef={triggerRef} footer={<><button type="button" disabled={pending} onClick={onClose}>取消</button><button className={styles.primary} type="button" disabled={pending || writeLocked || !valid} onClick={() => onSubmit(dialog.kind === 'manual' ? { text: text.trim(), startMs, endMs, evidenceCapturedAtMs, category, position } : undefined)}>{pending ? '正在提交…' : dialog.kind === 'cancel' ? '保存取消意图' : dialog.kind === 'retry' ? '重新识别失败集' : dialog.kind === 'empty' ? '确认本集无画面字' : dialog.kind === 'release' ? '发布版本' : '新增候选'}</button></>}>
+  return <Modal title={title} pending={pending} onClose={onClose} triggerRef={triggerRef} footer={<><button type="button" disabled={pending} onClick={onClose}>取消</button><button className={styles.primary} type="button" disabled={pending || writeLocked || !valid} onClick={() => onSubmit(dialog.kind === 'manual' ? { text: text.trim(), startMs, endMs, evidenceCapturedAtMs, category, position } : undefined)}>{pending ? '正在提交…' : dialog.kind === 'cancel' ? '保存取消意图' : dialog.kind === 'retry' ? '重新识别失败集' : dialog.kind === 'empty' ? '确认本集无画面字' : dialog.kind === 'release' ? dialog.allowPartial ? '确认部分发布' : '发布版本' : '新增候选'}</button></>}>
     {dialog.kind === 'cancel' && <p>取消只影响未终结集；已经完成的候选、人工决定与用量不会删除，结果可能先进入取消请求中或需对账。</p>}
     {dialog.kind === 'retry' && <p>只重试第 {dialog.episodes.map((episode) => String(episode).padStart(2, '0')).join('、')} 集；其他成功结果与人工决定保持不变。</p>}
     {dialog.kind === 'empty' && <p>第 {String(dialog.episode).padStart(2, '0')} 集将记录可审计的“明确无画面字”决定；以后仍可从新批次重新识别。</p>}
-    {dialog.kind === 'release' && <p>将以批次修订 {batch.revision} 创建不可变版本和逐集 SRT；历史版本与原下载身份保持不变。</p>}
+    {dialog.kind === 'release' && (dialog.allowPartial ? <>
+      <p>部分发布只纳入已完成或明确空集，排除集不会重跑、删除或改变原状态；历史版本与原下载身份保持不变。</p>
+      <div className={styles.releaseExclusions} role="list" aria-label="部分发布排除集">
+        {batch.jobs.filter((job) => !['completed', 'confirmed_empty'].includes(job.status)).map((job) => <div key={job.id} role="listitem"><strong>第 {String(job.episodeNumber).padStart(2, '0')} 集 · {episodeLabels[job.status]}</strong><span>{job.latestAttempt?.errorCode ? `错误：${job.latestAttempt.errorCode}` : '无错误码'}</span></div>)}
+      </div>
+    </> : <p>将以批次修订 {batch.revision} 创建完整不可变版本和逐集 SRT；历史版本与原下载身份保持不变。</p>)}
     {dialog.kind === 'manual' && <div className={styles.manualForm}><label>文字<input value={text} disabled={pending || writeLocked} onChange={(event) => setText(event.target.value)} /></label><div className={styles.formGrid}><label>分类<select value={category} disabled={pending || writeLocked} onChange={(event) => setCategory(event.target.value as ScreenTextCategory)}>{Object.entries(categoryLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><label>位置<select value={position} disabled={pending || writeLocked} onChange={(event) => setPosition(event.target.value as typeof position)}>{Object.entries(positionLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label></div><div className={styles.formGrid}><label>开始毫秒<input type="number" min={0} value={startMs} disabled={pending || writeLocked} onChange={(event) => setStartMs(Number(event.target.value))} /></label><label>结束毫秒<input type="number" min={1} value={endMs} disabled={pending || writeLocked} onChange={(event) => setEndMs(Number(event.target.value))} /></label></div><label>证据时间（毫秒）<input type="number" min={0} value={evidenceCapturedAtMs} disabled={pending || writeLocked} onChange={(event) => setEvidenceCapturedAtMs(Number(event.target.value))} /></label></div>}
     {Boolean(error) && <ErrorBlock title="提交失败" error={error} action={recoveryLabel(error, '重试同一意图')} pending={pending} onAction={() => { if (isReplayable(error)) onRetry(); else onRefresh(); }} />}
   </Modal>;
 };
 
-const ReleaseHistoryDialog = ({ projectId, releases, error, pending, search, sort, page, triggerRef, onClose, onRetry, onSearch, onSort, onPage }: { projectId: string; releases: { items: Array<{ id: string; version: number; batchId: string; cueCount: number; createdAt: string; exports: Array<{ id: string; filename: string; episodeNumber: number }> }>; total: number } | undefined; error: unknown; pending: boolean; search: string; sort: 'version_desc' | 'created_desc'; page: number; triggerRef: RefObject<HTMLElement | null>; onClose: () => void; onRetry: () => void; onSearch: (value: string) => void; onSort: (value: 'version_desc' | 'created_desc') => void; onPage: (value: number) => void }) => <Modal title="画面字历史版本" lead="历史版本与导出身份来自服务端，刷新后仍可下载原文件。" pending={false} onClose={onClose} triggerRef={triggerRef} wide>
+type ReleaseHistoryDialogProps = {
+  projectId: string;
+  releases: ScreenTextReleaseListResponse | undefined;
+  error: unknown;
+  pending: boolean;
+  search: string;
+  sort: 'version_desc' | 'created_desc';
+  page: number;
+  triggerRef: RefObject<HTMLElement | null>;
+  onClose: () => void;
+  onRetry: () => void;
+  onSearch: (value: string) => void;
+  onSort: (value: 'version_desc' | 'created_desc') => void;
+  onPage: (value: number) => void;
+};
+
+const ReleaseHistoryDialog = ({ projectId, releases, error, pending, search, sort, page, triggerRef, onClose, onRetry, onSearch, onSort, onPage }: ReleaseHistoryDialogProps) => <Modal title="画面字历史版本" lead="历史版本与导出身份来自服务端，刷新后仍可下载原文件。" pending={false} onClose={onClose} triggerRef={triggerRef} wide>
   <div className={styles.historyToolbar}><input aria-label="搜索历史版本" placeholder="搜索版本、文件名或批次编号" value={search} onChange={(event) => onSearch(event.target.value)} /><select aria-label="历史版本排序" value={sort} onChange={(event) => onSort(event.target.value as typeof sort)}><option value="version_desc">版本从新到旧</option><option value="created_desc">最近创建</option></select></div>
   {pending && <div className={styles.regionState} role="status">正在读取历史版本…</div>}
   {Boolean(error) && <ErrorBlock title="历史版本读取失败" error={error} action="重新读取历史版本" onAction={onRetry} pending={pending} />}
   {!pending && !error && releases?.items.length === 0 && <div className={styles.regionState}>尚无发布版本。</div>}
-  <div className={styles.releaseList}>{releases?.items.map((release) => <section key={release.id}><header><strong>画面字 V{release.version}</strong><span>{release.cueCount} 条 · 批次 #{release.batchId.slice(0, 8)} · {new Date(release.createdAt).toLocaleString('zh-CN')}</span></header><div>{release.exports.map((item) => <a key={item.id} href={screenTextExportDownloadUrl(projectId, item.id)} download>{item.filename} · 第 {String(item.episodeNumber).padStart(2, '0')} 集</a>)}</div></section>)}</div>
+  <div className={styles.releaseList}>{releases?.items.map((release) => <section key={release.id}><header><strong>画面字 V{release.version}</strong><span className={`${styles.statusTag} ${release.partial ? styles.warning : styles.success}`}>{release.partial ? '部分发布' : '完整发布'}</span><span>{release.cueCount} 条 · 批次 #{release.batchId.slice(0, 8)} · {new Date(release.createdAt).toLocaleString('zh-CN')}</span></header>{release.partial && <div className={styles.releaseExclusionSummary}>排除 {release.excludedEpisodes.length} 集：{release.excludedEpisodes.map((item) => `第${String(item.episodeNumber).padStart(2, '0')}集 ${episodeLabels[item.status]}${item.errorCode ? `（${item.errorCode}）` : ''}`).join('；')}</div>}<div>{release.exports.map((item) => <a key={item.id} href={screenTextExportDownloadUrl(projectId, item.id)} download>{item.filename} · 第 {String(item.episodeNumber).padStart(2, '0')} 集</a>)}</div></section>)}</div>
   {(releases?.total ?? 0) > 20 && <div className={styles.pagination}><span>第 {page + 1} 页 · 共 {releases?.total ?? 0} 个版本</span><div><button type="button" disabled={page === 0 || pending} onClick={() => onPage(page - 1)}>上一页</button><button type="button" disabled={(page + 1) * 20 >= (releases?.total ?? 0) || pending} onClick={() => onPage(page + 1)}>下一页</button></div></div>}
   <div className={styles.modalActions}><button type="button" onClick={onClose}>关闭</button></div>
 </Modal>;

@@ -10,6 +10,13 @@ import {
   DevelopmentAsrSchedulingPolicyReader,
   type AsrSchedulingPolicyReader,
 } from '../modules/asr/asr-scheduling-policy.js';
+import { createProductionS3ConfigFromEnv, ProductionS3CompatibleUploadStorage } from '../modules/storage/s3-compatible-storage.js';
+import {
+  createTencentAsrRegistryFromEnv,
+  createTencentAsrSdkFactory,
+  createTencentAsrRuntimeConfigFromEnv,
+  TencentAsrConfigurationError,
+} from '../modules/asr/tencent-asr-runtime.js';
 import { AsrWorker } from './asr.worker.js';
 
 export const runAsrWorker = async (input: {
@@ -34,10 +41,37 @@ export const runAsrWorker = async (input: {
   }));
 };
 
-const runStandalone = async () => {
-  if (process.env.NODE_ENV === 'production') {
-    throw new Error('生产环境尚未登记获授权的真实 ASR 适配器。');
+/** 生产 Worker 的唯一真实 ASR 装配入口；未显式启用时生产 fail-closed。 */
+export const createAsrWorkerRegistryFromEnv = (input: {
+  env?: NodeJS.ProcessEnv;
+  sdkFactory?: Parameters<typeof createTencentAsrRegistryFromEnv>[0]['sdkFactory'];
+  objectUrlSigner?: Parameters<typeof createTencentAsrRegistryFromEnv>[0]['objectUrlSigner'];
+} = {}) => {
+  const env = input.env ?? process.env;
+  const config = createTencentAsrRuntimeConfigFromEnv(env);
+  if (!config.enabled) {
+    if (config.production) throw new TencentAsrConfigurationError('DISABLED_IN_PRODUCTION');
+    return createDefaultAsrAdapterRegistry();
   }
+  let objectUrlSigner = input.objectUrlSigner;
+  if (!objectUrlSigner) {
+    if (env.QIMAO_UPLOAD_STORAGE_KIND?.trim().toLowerCase() !== 's3') {
+      throw new TencentAsrConfigurationError('CONFIG_INVALID');
+    }
+    const storageConfig = createProductionS3ConfigFromEnv(env);
+    if (storageConfig.provider !== 'tencent-cos') {
+      throw new TencentAsrConfigurationError('CONFIG_INVALID');
+    }
+    objectUrlSigner = new ProductionS3CompatibleUploadStorage(storageConfig);
+  }
+  return createTencentAsrRegistryFromEnv({
+    env,
+    sdkFactory: input.sdkFactory ?? createTencentAsrSdkFactory(),
+    objectUrlSigner,
+  });
+};
+
+const runStandalone = async () => {
   const controller = new AbortController();
   const stop = () => controller.abort();
   process.once('SIGINT', stop);
@@ -46,7 +80,7 @@ const runStandalone = async () => {
   try {
     await runAsrWorker({
       database,
-      registry: createDefaultAsrAdapterRegistry(),
+      registry: createAsrWorkerRegistryFromEnv(),
       signal: controller.signal,
     });
   } finally {

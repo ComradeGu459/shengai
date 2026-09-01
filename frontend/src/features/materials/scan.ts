@@ -14,6 +14,18 @@ export interface ScannedMaterialFile {
 
 export type MaterialSelections = Record<number, Partial<Record<MaterialRole, string>>>;
 
+export const withRelativePathFingerprint = (
+  file: ScannedMaterialFile,
+  relativePath: string,
+): ScannedMaterialFile => {
+  const normalizedPath = relativePath.replaceAll('\\', '/');
+  return {
+    ...file,
+    relativePath: normalizedPath,
+    fingerprint: `${normalizedPath}|${file.sizeBytes}|${file.lastModifiedMs}`,
+  };
+};
+
 const episodePatterns = [
   /第\s*0*(\d{1,3})\s*[集话]/i,
   /(?:episode|ep|e)[\s_-]*0*(\d{1,3})(?:\D|$)/i,
@@ -78,6 +90,12 @@ export const autoPairMaterials = (files: ScannedMaterialFile[]) => {
         (file) => file.episodeNumber === episode && file.suggestedRole === role && file.fingerprintValid,
       );
       if (candidates.length === 1) selections[episode]![role] = candidates[0]!.relativePath;
+    }
+    const asr = selections[episode]?.asr_video;
+    const screen = selections[episode]?.screen_video;
+    if (asr && !screen) {
+      const videoCandidates = files.filter((file) => file.episodeNumber === episode && file.mediaType === 'video' && file.fingerprintValid);
+      if (videoCandidates.length === 1) selections[episode]!.screen_video = asr;
     }
   }
   return { episodes, selections };

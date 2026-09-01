@@ -13,6 +13,12 @@
 | 当前选择文件、未提交筛选、暂停开关 | 浏览器 | 可使用 IndexedDB 保存恢复提示，但不决定服务端完成状态 |
 | 到期清理和孤儿核对 | 后端 Worker | 同一代码库的独立运行入口，可重试且无内存状态依赖 |
 
+### 腾讯 COS 对象存储实现
+
+正式生产对象存储通过现有 `UploadStorage`/`DeliveryStorage` 接口接入，上传会话、分片确认、异步完成任务、Asset 与素材绑定仍全部由 PostgreSQL 和现有 `UploadCompletionWorker` 管理；COS 只负责同一 `objectKey` 下的 multipart 字节事实。生产配置使用 `QIMAO_S3_PROVIDER=tencent-cos`，固定私有 Bucket `milaidi-upload-1310313248`、endpoint `https://cos.ap-nanjing.myqcloud.com`、`virtual-hosted` 寻址（AWS `S3Client` 的 `forcePathStyle=false`）。预签名 URL 只绑定现有 `storageUploadId`、对象键、分片号、大小和 Content-Type，默认有效期 600 秒；密钥只存在服务端配置。
+
+Rainyun/ROS 历史配置保持 `provider=rains3` 与 `path` 寻址。Tencent COS 禁止 `server_relay`，新会话只走同一 multipart/浏览器直传链；旧 TUS 仅在请求显式声明历史 `transportKind=tus` 时保留兼容入口，不与 COS multipart 会话共享或并行驱动。完成、Head、校验和 Asset/绑定落账仍由持久 Worker 异步执行，未知结果只查询同一上传身份。
+
 M2 不要求外部消息队列。若定时扫描足以满足 10 人以内的负载，先使用数据库任务状态和有界 Worker；未来确有扩缩容证据时再接队列。
 
 ## 项目状态
@@ -116,10 +122,12 @@ M2 没有账号系统时，操作者字段允许保存受控环境中的匿名�
 | `GET /api/uploads/{uploadId}` | 返回服务端已确认分片与会话状态 |
 | `POST /api/uploads/{uploadId}/parts/authorize` | 为指定缺失分片签发可续期短时授权；不要求幂等键 |
 | `POST /api/uploads/{uploadId}/parts/confirm` | 使用 `Idempotency-Key` 记录对象存储确认信息；不得接收文件字节 |
-| `POST /api/uploads/{uploadId}/complete` | 先持久化完成意图，再幂等合并、核对对象并落账 |
+| `POST /api/uploads/{uploadId}/complete` | 只校验权限、版本、幂等键和缺片；事务内把会话置为 `verifying` 并创建唯一完成任务，立即返回 `202`。对象存储合并、Head/摘要核验和 Asset/绑定落账由可恢复 Worker 完成；同一命令重放返回同一事实。 |
 | `POST /api/uploads/{uploadId}/abort` | 先把会话置为取消终态，再可重试清理未完成分片 |
 | `POST /api/projects/{projectId}/recycle` | 移入回收站并设置到期时间 |
 | `POST /api/projects/{projectId}/restore` | 在到期且未进入清理前恢复 |
+
+在 Tencent COS 生产实例中，创建请求省略 `transportKind` 或明确使用 `multipart`；显式 `transportKind=tus` 返回 `409 UPLOAD_TRANSPORT_DISABLED`，不会建立新会话。未启用历史兼容实例不注册 TUS 数据面；既有 TUS 会话仍可通过普通查询与显式 `abort` 放弃。`server_relay` 不作为 COS fallback。
 
 永久清理由内部 Worker 触发，不提供普通页面可直接调用的立即物理删除接口。
 
@@ -139,7 +147,7 @@ M2 没有账号系统时，操作者字段允许保存受控环境中的匿名�
 
 稳定错误码至少区分：授权过期、会话过期、文件指纹不符、分片缺失、对象不存在、大小不符、校验失败、版本冲突、项目已回收、项目正在清理和临时存储故障。
 
-`DEV-M2-03` 已落地的上传协议稳定错误码包括：`UPLOAD_FILE_TYPE_INVALID`、`UPLOAD_FILE_SIZE_INVALID`、`FILE_FINGERPRINT_MISMATCH`、`UPLOAD_SESSION_EXPIRED`、`UPLOAD_PART_INVALID`、`UPLOAD_PART_ALREADY_CONFIRMED`、`UPLOAD_PART_SIZE_MISMATCH`、`UPLOAD_PART_STORAGE_MISMATCH`、`UPLOAD_PART_CONFIRM_CONFLICT`、`UPLOAD_PARTS_MISSING`、`STORAGE_OBJECT_NOT_FOUND`、`UPLOAD_SIZE_MISMATCH`、`UPLOAD_CHECKSUM_MISMATCH`、`UPLOAD_VERSION_CONFLICT`、`UPLOAD_STATE_INVALID`、`STORAGE_TEMPORARY_FAILURE`、`PROJECT_NOT_ACTIVE` 和 `IDEMPOTENCY_KEY_REUSED`。错误响应必须同时给出是否可重试及下一动作；缺失分片错误附带有序 `missingPartNumbers`。
+`DEV-M2-03` 已落地的上传协议稳定错误码包括：`UPLOAD_FILE_TYPE_INVALID`、`UPLOAD_FILE_SIZE_INVALID`、`FILE_FINGERPRINT_MISMATCH`、`UPLOAD_SESSION_EXPIRED`、`UPLOAD_PART_INVALID`、`UPLOAD_PART_ALREADY_CONFIRMED`、`UPLOAD_PART_SIZE_MISMATCH`、`UPLOAD_PART_STORAGE_MISMATCH`、`UPLOAD_PART_CONFIRM_CONFLICT`、`UPLOAD_PARTS_MISSING`、`STORAGE_OBJECT_NOT_FOUND`、`UPLOAD_SIZE_MISMATCH`、`UPLOAD_CHECKSUM_MISMATCH`、`UPLOAD_VERSION_CONFLICT`、`UPLOAD_STATE_INVALID`、`UPLOAD_TRANSPORT_DISABLED`、`STORAGE_TEMPORARY_FAILURE`、`PROJECT_NOT_ACTIVE` 和 `IDEMPOTENCY_KEY_REUSED`。错误响应必须同时给出是否可重试及下一动作；缺失分片错误附带有序 `missingPartNumbers`。
 
 素材清单接口使用以下稳定边界：非法根目录、绝对/越界/错根相对路径、路径末段与文件名不一致、角色缺失、重复角色、重复占用、类型或指纹不匹配返回 `400 MATERIAL_MANIFEST_INVALID`；`expectedVersion` 不是最新版本返回 `409 MATERIAL_MANIFEST_VERSION_CONFLICT` 并要求重新读取最新清单；同一幂等键用于语义不同的确认请求返回 `409 IDEMPOTENCY_KEY_REUSED`。不存在的项目返回 `404 PROJECT_NOT_FOUND`，非 `active` 项目返回 `409 PROJECT_NOT_ACTIVE`。
 
@@ -150,6 +158,10 @@ M2 没有账号系统时，操作者字段允许保存受控环境中的匿名�
 - 分片确认、完成、取消、回收、恢复和清理命令必须幂等；同键同请求稳定重放，同键异请求返回 `IDEMPOTENCY_KEY_REUSED`。短时分片授权可续期且不改变 PostgreSQL 业务状态，因此不强制使用幂等键。
 - 分片确认必须在数据库锁内重读项目和会话；项目非 `active` 或会话处于完成中、终态、过期状态时拒绝写入，迟到确认不得把状态改回 `uploading`。
 - 完成命令在调用对象存储前保存命令占位。若对象已经合并但最终数据库事务未完成，同一完成意图先核对对象，再补建唯一素材并转为 `completed`。
+- 完成任务是 PostgreSQL 中按 `upload_session_id` 唯一的持久事实，保存幂等键、请求摘要、阶段、尝试次数、租约、下一次尝试时间和最后错误。Worker 以 `FOR UPDATE SKIP LOCKED` 领取 `scheduled/retryable` 或已过期租约；进程重启不依赖内存 Promise。
+- Worker 在第一次外部 Complete 前先把阶段写为 `write_in_flight`。Complete 抛错、超时或该阶段后进程中止一律按 unknown 处理，只对同一 `object_key` 做 Head/有界对账，不重复 Complete、不创建新 multipart、不扫描上传列表；对象尺寸和摘要核对通过后才进入唯一 Asset 与素材绑定事务。
+- HTTP 完成请求链不得调用 `completeMultipart`、`headObject`、`readObject`/`GetObject` 或整对象摘要计算；只有 Worker 可以执行这些外部核验。
+- 既有 TUS 兼容完成分支保持原有临时文件提升语义；本异步任务的持久完成 Job 只接管 `transport_kind = multipart`，不得让 TUS 会话误入 multipart Worker。
 - 取消命令在数据库锁内先取得终态，再执行可重复的存储清理；完成和取消的并发结果由锁内先行命令唯一决定。
 - 项目非 `active` 后拒绝新授权、分片确认和完成且不产生新的业务落账；取消清理仍可重复执行。
 - 服务端生成不可猜测对象键；原文件名只作为经过清理的展示元数据。

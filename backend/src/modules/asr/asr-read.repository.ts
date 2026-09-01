@@ -8,6 +8,9 @@ import type {
   AsrHotwordPreview,
   AsrJob,
   AsrResult,
+  AsrSrtComparison,
+  AsrSrtComparisonCue,
+  AsrSrtComparisonSamplePosition,
 } from '@qimao-terms-cloud/contracts';
 import type { PoolClient, QueryResultRow } from 'pg';
 
@@ -22,7 +25,7 @@ interface BatchRow extends QueryResultRow {
   retry_of_batch_id: string | null;
   scope_kind: AsrBatchSummary['scopeKind'];
   episode_numbers: number[];
-  term_version_id: string;
+  term_version_id: string | null;
   term_version_is_latest: boolean;
   manifest_id: string;
   manifest_version: number;
@@ -50,6 +53,8 @@ interface BatchRow extends QueryResultRow {
   reused_count: string;
   created_at: Date;
   updated_at: Date;
+  routing_version_id: string | null;
+  deployment_version_id: string | null;
   list_total?: string;
 }
 
@@ -66,6 +71,8 @@ interface JobRow extends QueryResultRow {
   cancel_requested: boolean;
   created_at: Date;
   updated_at: Date;
+  routing_version_id: string | null;
+  deployment_version_id: string | null;
 }
 
 interface AttemptRow extends QueryResultRow {
@@ -100,7 +107,23 @@ interface AttemptRow extends QueryResultRow {
   reconciliation_status: 'final' | 'pending' | null;
   usage_provider_request_id: string | null;
   result_id: string | null;
+  routing_version_id: string | null;
+  deployment_version_id: string | null;
 }
+
+const localPolicyBlockCodes = new Set([
+  'SYSTEM_CONTROL_BUDGET_NO_ACTIVE_POLICY',
+  'SYSTEM_CONTROL_BUDGET_RULE_MISSING',
+  'SYSTEM_CONTROL_BUDGET_HARD_LIMIT',
+]);
+
+const isSafeLocalPolicyBlock = (row: AttemptRow) => Boolean(
+  row.error_code
+  && localPolicyBlockCodes.has(row.error_code)
+  && !row.provider_request_id
+  && !row.usage_provider_request_id
+  && !row.external_side_effect_possible,
+);
 
 interface ResultRow extends QueryResultRow {
   id: string;
@@ -108,7 +131,7 @@ interface ResultRow extends QueryResultRow {
   project_id: string;
   episode_number: number;
   asset_id: string;
-  term_version_id: string;
+  term_version_id: string | null;
   config_digest: string;
   hotword_digest: string;
   quality_status: AsrResult['qualityStatus'];
@@ -118,7 +141,7 @@ interface ResultRow extends QueryResultRow {
 
 interface BatchHotwordRow extends QueryResultRow {
   project_id: string;
-  term_version_id: string;
+  term_version_id: string | null;
   provider: string;
   adapter: string;
   model: string;
@@ -138,15 +161,16 @@ interface BatchHotwordRow extends QueryResultRow {
 const batchColumns = `
   batch.id, batch.project_id, batch.retry_of_batch_id, batch.scope_kind,
   batch.episode_numbers, batch.term_version_id, batch.manifest_id, batch.manifest_version,
-  (batch.term_version_id = (
+  COALESCE(batch.term_version_id = (
     SELECT version.id FROM term_versions version
      WHERE version.project_id = batch.project_id ORDER BY version.version DESC LIMIT 1
-  )) AS term_version_is_latest,
+  ), FALSE) AS term_version_is_latest,
   batch.provider, batch.adapter, batch.model, batch.language, batch.config_digest,
   batch.hotword_digest, batch.hotword_term_count, batch.hotword_alias_count,
   batch.hotword_filtered_count, batch.hotword_truncated_count,
   batch.hotword_projection_version, batch.status,
   batch.force_new_recognition, batch.created_at, batch.updated_at,
+  batch.routing_version_id, batch.deployment_version_id,
   cardinality(batch.episode_numbers)::text AS total_count_value,
   COUNT(job.id) FILTER (WHERE job.status = 'queued')::text AS queued_count,
   COUNT(job.id) FILTER (WHERE job.status IN ('leased','running'))::text AS running_count,
@@ -196,6 +220,8 @@ const toSummary = (row: BatchRow): AsrBatchSummary => ({
   },
   createdAt: row.created_at.toISOString(),
   updatedAt: row.updated_at.toISOString(),
+  routingVersionId: row.routing_version_id,
+  deploymentVersionId: row.deployment_version_id,
 });
 
 const loadResult = async (client: PoolClient, resultId: string): Promise<AsrResult | null> => {
@@ -244,6 +270,7 @@ const loadAttempts = async (client: PoolClient, jobId: string): Promise<AsrAttem
   );
   const attempts: AsrAttempt[] = [];
   for (const row of result.rows) {
+    const localPolicyBlocked = isSafeLocalPolicyBlock(row);
     attempts.push({
       id: row.id,
       attemptNumber: row.attempt_number,
@@ -253,7 +280,8 @@ const loadAttempts = async (client: PoolClient, jobId: string): Promise<AsrAttem
       providerRequestId: row.provider_request_id,
       errorCode: row.error_code,
       errorDetail: row.error_detail,
-      retryable: row.retryable,
+      localPolicyBlocked,
+      retryable: row.retryable || localPolicyBlocked,
       externalSideEffectPossible: row.external_side_effect_possible,
       startedAt: row.started_at?.toISOString() ?? null,
       completedAt: row.completed_at?.toISOString() ?? null,
@@ -284,9 +312,66 @@ const loadAttempts = async (client: PoolClient, jobId: string): Promise<AsrAttem
       } : null,
       result: row.result_id ? await loadResult(client, row.result_id) : null,
       createdAt: row.created_at.toISOString(),
+      routingVersionId: row.routing_version_id,
+      deploymentVersionId: row.deployment_version_id,
     });
   }
   return attempts;
+};
+
+const comparisonEpisodes = [2, 8, 29] as const;
+const comparisonReviewOptions = [
+  { code: 'missing_word' as const, label: '漏词' as const },
+  { code: 'extra_word' as const, label: '额外' as const },
+  { code: 'proper_name' as const, label: '专名' as const },
+  { code: 'timing' as const, label: '时间' as const },
+  { code: 'match' as const, label: '一致' as const },
+];
+const COMPARISON_TEXT_LIMIT = 240;
+const COMPARISON_ASR_CUES_PER_SAMPLE = 8;
+
+interface ComparisonResultRow extends QueryResultRow {
+  episode_number: number;
+  result_id: string;
+  asset_id: string;
+  source_srt_set_digest: string | null;
+}
+
+interface ComparisonCueRow extends QueryResultRow {
+  episode_number: number;
+  cue_id: string;
+  cue_index: number;
+  start_ms: number;
+  end_ms: number;
+  text: string;
+  confidence: string | null;
+}
+
+const comparisonCue = (row: ComparisonCueRow, confidence: number | null): AsrSrtComparisonCue => {
+  const text = row.text.trim();
+  const textTruncated = text.length > COMPARISON_TEXT_LIMIT;
+  return {
+    id: row.cue_id,
+    cueIndex: row.cue_index,
+    startMs: row.start_ms,
+    endMs: row.end_ms,
+    text: textTruncated ? `${text.slice(0, COMPARISON_TEXT_LIMIT - 1)}…` : text,
+    textTruncated,
+    confidence,
+  };
+};
+
+const sampleIndex = (position: AsrSrtComparisonSamplePosition, count: number) => {
+  if (position === 'start') return 0;
+  if (position === 'middle') return Math.floor((count - 1) / 2);
+  return count - 1;
+};
+
+const comparisonStatus = (companyCueCount: number, asrCueCount: number): AsrSrtComparison['episodes'][number]['status'] => {
+  if (companyCueCount > 0 && asrCueCount > 0) return 'ready';
+  if (companyCueCount > 0) return 'missing_asr_result';
+  if (asrCueCount > 0) return 'missing_company_srt';
+  return 'missing_both';
 };
 
 export const loadAsrBatchSummary = async (client: PoolClient, batchId: string) => {
@@ -312,7 +397,7 @@ export const loadAsrBatchDetail = async (client: PoolClient, batchId: string): P
   const jobRows = await client.query<JobRow>(
     `SELECT id, episode_number, asset_id, asset_original_filename, asset_checksum_value,
             status, current_attempt_id, current_result_id, reused_result, cancel_requested,
-            created_at, updated_at
+            created_at, updated_at, routing_version_id, deployment_version_id
        FROM asr_jobs WHERE batch_id = $1 ORDER BY episode_number, id`,
     [batchId],
   );
@@ -333,6 +418,8 @@ export const loadAsrBatchDetail = async (client: PoolClient, batchId: string): P
       currentResult: row.current_result_id ? await loadResult(client, row.current_result_id) : null,
       createdAt: row.created_at.toISOString(),
       updatedAt: row.updated_at.toISOString(),
+      routingVersionId: row.routing_version_id,
+      deploymentVersionId: row.deployment_version_id,
     });
   }
   return {
@@ -463,6 +550,129 @@ export class AsrReadRepository {
     try {
       const batch = await loadAsrBatchDetail(client, batchId);
       return batch?.projectId === projectId ? batch : null;
+    } finally {
+      client.release();
+    }
+  }
+
+  async compareSrt(projectId: string, batchId: string): Promise<AsrSrtComparison | null> {
+    const client = await this.pool.connect();
+    try {
+      const results = await client.query<ComparisonResultRow>(
+        `SELECT job.episode_number, result.id AS result_id, result.asset_id,
+                version.source_srt_set_digest
+           FROM asr_jobs job
+           JOIN asr_results result ON result.id = job.current_result_id
+           LEFT JOIN term_versions version ON version.id = result.term_version_id
+          WHERE job.batch_id = $1 AND job.project_id = $2
+            AND job.status = 'completed'
+            AND job.episode_number = ANY($3::integer[])
+            AND result.project_id = $2
+          ORDER BY job.episode_number, result.id`,
+        [batchId, projectId, comparisonEpisodes],
+      );
+      const resultByEpisode = new Map(results.rows.map((row) => [row.episode_number, row]));
+      const batchExists = await client.query<{ id: string }>(
+        'SELECT id FROM asr_batches WHERE id = $1 AND project_id = $2',
+        [batchId, projectId],
+      );
+      if (!batchExists.rows[0]) return null;
+
+      const company = await client.query<ComparisonCueRow>(
+        `WITH selected AS (
+           SELECT requested.episode_number,
+                  result.asset_id,
+                  COALESCE(version.source_srt_set_digest, latest.source_srt_set_digest) AS source_srt_set_digest
+             FROM unnest($3::integer[]) AS requested(episode_number)
+             LEFT JOIN asr_jobs job
+               ON job.batch_id = $1 AND job.project_id = $2
+              AND job.episode_number = requested.episode_number
+              AND job.status = 'completed'
+             LEFT JOIN asr_results result ON result.id = job.current_result_id
+             LEFT JOIN term_versions version ON version.id = result.term_version_id
+             LEFT JOIN LATERAL (
+               SELECT term_version.source_srt_set_digest
+                 FROM term_versions term_version
+                 JOIN term_drafts draft ON draft.id = term_version.draft_id
+                WHERE term_version.project_id = $2 AND draft.status = 'confirmed'
+                ORDER BY term_version.version DESC, term_version.id DESC
+                LIMIT 1
+             ) latest ON TRUE
+         )
+         SELECT selected.episode_number, cue.id AS cue_id, cue.cue_index,
+                cue.start_ms, cue.end_ms, cue.text, NULL::numeric AS confidence
+           FROM selected
+           JOIN term_cues cue
+             ON cue.project_id = $2
+            AND cue.source_srt_set_digest = selected.source_srt_set_digest
+            AND cue.episode_number = selected.episode_number
+            AND (selected.asset_id IS NULL OR cue.asset_id = selected.asset_id)
+          ORDER BY selected.episode_number, cue.cue_index, cue.id`,
+        [batchId, projectId, comparisonEpisodes],
+      );
+      const asr = await client.query<ComparisonCueRow>(
+        `SELECT result.episode_number, cue.id AS cue_id, cue.cue_index,
+                cue.start_ms, cue.end_ms, cue.text, cue.confidence
+           FROM asr_jobs job
+           JOIN asr_results result ON result.id = job.current_result_id
+           JOIN asr_cues cue ON cue.result_id = result.id
+          WHERE job.batch_id = $1 AND job.project_id = $2
+            AND job.status = 'completed'
+            AND result.project_id = $2
+            AND result.episode_number = ANY($3::integer[])
+          ORDER BY result.episode_number, cue.cue_index, cue.id`,
+        [batchId, projectId, comparisonEpisodes],
+      );
+      const companyByEpisode = new Map<number, ComparisonCueRow[]>();
+      for (const row of company.rows) companyByEpisode.set(row.episode_number, [...(companyByEpisode.get(row.episode_number) ?? []), row]);
+      const asrByEpisode = new Map<number, ComparisonCueRow[]>();
+      for (const row of asr.rows) asrByEpisode.set(row.episode_number, [...(asrByEpisode.get(row.episode_number) ?? []), row]);
+      const positions: AsrSrtComparisonSamplePosition[] = ['start', 'middle', 'end'];
+      const episodes = comparisonEpisodes.map((episodeNumber) => {
+        const companyRows = companyByEpisode.get(episodeNumber) ?? [];
+        const asrRows = asrByEpisode.get(episodeNumber) ?? [];
+        const samples = companyRows.length === 0 ? [] : positions.map((position) => {
+          const companyRow = companyRows[sampleIndex(position, companyRows.length)]!;
+          const overlappingAll = asrRows.filter((asrRow) => {
+            const overlapMs = Math.min(companyRow.end_ms, asrRow.end_ms) - Math.max(companyRow.start_ms, asrRow.start_ms);
+            return overlapMs > 0;
+          });
+          const overlapping = overlappingAll.slice(0, COMPARISON_ASR_CUES_PER_SAMPLE);
+          const companyCue = comparisonCue(companyRow, null);
+          const asrCues = overlapping.map((row) => comparisonCue(row, row.confidence === null ? null : Number(row.confidence)));
+          return {
+            position,
+            companyCue,
+            asrCues,
+            asrCuesTruncated: overlappingAll.length > overlapping.length,
+            overlaps: overlapping.map((row) => ({
+              companyCueId: companyRow.cue_id,
+              asrCueId: row.cue_id,
+              overlapMs: Math.min(companyRow.end_ms, row.end_ms) - Math.max(companyRow.start_ms, row.start_ms),
+            })),
+            mapping: {
+              companyCueId: companyRow.cue_id,
+              asrCueIds: overlapping.map((row) => row.cue_id),
+              relation: overlapping.length === 0 ? 'none' as const : overlapping.length === 1 ? 'one_to_one' as const : 'one_to_many' as const,
+            },
+          };
+        });
+        const result = resultByEpisode.get(episodeNumber);
+        return {
+          episodeNumber,
+          status: comparisonStatus(companyRows.length, result ? asrRows.length : 0),
+          companyCueCount: companyRows.length,
+          asrCueCount: result ? asrRows.length : 0,
+          samples,
+        };
+      });
+      return {
+        projectId,
+        batchId,
+        episodeNumbers: [...comparisonEpisodes],
+        manualReviewOptions: comparisonReviewOptions,
+        episodes,
+      };
     } finally {
       client.release();
     }

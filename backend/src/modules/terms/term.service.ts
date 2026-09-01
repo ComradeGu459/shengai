@@ -12,45 +12,19 @@ import type {
 
 import { TermCandidateRepository } from './term-candidate.repository.js';
 import { TermExtractionRepository } from './term-extraction.repository.js';
-import type { ExtractedTermSeed, TermExtractionAdapter } from './term-extraction.js';
+import type { TermExtractionAdapter } from './term-extraction.js';
 import { TermExportRepository } from './term-export.repository.js';
 import { TermDomainError, termInvalid, termNotFound, type TermErrorCode } from './term-errors.js';
 import { TermSourceService } from './term-source.service.js';
 import { TermVersionRepository } from './term-version.repository.js';
 import { TermWorkspaceRepository } from './term-workspace.repository.js';
 import { createTermVersionXlsx } from './term-xlsx.js';
+import type { SystemControlRoutingService } from '../system-control/system-control.routing.service.js';
+import { SystemControlRoutingError } from '../system-control/system-control.routing.errors.js';
 
 export const TERM_PROMPT_VERSION = 'term-prompt-v1';
 
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-const termTypes = new Set([
-  '人名', '地名', '特定物品', '朝代', '组织名', '等级', '物种/种族名', '特殊概念/事件',
-]);
-
-const validateSeeds = (seeds: ExtractedTermSeed[], cueIds: Set<string>) => {
-  const candidates: ExtractedTermSeed[] = [];
-  const diagnostics: string[] = [];
-  const seen = new Set<string>();
-  for (const seed of seeds) {
-    const evidence = [...new Set(seed.evidenceCueIds)].filter((cueId) => cueIds.has(cueId));
-    const key = seed.name.trim();
-    if (!termTypes.has(seed.type) || !seed.name.trim() || !evidence.length || seen.has(key)
-      || !Number.isFinite(seed.confidence) || seed.confidence < 0 || seed.confidence > 1) {
-      diagnostics.push(`候选“${seed.name || '未命名'}”因缺少真实证据、名称无效或重复而未进入人工草稿。`);
-      continue;
-    }
-    seen.add(key);
-    candidates.push({
-      ...seed,
-      name: seed.name.trim(),
-      aliases: [...new Set(seed.aliases.map((item) => item.trim()).filter(Boolean))],
-      gender: seed.type === '人名' ? seed.gender : 'unknown',
-      evidenceCueIds: evidence,
-    });
-  }
-  return { candidates, diagnostics };
-};
-
 export class TermService {
   constructor(
     private readonly source: TermSourceService,
@@ -60,6 +34,7 @@ export class TermService {
     private readonly workspace: TermWorkspaceRepository,
     private readonly adapter: TermExtractionAdapter,
     private readonly exports: TermExportRepository,
+    private readonly routing?: SystemControlRoutingService,
   ) {}
 
   async getWorkspace(projectId: string) {
@@ -74,7 +49,7 @@ export class TermService {
       ?? null;
     return {
       source: source.state,
-      sourceIsCurrent: source.state.status === 'ready' && trackedDigest !== null && trackedDigest === currentDigest,
+      sourceIsCurrent: source.state.status === 'ready' && (trackedDigest === null || trackedDigest === currentDigest),
       ...projection,
     };
   }
@@ -85,6 +60,10 @@ export class TermService {
     idempotencyKey: string;
     requestId: string;
   }) {
+    const configuredPromptVersion = typeof this.adapter.configSummary.promptVersion === 'string'
+      && this.adapter.configSummary.promptVersion.trim()
+      ? this.adapter.configSummary.promptVersion
+      : TERM_PROMPT_VERSION;
     const inspected = await this.source.inspect(input.projectId);
     const sourceDigest = inspected.state.sourceSrtSetDigest;
     if (!sourceDigest) {
@@ -93,17 +72,26 @@ export class TermService {
     if (input.expectedSourceDigest && input.expectedSourceDigest !== sourceDigest) {
       throw new TermDomainError('TERM_SOURCE_CHANGED', '公司 SRT 来源已经变化，请刷新后重试。', 409, 'reload_terms');
     }
-    const requestHash = hash({ sourceDigest, promptVersion: TERM_PROMPT_VERSION });
-    const begun = await this.extraction.begin({
-      projectId: input.projectId,
-      sourceDigest,
-      promptVersion: TERM_PROMPT_VERSION,
-      adapter: this.adapter.name,
-      adapterConfig: this.adapter.configSummary,
-      idempotencyKey: input.idempotencyKey,
-      requestHash,
-      requestId: input.requestId,
-    });
+    const requestHash = hash({ sourceDigest, promptVersion: configuredPromptVersion, adapter: this.adapter.configSummary });
+    let begun;
+    try {
+      begun = await this.extraction.begin({
+        projectId: input.projectId,
+        sourceDigest,
+        promptVersion: configuredPromptVersion,
+        adapter: this.adapter.name,
+        adapterConfig: this.adapter.configSummary,
+        idempotencyKey: input.idempotencyKey,
+        requestHash,
+        requestId: input.requestId,
+        ...(this.routing ? { routeResolver: (client) => this.routing!.resolveActiveTermsTargets(client) } : {}),
+      });
+    } catch (error) {
+      if (error instanceof SystemControlRoutingError) {
+        throw termInvalid('TERM_ROUTING_NOT_ACTIVE', error.message, 'publish_routing_policy');
+      }
+      throw error;
+    }
     if (begun.replay) return begun;
     if (!inspected.ready) {
       await this.extraction.fail(begun.run.id, inspected.state.issueCode ?? 'TERM_SRT_INVALID', inspected.state.issueDetail ?? 'SRT 无效。');
@@ -113,25 +101,7 @@ export class TermService {
         'replace_source_srt',
       );
     }
-    try {
-      const output = await this.adapter.extract({ cues: inspected.ready.cues, promptVersion: TERM_PROMPT_VERSION });
-      const validated = validateSeeds(output.candidates, new Set(inspected.ready.cues.map((cue) => cue.id)));
-      const completed = await this.extraction.complete({
-        runId: begun.run.id,
-        projectId: input.projectId,
-        sourceDigest,
-        promptVersion: TERM_PROMPT_VERSION,
-        cues: inspected.ready.cues,
-        candidates: validated.candidates,
-        diagnostics: [...output.diagnostics, ...validated.diagnostics],
-        usageSummary: output.usageSummary,
-      });
-      return { ...completed, replay: false };
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : '术语提取失败。';
-      await this.extraction.fail(begun.run.id, 'TERM_EXTRACTION_FAILED', detail);
-      throw new TermDomainError('TERM_EXTRACTION_FAILED', '术语提取失败，请检查来源后显式重试。', 500, 'retry_extraction', true);
-    }
+    return { ...begun, replay: false };
   }
 
   decide(projectId: string, candidateId: string, body: TermCandidateDecisionBody) {

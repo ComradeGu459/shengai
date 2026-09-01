@@ -117,6 +117,21 @@ const recycle = async (projectId: string, expectedVersion: number, key = randomU
   }),
 });
 
+const purge = async (projectId: string, expectedVersion: number, key = randomUUID()) => ({
+  key,
+  response: await app.inject({
+    method: 'POST',
+    url: `/api/projects/${projectId}/purge`,
+    headers: { 'idempotency-key': key },
+    payload: { expectedVersion },
+  }),
+});
+
+const readPurge = async (projectId: string, key: string) => app.inject({
+  method: 'GET',
+  url: `/api/projects/${projectId}/purge/commands/${encodeURIComponent(key)}`,
+});
+
 const makeCleanupDue = async (projectId: string, at: Date) => {
   await pool.query('UPDATE projects SET recycle_expires_at = $2 WHERE id = $1', [projectId, at]);
   await pool.query('UPDATE cleanup_jobs SET next_attempt_at = $2 WHERE project_id = $1', [projectId, at]);
@@ -236,6 +251,9 @@ describe('BACK-M2-06 项目回收生命周期', () => {
         project.id, expiresAt[project.id],
       ]);
     }
+    const commandsBeforeRead = await pool.query<{ count: string }>(
+      'SELECT COUNT(*) FROM project_lifecycle_commands',
+    );
 
     const listAcrossPages = async (query = '') => {
       const firstPage = await app.inject({ method: 'GET', url: `/api/recycle-bin?limit=2&offset=0${query}` });
@@ -269,6 +287,134 @@ describe('BACK-M2-06 项目回收生命周期', () => {
       method: 'GET', url: '/api/recycle-bin?sortBy=recycledAt&sortDirection=asc',
     });
     expect(afterWorkerMetadataChange.json().items[0].recycledAt).toBe(recycledAt[projectC.id].toISOString());
+    const commandsAfterRead = await pool.query<{ count: string }>(
+      'SELECT COUNT(*) FROM project_lifecycle_commands',
+    );
+    expect(commandsAfterRead.rows[0]?.count).toBe(commandsBeforeRead.rows[0]?.count);
+  });
+
+  it('永久删除只接受回收项目，幂等重放同事实且同键异参冲突', async () => {
+    const active = await createProject('匿名仍在使用项目');
+    const activeAttempt = await purge(active.id, active.version, 'purge-active-key');
+    expect(activeAttempt.response.statusCode).toBe(409);
+    expect(activeAttempt.response.json().error.code).toBe('PROJECT_NOT_RECYCLED');
+
+    const project = await createProject('匿名永久删除项目');
+    const recycled = await recycle(project.id, project.version);
+    const expectedVersion = recycled.response.json().project.version as number;
+    const first = await purge(project.id, expectedVersion, 'purge-idempotent-key');
+    expect(first.response.statusCode).toBe(201);
+    expect(first.response.json().project).toMatchObject({ id: project.id, lifecycleStatus: 'purging', version: expectedVersion + 1 });
+
+    const job = await pool.query<{ status: string; next_attempt_at: Date }>(
+      'SELECT status, next_attempt_at FROM cleanup_jobs WHERE project_id = $1', [project.id],
+    );
+    expect(job.rows[0]?.status).toBe('scheduled');
+    expect(job.rows[0]?.next_attempt_at.getTime()).toBeLessThanOrEqual(Date.now());
+
+    const replay = await purge(project.id, expectedVersion, 'purge-idempotent-key');
+    expect(replay.response.statusCode).toBe(200);
+    expect(replay.response.json()).toEqual(first.response.json());
+    const conflict = await purge(project.id, expectedVersion + 1, 'purge-idempotent-key');
+    expect(conflict.response.statusCode).toBe(409);
+    expect(conflict.response.json().error.code).toBe('IDEMPOTENCY_KEY_REUSED');
+  });
+
+  it('永久删除未知结果只按项目与同一键只读恢复，异种命令和跨项目统一安全 404', async () => {
+    const projectA = await createProject('匿名永久删除查询-A');
+    const projectB = await createProject('匿名永久删除查询-B');
+    const recycledA = await recycle(projectA.id, projectA.version);
+    const expectedA = recycledA.response.json().project.version as number;
+    const purgeKey = 'purge-read-recovery-key';
+    const requested = await purge(projectA.id, expectedA, purgeKey);
+    expect(requested.response.statusCode).toBe(201);
+
+    const before = await pool.query<{ commands: string; jobs: string }>(
+      `SELECT
+         (SELECT COUNT(*) FROM project_lifecycle_commands) AS commands,
+         (SELECT COUNT(*) FROM cleanup_jobs) AS jobs`,
+    );
+    const recovered = await readPurge(projectA.id, purgeKey);
+    expect(recovered.statusCode).toBe(200);
+    expect(recovered.json()).toEqual(requested.response.json());
+    const after = await pool.query<{ commands: string; jobs: string }>(
+      `SELECT
+         (SELECT COUNT(*) FROM project_lifecycle_commands) AS commands,
+         (SELECT COUNT(*) FROM cleanup_jobs) AS jobs`,
+    );
+    expect(after.rows[0]).toEqual(before.rows[0]);
+
+    const unknown = await readPurge(projectA.id, 'purge-read-missing-key');
+    expect(unknown.statusCode).toBe(404);
+    expect(unknown.json().error.code).toBe('PURGE_COMMAND_NOT_FOUND');
+    expect(unknown.json().projectId).toBeUndefined();
+    expect(unknown.json().error.commandKind).toBeUndefined();
+
+    const crossProject = await readPurge(projectB.id, purgeKey);
+    expect(crossProject.statusCode).toBe(404);
+    expect(crossProject.json().error.code).toBe('PURGE_COMMAND_NOT_FOUND');
+
+    const recycledB = await recycle(projectB.id, projectB.version, 'recycle-read-command-key');
+    const wrongKind = await readPurge(projectB.id, recycledB.key);
+    expect(wrongKind.statusCode).toBe(404);
+    expect(wrongKind.json().error.code).toBe('PURGE_COMMAND_NOT_FOUND');
+  });
+
+  it('永久删除校验版本与项目归属，进入 purging 后不可恢复或再次创建命令', async () => {
+    const projectA = await createProject('匿名永久删除-A');
+    const projectB = await createProject('匿名永久删除-B');
+    const recycledA = await recycle(projectA.id, projectA.version);
+    const recycledB = await recycle(projectB.id, projectB.version);
+    const expectedA = recycledA.response.json().project.version as number;
+    const expectedB = recycledB.response.json().project.version as number;
+
+    const stale = await purge(projectA.id, projectA.version, 'purge-version-key');
+    expect(stale.response.statusCode).toBe(409);
+    expect(stale.response.json().error.code).toBe('PROJECT_VERSION_CONFLICT');
+
+    const first = await purge(projectA.id, expectedA, 'purge-cross-project-key');
+    expect(first.response.statusCode).toBe(201);
+    const crossProject = await purge(projectB.id, expectedB, 'purge-cross-project-key');
+    expect(crossProject.response.statusCode).toBe(409);
+    expect(crossProject.response.json().error.code).toBe('IDEMPOTENCY_KEY_REUSED');
+
+    const restore = await app.inject({
+      method: 'POST', url: `/api/projects/${projectA.id}/restore`,
+      headers: { 'idempotency-key': randomUUID() },
+      payload: { expectedVersion: first.response.json().project.version },
+    });
+    expect(restore.statusCode).toBe(409);
+    expect(restore.json().error.code).toBe('PROJECT_PURGING');
+    const secondCommand = await purge(projectA.id, first.response.json().project.version, randomUUID());
+    expect(secondCommand.response.statusCode).toBe(409);
+    expect(secondCommand.response.json().error.code).toBe('PROJECT_PURGING');
+  });
+
+  it('永久删除任务完成后保留命令事实，重放仍返回最初 purging 响应', async () => {
+    const project = await createProject('匿名永久删除完成项目');
+    const recycled = await recycle(project.id, project.version);
+    const expectedVersion = recycled.response.json().project.version as number;
+    const requested = await purge(project.id, expectedVersion, 'purge-complete-key');
+    const worker = new ProjectCleanupWorker(pool, storage, lifecycleConfig, { workerId: 'purge-complete-worker' });
+    expect(await worker.runOnce()).toMatchObject({ processed: true, projectId: project.id, status: 'completed' });
+
+    const projectState = await pool.query<{ lifecycle_status: string }>(
+      'SELECT lifecycle_status FROM projects WHERE id = $1', [project.id],
+    );
+    expect(projectState.rows[0]?.lifecycle_status).toBe('purged');
+    const command = await pool.query<{ command_kind: string }>(
+      'SELECT command_kind FROM project_lifecycle_commands WHERE idempotency_key = $1', ['purge-complete-key'],
+    );
+    expect(command.rows[0]?.command_kind).toBe('purge_project');
+    const replay = await purge(project.id, expectedVersion, 'purge-complete-key');
+    expect(replay.response.statusCode).toBe(200);
+    expect(replay.response.json()).toEqual(requested.response.json());
+    const restore = await app.inject({
+      method: 'POST', url: `/api/projects/${project.id}/restore`,
+      headers: { 'idempotency-key': randomUUID() }, payload: { expectedVersion: expectedVersion + 1 },
+    });
+    expect(restore.statusCode).toBe(404);
+    expect(restore.json().error.code).toBe('PROJECT_NOT_FOUND');
   });
 
   it('分片清理失败不回滚回收，恢复时重试且上传仍保持 aborted', async () => {
@@ -348,7 +494,9 @@ describe('BACK-M2-06 项目回收生命周期', () => {
       new TextEncoder().encode('data'),
     );
     const latest = await app.inject({ method: 'GET', url: `/api/projects/${project.id}` });
-    await recycle(project.id, latest.json().version);
+    const recycled = await recycle(project.id, latest.json().version);
+    const purged = await purge(project.id, recycled.response.json().project.version);
+    expect(purged.response.statusCode).toBe(201);
     let now = new Date();
     await makeCleanupDue(project.id, new Date(now.getTime() - 1_000));
     storage.failNextDeleteObject();

@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily upload.milaidi.online TLS renewal check
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+RandomizedDelaySec=45m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

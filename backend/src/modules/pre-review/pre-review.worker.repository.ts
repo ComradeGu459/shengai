@@ -5,7 +5,6 @@ import type { DatabasePool } from '../../database/pool.js';
 import {
   alignEpisode,
   effectiveSystemDecision,
-  PRE_EDIT_ALGORITHM_VERSION,
   normalizePreEditText,
   scanFormatIssues,
   type AlignmentCue,
@@ -156,14 +155,21 @@ export class PreReviewWorkerRepository {
         await client.query('ROLLBACK');
         return false;
       }
-      const session = await client.query<{ source_srt_set_digest: string; term_version_id: string; status: string }>(
-        'SELECT source_srt_set_digest, term_version_id, status FROM pre_edit_sessions WHERE id = $1 FOR UPDATE',
+      const session = await client.query<{ source_srt_set_digest: string; term_version_id: string; strategy_version_id: string | null; status: string }>(
+        'SELECT source_srt_set_digest, term_version_id, strategy_version_id, status FROM pre_edit_sessions WHERE id = $1 FOR UPDATE',
         [currentJob.session_id],
       );
       if (!session.rows[0] || !['preparing', 'failed'].includes(session.rows[0].status)) {
         await client.query('ROLLBACK');
         return false;
       }
+      if (!session.rows[0].strategy_version_id) throw new Error('前置审改会话缺少已绑定策略版本。');
+      const strategy = await client.query<{ rule_pack: Record<string, unknown> }>(
+        `SELECT v.payload AS rule_pack FROM strategy_artifact_versions v JOIN strategy_artifacts a ON a.id=v.artifact_id WHERE v.id = $1 AND a.runtime_module='pre_review' AND v.runtime_status IN ('active','retired','approved') FOR SHARE`,
+        [session.rows[0].strategy_version_id],
+      );
+      if (!strategy.rows[0]) throw new Error('前置审改会话绑定的策略版本不可读取。');
+      const rulePack = strategy.rows[0].rule_pack as any;
       const episodes = await client.query<EpisodeRow>(
         `SELECT id, episode_number, company_asset_id, asr_result_id, asr_quality_status,
                 video_duration_ms::text
@@ -179,7 +185,7 @@ export class PreReviewWorkerRepository {
       for (const episode of episodes.rows) {
         const cues = await this.loadCues(client, episode, session.rows[0].source_srt_set_digest);
         if (!cues.company.length) throw new Error(`第 ${episode.episode_number} 集缺少公司稿 Cue。`);
-        const groups = alignEpisode(cues.company, cues.asr);
+        const groups = alignEpisode(cues.company, cues.asr, rulePack);
         for (const group of groups) {
           const insertedGroup = await client.query<{ id: string }>(
             `INSERT INTO pre_edit_alignment_groups (
@@ -190,7 +196,7 @@ export class PreReviewWorkerRepository {
             [
               currentJob.session_id, episode.id, group.kind,
               group.companyCues.map((cue) => cue.cueId), group.asrCues.map((cue) => cue.cueId),
-              group.timeOverlapMs, group.textSimilarity, PRE_EDIT_ALGORITHM_VERSION, group.digest,
+              group.timeOverlapMs, group.textSimilarity, `pre-review-rule-pack:${session.rows[0].strategy_version_id}`, group.digest,
             ],
           );
           const targets: Array<AlignmentCue | null> = group.companyCues.length ? group.companyCues : [null];
@@ -218,7 +224,7 @@ export class PreReviewWorkerRepository {
                 companyMatched, asrMatched, conflict: companyMatched !== asrMatched,
               }];
             });
-            const issues = scanFormatIssues(system.text, timing ? {
+            const issues = scanFormatIssues(system.text, rulePack, timing ? {
               startMs: timing.startMs,
               endMs: target?.endMs ?? group.asrCues.at(-1)!.endMs,
               videoDurationMs: episode.video_duration_ms === null ? null : Number(episode.video_duration_ms),

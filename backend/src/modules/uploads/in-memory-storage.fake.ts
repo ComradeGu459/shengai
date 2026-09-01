@@ -218,8 +218,11 @@ export class InMemoryStorageFake implements UploadStorage {
     return object ? Uint8Array.from(object.bytes) : null;
   }
 
-  async abortMultipart(storageUploadId: string) {
+  async abortMultipart(input: { storageUploadId: string; objectKey: string }) {
     this.checkFailure();
-    this.uploads.delete(storageUploadId);
+    const upload = this.uploads.get(input.storageUploadId);
+    if (!upload) return;
+    if (upload.objectKey !== input.objectKey) throw new StorageTemporaryError('测试分片上传对象身份不匹配。');
+    this.uploads.delete(input.storageUploadId);
   }
 }

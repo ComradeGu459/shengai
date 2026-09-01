@@ -11,7 +11,11 @@ interface SessionRow extends QueryResultRow {
 
 const mapSession = (row: SessionRow): AcceptanceSession => ({
   id: row.id, projectId: row.project_id, projectVersion: row.project_version, status: row.status,
-  source: { ...row.source_snapshot, sourceDigest: row.source_digest }, revision: row.revision,
+    source: {
+      ...row.source_snapshot,
+      screenTextExcludedEpisodes: row.source_snapshot?.screenTextExcludedEpisodes ?? [],
+      sourceDigest: row.source_digest,
+    }, revision: row.revision,
   episodeCounts: { total: Number(row.episode_total), passed: Number(row.episode_passed), blocked: Number(row.episode_blocked), reworkRequired: Number(row.episode_rework) },
   createdAt: row.created_at.toISOString(), updatedAt: row.updated_at.toISOString(),
 });
@@ -35,6 +39,17 @@ const mapIssue = (row: any): AcceptanceIssue => ({
   track: row.track, cueId: row.cue_id, timeMs: row.time_ms, note: row.note, status: row.status,
   resolutionReason: row.resolution_reason, createdAt: row.created_at.toISOString(), updatedAt: row.updated_at.toISOString(),
 });
+
+type AcceptanceTrack = 'dialogue' | 'screen_text';
+
+const mapPostgresTextArray = (value: unknown): AcceptanceTrack[] => {
+  const toTrack = (item: string): AcceptanceTrack | undefined => item === 'dialogue' || item === 'screen_text' ? item : undefined;
+  if (Array.isArray(value)) return value.map(String).map(toTrack).filter((item): item is AcceptanceTrack => item !== undefined);
+  if (typeof value !== 'string') return [];
+  const text = value.trim();
+  if (text.length < 2 || text[0] !== '{' || text[text.length - 1] !== '}') return toTrack(text) ? [toTrack(text)!] : [];
+  return text.slice(1, -1).split(',').filter(Boolean).map((item) => toTrack(item.trim().replace(/^"(.*)"$/, '$1').replace(/\\"/g, '"').replace(/\\\\/g, '\\'))).filter((item): item is AcceptanceTrack => item !== undefined);
+};
 
 const sessionColumns = `session.id, session.project_id, session.project_version, session.status,
   session.revision, session.source_snapshot, session.source_digest, session.created_at, session.updated_at,
@@ -87,7 +102,7 @@ export class SubtitleAcceptanceReadRepository {
 
   async listRework(projectId: string, sessionId: string) {
     const result = await this.pool.query('SELECT * FROM acceptance_rework_requests WHERE project_id = $1 AND session_id = $2 ORDER BY created_at DESC, id DESC', [projectId, sessionId]);
-    return { items: result.rows.map((row: any) => ({ id: row.id, sessionId: row.session_id, episodeNumbers: row.episode_numbers, tracks: row.tracks, reason: row.reason, createdAt: row.created_at.toISOString() })) };
+    return { items: result.rows.map((row: any) => ({ id: row.id, sessionId: row.session_id, episodeNumbers: row.episode_numbers, tracks: mapPostgresTextArray(row.tracks), reason: row.reason, createdAt: row.created_at.toISOString() })) };
   }
 
   async listReleases(projectId: string) {

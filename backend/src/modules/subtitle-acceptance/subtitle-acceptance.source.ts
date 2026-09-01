@@ -1,4 +1,4 @@
-import type { AcceptanceTrack } from '@qimao-terms-cloud/contracts';
+import type { AcceptanceTrack, ScreenTextReleaseExclusion } from '@qimao-terms-cloud/contracts';
 import type { QueryResultRow } from 'pg';
 
 import type { DatabasePool } from '../../database/pool.js';
@@ -45,6 +45,7 @@ export interface AcceptanceSourceInspection {
   screenTextReleaseId: string | null;
   screenTextReleaseVersion: number | null;
   screenTextHeadReleaseId: string | null;
+  screenTextExcludedEpisodes: ScreenTextReleaseExclusion[];
   manifestId: string;
   manifestVersion: number;
   termVersionId: string;
@@ -83,16 +84,17 @@ export class SubtitleAcceptanceSourceService {
   async inspect(projectId: string, selection: { preEditReleaseId?: string; screenTextReleaseId?: string | null } = {}): Promise<AcceptanceSourceInspection> {
     const heads = await readHeads(this.pool, projectId);
     const preEditReleaseId = selection.preEditReleaseId ?? heads.pre_edit_head_id!;
-    const pre = await this.pool.query<{ id: string; version: number; release_digest: string; session_id: string; term_version_id: string; manifest_id: string }>(
+    const pre = await this.pool.query<{ id: string; version: number; release_digest: string; session_id: string; term_version_id: string; manifest_id: string; source_snapshot: any }>(
       `SELECT release.id, release.version, release.release_digest, release.session_id,
-              session.term_version_id, session.manifest_id
+              session.term_version_id, session.manifest_id, session.source_snapshot
          FROM pre_edit_releases release JOIN pre_edit_sessions session ON session.id = release.session_id
         WHERE release.id = $1 AND release.project_id = $2`, [preEditReleaseId, projectId],
     );
     if (!pre.rows[0]) throw acceptanceInvalid('ACCEPTANCE_SOURCE_NOT_READY', '指定的前置审改 Release 不存在或不属于当前项目。', 'select_release');
-    const screenTextReleaseId = selection.screenTextReleaseId === undefined ? heads.screen_text_head_id : selection.screenTextReleaseId;
-    const screen = screenTextReleaseId ? await this.pool.query<{ id: string; version: number; release_digest: string; term_version_id: string; manifest_id: string }>(
-      `SELECT id, version, release_digest, term_version_id, manifest_id FROM screen_text_releases WHERE id = $1 AND project_id = $2`,
+    const preScreenTextReleaseId = pre.rows[0].source_snapshot?.screenTextRelease?.id ?? heads.screen_text_head_id;
+    const screenTextReleaseId = selection.screenTextReleaseId === undefined ? preScreenTextReleaseId : selection.screenTextReleaseId;
+    const screen = screenTextReleaseId ? await this.pool.query<{ id: string; version: number; release_digest: string; term_version_id: string; manifest_id: string; excluded_episodes: unknown }>(
+      `SELECT id, version, release_digest, term_version_id, manifest_id, excluded_episodes FROM screen_text_releases WHERE id = $1 AND project_id = $2`,
       [screenTextReleaseId, projectId],
     ) : null;
     if (screenTextReleaseId && !screen?.rows[0]) throw acceptanceInvalid('ACCEPTANCE_SOURCE_NOT_READY', '指定的画面字 Release 不存在或不属于当前项目。', 'select_release');
@@ -106,6 +108,16 @@ export class SubtitleAcceptanceSourceService {
       [preEditReleaseId],
     );
     if (!files.rowCount) throw acceptanceInvalid('ACCEPTANCE_SOURCE_NOT_READY', '前置审改 Release 没有逐集字幕。', 'prepare_sources');
+    const screenTextExcludedEpisodes: ScreenTextReleaseExclusion[] = Array.isArray(screen?.rows[0]?.excluded_episodes)
+      ? screen!.rows[0]!.excluded_episodes.map((item: any) => ({
+        episodeNumber: item.episodeNumber,
+        jobId: item.jobId,
+        status: item.status,
+        attemptId: item.attemptId ?? null,
+        errorCode: item.errorCode ?? null,
+        effectClass: item.effectClass ?? null,
+        providerRequestId: item.providerRequestId ?? null,
+      })) : [];
     const screenCues = screenTextReleaseId ? await this.pool.query<{ id: string; episode_number: number; cue_index: number; start_ms: number; end_ms: number; text: string; position: string; pair_group_id: string | null }>(
       `SELECT cue.id, cue.episode_number, cue.cue_index, cue.start_ms, cue.end_ms, cue.text, cue.position, candidate.pair_group_id
          FROM screen_text_release_cues cue
@@ -142,6 +154,7 @@ export class SubtitleAcceptanceSourceService {
       projectId, projectVersion: heads.project_version,
       preEditReleaseId, preEditReleaseVersion: pre.rows[0].version, preEditHeadReleaseId: heads.pre_edit_head_id!,
       screenTextReleaseId: screenTextReleaseId ?? null, screenTextReleaseVersion: screen?.rows[0]?.version ?? null, screenTextHeadReleaseId: heads.screen_text_head_id,
+      screenTextExcludedEpisodes,
       manifestId: heads.manifest_id!, manifestVersion: heads.manifest_version!, termVersionId: heads.term_version_id!, termVersion: heads.term_version!,
       ruleVersion: ACCEPTANCE_RULE_VERSION,
     };

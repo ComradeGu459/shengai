@@ -1,5 +1,7 @@
 import { Type, type Static } from '@sinclair/typebox';
 
+import { ScreenTextReleaseExclusionSchema } from './screen-text.js';
+
 const Uuid = () => Type.String({ format: 'uuid' });
 const Digest = () => Type.String({ pattern: '^[0-9a-f]{64}$' });
 const Timestamp = () => Type.String({ format: 'date-time' });
@@ -62,6 +64,7 @@ export type AcceptanceEpisode = Static<typeof AcceptanceEpisodeSchema>;
 export const AcceptanceSourceSnapshotSchema = Type.Object({
   preEditReleaseId: Uuid(), preEditReleaseVersion: Type.Integer({ minimum: 1 }), preEditHeadReleaseId: Uuid(),
   screenTextReleaseId: Type.Union([Uuid(), Type.Null()]), screenTextReleaseVersion: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]), screenTextHeadReleaseId: Type.Union([Uuid(), Type.Null()]),
+  screenTextExcludedEpisodes: Type.Array(ScreenTextReleaseExclusionSchema),
   manifestId: Uuid(), manifestVersion: Type.Integer({ minimum: 1 }), termVersionId: Uuid(), termVersion: Type.Integer({ minimum: 1 }),
   ruleVersion: Type.String({ minLength: 1, maxLength: 80 }), sourceDigest: Digest(),
 }, { additionalProperties: false });
@@ -124,10 +127,7 @@ export type CreateAcceptanceReworkBody = Static<typeof CreateAcceptanceReworkBod
 export const AcceptanceReworkSchema = Type.Object({ id: Uuid(), sessionId: Uuid(), episodeNumbers: Type.Array(EpisodeNumber()), tracks: Type.Array(AcceptanceTrackSchema), reason: Type.String(), createdAt: Timestamp() }, { additionalProperties: false });
 export const AcceptanceReworkCommandResultSchema = Type.Object({ rework: AcceptanceReworkSchema, replay: Type.Boolean() }, { additionalProperties: false });
 export const AcceptanceReworkListSchema = Type.Object({ items: Type.Array(AcceptanceReworkSchema) }, { additionalProperties: false });
-export const CreateAcceptanceReleaseBodySchema = Type.Object({ expectedSessionRevision: Type.Integer({ minimum: 1 }) }, { additionalProperties: false });
-export type CreateAcceptanceReleaseBody = Static<typeof CreateAcceptanceReleaseBodySchema>;
 export const AcceptanceReleaseSchema = Type.Object({ id: Uuid(), projectId: Uuid(), sessionId: Uuid(), version: Type.Integer({ minimum: 1 }), sourceDigest: Digest(), acceptanceDigest: Digest(), cueCount: Type.Integer({ minimum: 0 }), createdAt: Timestamp() }, { additionalProperties: false });
-export const AcceptanceReleaseCommandResultSchema = Type.Object({ release: AcceptanceReleaseSchema, replay: Type.Boolean() }, { additionalProperties: false });
 export const AcceptanceReleaseListSchema = Type.Object({ items: Type.Array(AcceptanceReleaseSchema) }, { additionalProperties: false });
 export const CreateAcceptancePlaybackGrantBodySchema = Type.Object({ expectedSessionRevision: Type.Integer({ minimum: 1 }) }, { additionalProperties: false });
 export type CreateAcceptancePlaybackGrantBody = Static<typeof CreateAcceptancePlaybackGrantBodySchema>;

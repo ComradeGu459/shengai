@@ -77,6 +77,40 @@ const hotwordEvidence = {
   ],
   summary: hotwords,
 };
+const srtComparison = {
+  projectId,
+  batchId,
+  episodeNumbers: [2, 8, 29],
+  manualReviewOptions: [
+    { code: 'missing_word', label: '漏词' },
+    { code: 'extra_word', label: '额外' },
+    { code: 'proper_name', label: '专名' },
+    { code: 'timing', label: '时间' },
+    { code: 'match', label: '一致' },
+  ],
+  episodes: [2, 8, 29].map((episodeNumber, episodeIndex) => ({
+    episodeNumber,
+    status: episodeIndex === 1 ? 'missing_asr_result' : 'ready',
+    companyCueCount: episodeIndex === 1 ? 3 : 12,
+    asrCueCount: episodeIndex === 1 ? 0 : 14,
+    samples: episodeIndex === 1 ? [] : [
+      {
+        position: episodeIndex === 2 ? 'end' : 'start',
+        companyCue: { id: `company-${episodeNumber}-1`, cueIndex: 1, startMs: 0, endMs: 1_200, text: '开场对白', textTruncated: false, confidence: null },
+        asrCues: episodeIndex === 2 ? [] : [
+          { id: `00000000-0000-4000-8000-${String(episodeNumber).padStart(12, '0')}`, cueIndex: 1, startMs: 0, endMs: 500, text: '开场', textTruncated: false, confidence: 0.92 },
+          { id: `10000000-0000-4000-8000-${String(episodeNumber).padStart(12, '0')}`, cueIndex: 2, startMs: 510, endMs: 1_200, text: '对白', textTruncated: false, confidence: 0.88 },
+        ],
+        asrCuesTruncated: false,
+        overlaps: [],
+        mapping: episodeIndex === 2 ? null : { companyCueId: `company-${episodeNumber}-1`, asrCueIds: [
+          `00000000-0000-4000-8000-${String(episodeNumber).padStart(12, '0')}`,
+          `10000000-0000-4000-8000-${String(episodeNumber).padStart(12, '0')}`,
+        ], relation: 'one_to_many' },
+      },
+    ],
+  })),
+};
 const usage = { provider: 'fake', mediaDurationMs: 61_000, billingUnit: 'second', billingQuantity: 61, currency: 'CNY', estimatedAmount: '0', finalAmount: '0', reconciliationStatus: 'final', providerRequestId: 'req-anon-1' };
 const qualitySummary = { audioCoverageRatio: 0.98, emptyResult: false, cueCount: 3, longSegmentCount: 0, timelineIssueCount: 0, termHitCount: 2, lowConfidenceCount: 1, hallucinationSignalCount: 0 };
 
@@ -89,6 +123,7 @@ const attempt = (id: string, receipt: 'simulated' | 'submitted' | 'partially_sub
   providerRequestId: `req-${receipt}`,
   errorCode: null,
   errorDetail: null,
+  localPolicyBlocked: false,
   retryable: false,
   externalSideEffectPossible: receipt === 'unknown',
   startedAt: '2026-08-14T08:03:00.000Z',
@@ -180,7 +215,9 @@ const detail = (status: 'running' | 'partial' | 'reconciliation_required' | 'com
             { ...attempt(`${jobTwoId}-unsupported`, 'unsupported'), attemptNumber: 2 },
             { ...attempt(`${jobTwoId}-unknown`, 'unknown'), attemptNumber: 3 },
           ]
-        : [attempt(`${jobTwoId}-attempt`, status === 'reconciliation_required' ? 'unknown' : 'partially_submitted')],
+        : status === 'partial'
+          ? [{ ...attempt(`${jobTwoId}-attempt`, 'partially_submitted'), status: 'failed', providerRequestId: null, errorCode: 'ASR_PROVIDER_REJECTED', errorDetail: '供应商明确拒绝且可安全恢复。', retryable: true, usage: null }]
+          : [attempt(`${jobTwoId}-attempt`, status === 'reconciliation_required' ? 'unknown' : 'partially_submitted')],
       currentResult: status === 'completed' ? result(2, assetTwoId, 'warning') : null, createdAt: '2026-08-14T08:02:00.000Z', updatedAt: '2026-08-14T08:04:00.000Z',
     },
   ],
@@ -248,6 +285,7 @@ const baseFetch = (state: FetchState = {}) => async (input: RequestInfo | URL) =
     return response(preparation(state.readyTwo ?? true, forceNewRecognition));
   }
   if (url.includes('/asr/batches?')) return response({ items: state.batches === false ? [] : [batch(current)], total: state.batches === false ? 0 : 1 });
+  if (url.endsWith(`/asr/batches/${batchId}/srt-compare`)) return response(srtComparison);
   if (url.endsWith(`/asr/batches/${batchId}/hotwords`)) return response(hotwordEvidence);
   if (url.endsWith(`/asr/batches/${batchId}`)) return response(detail(current));
   throw new Error(`未模拟请求：${url}`);
@@ -300,6 +338,53 @@ describe('正式单剧中文识别工作台', () => {
     expect(vi.mocked(globalThis.fetch).mock.calls.some(([input]) => String(input).includes('/asr/hotwords/preview'))).toBe(false);
   });
 
+  it('读取 SRT 对照抽样，展示首中尾角色关系并允许临时人工判断', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(baseFetch({ batchStatus: 'completed' }));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: '查看批次' }));
+    fireEvent.click(await screen.findByRole('button', { name: '查看 SRT 对照' }));
+    const panel = await screen.findByRole('dialog', { name: 'SRT 对照抽样' });
+    expect(await within(panel).findByText('抽样集：第 2 / 8 / 29 集')).toBeInTheDocument();
+    expect(within(panel).getAllByText('关系：一对多').length).toBeGreaterThan(0);
+    expect(within(panel).getByText('无重叠 ASR cue')).toBeInTheDocument();
+    expect(within(panel).getByText('缺 ASR 结果')).toBeInTheDocument();
+    expect(within(panel).getAllByText('开场对白').length).toBeGreaterThan(0);
+    expect(within(panel).getAllByText('00:00.000–00:01.200').length).toBeGreaterThan(0);
+
+    const review = within(panel).getAllByRole('button', { name: '一致' })[0]!;
+    expect(review).toHaveAttribute('aria-pressed', 'false');
+    fireEvent.click(review);
+    expect(review).toHaveAttribute('aria-pressed', 'true');
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith(`/asr/batches/${batchId}/srt-compare`))).toBe(true);
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'POST')).toBe(false);
+  });
+
+  it('SRT 对照读取失败显示请求标识，恢复只重读同一查询', async () => {
+    let compareCalls = 0;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith(`/asr/batches/${batchId}/srt-compare`)) {
+        compareCalls += 1;
+        return compareCalls === 1
+          ? response({ error: { code: 'ASR_SRT_COMPARE_UNAVAILABLE', message: 'SRT 对照暂不可用。', retryable: true, action: 'reload_asr', requestId: 'req-srt-503' } }, 503)
+          : response(srtComparison);
+      }
+      return baseFetch({ batchStatus: 'completed' })(input);
+    });
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: '查看批次' }));
+    fireEvent.click(await screen.findByRole('button', { name: '查看 SRT 对照' }));
+    const panel = await screen.findByRole('dialog', { name: 'SRT 对照抽样' });
+    const alert = await within(panel).findByRole('alert');
+    expect(within(alert).getByText('SRT 对照暂不可用。')).toBeInTheDocument();
+    expect(within(alert).getByText('请求标识：req-srt-503')).toBeInTheDocument();
+    fireEvent.click(within(alert).getByRole('button', { name: '重新读取' }));
+    expect((await within(panel).findAllByText('关系：一对多')).length).toBeGreaterThan(0);
+    expect(compareCalls).toBe(2);
+  });
+
   it('逐集准备失败显示请求标识并只用原查询重新读取', async () => {
     let resolveFirst!: (value: Response) => void;
     const firstPreparation = new Promise<Response>((resolve) => { resolveFirst = resolve; });
@@ -315,8 +400,8 @@ describe('正式单剧中文识别工作台', () => {
     });
     renderPage();
 
-    fireEvent.click((await screen.findAllByRole('button', { name: '新建模拟识别批次' }))[0]!);
-    const panel = screen.getByRole('dialog', { name: '新建模拟识别批次' });
+    fireEvent.click((await screen.findAllByRole('button', { name: '新建识别批次' }))[0]!);
+    const panel = screen.getByRole('dialog', { name: '新建识别批次' });
     expect(await within(panel).findByText('正在读取服务端逐集准备事实…')).toBeInTheDocument();
     resolveFirst(response({ error: { code: 'ASR_PREPARATION_UNAVAILABLE', message: '逐集准备服务暂不可用。', retryable: true, action: 'reload_asr', requestId: 'req-preparation-503' } }, 503));
 
@@ -396,15 +481,20 @@ describe('正式单剧中文识别工作台', () => {
     });
     renderPage();
 
-    const newButton = (await screen.findAllByRole('button', { name: '新建模拟识别批次' }))[0]!;
+    const newButton = (await screen.findAllByRole('button', { name: '新建识别批次' }))[0]!;
     fireEvent.click(newButton);
-    await screen.findByText('可复用');
+    const panel = screen.getByRole('dialog', { name: '新建识别批次' });
+    await within(panel).findByText('可复用');
+    expect(within(panel).getByText('运行配置')).toBeInTheDocument();
+    expect(within(panel).getByText('fake')).toBeInTheDocument();
+    expect(within(panel).getByText('deterministic_fake · fake-v1')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '关闭新建批次' })).toHaveFocus();
-    fireEvent.click(screen.getByRole('button', { name: '确认批次信息' }));
-    const dialog = screen.getByRole('dialog', { name: '确认创建模拟识别批次' });
+    fireEvent.click(within(panel).getByRole('button', { name: '确认批次信息' }));
+    const dialog = screen.getByRole('dialog', { name: '确认创建识别批次' });
+    expect(within(dialog).getByText(/运行配置 fake · deterministic_fake · fake-v1/)).toBeInTheDocument();
     expect(within(dialog).getByRole('button', { name: '取消' })).toHaveFocus();
 
-    fireEvent.click(within(dialog).getByRole('button', { name: '创建模拟识别批次' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: '创建识别批次' }));
     await waitFor(() => expect(dialog).toHaveFocus());
     expect(within(dialog).getByRole('button', { name: '处理中…' })).toBeDisabled();
     fireEvent.keyDown(dialog, { key: 'Escape' });
@@ -413,9 +503,10 @@ describe('正式单剧中文识别工作台', () => {
     rejectFirst(new TypeError('网络响应未知'));
     await waitFor(() => expect(within(dialog).getByRole('button', { name: '取消' })).toHaveFocus());
     expect(screen.getByText('网络响应未知')).toBeInTheDocument();
-    fireEvent.click(within(dialog).getByRole('button', { name: '创建模拟识别批次' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: '创建识别批次' }));
 
-    const success = await screen.findByText(/模拟识别批次 ca65378e 已创建/);
+    const success = await screen.findByText(/识别批次 ca65378e 已创建/);
+    expect(success).toHaveTextContent('运行配置：fake · deterministic_fake · fake-v1');
     await waitFor(() => expect(success).toHaveFocus());
     expect(postKeys).toHaveLength(2);
     expect(postKeys[0]).toBe(postKeys[1]);
@@ -435,24 +526,24 @@ describe('正式单剧中文识别工作台', () => {
     });
     renderPage();
 
-    fireEvent.click((await screen.findAllByRole('button', { name: '新建模拟识别批次' }))[0]!);
-    let panel = screen.getByRole('dialog', { name: '新建模拟识别批次' });
+    fireEvent.click((await screen.findAllByRole('button', { name: '新建识别批次' }))[0]!);
+    let panel = screen.getByRole('dialog', { name: '新建识别批次' });
     await within(panel).findByText('可复用');
     fireEvent.click(within(panel).getByRole('radio', { name: '选中集' }));
     fireEvent.click(within(panel).getAllByRole('checkbox')[1]!);
     fireEvent.click(within(panel).getByRole('button', { name: '确认批次信息' }));
-    let dialog = screen.getByRole('dialog', { name: '确认创建模拟识别批次' });
-    fireEvent.click(within(dialog).getByRole('button', { name: '创建模拟识别批次' }));
-    await screen.findByText(/模拟识别批次 ca65378e 已创建/);
+    let dialog = screen.getByRole('dialog', { name: '确认创建识别批次' });
+    fireEvent.click(within(dialog).getByRole('button', { name: '创建识别批次' }));
+    await screen.findByText(/识别批次 ca65378e 已创建/);
 
-    fireEvent.click((await screen.findAllByRole('button', { name: '新建模拟识别批次' }))[0]!);
-    panel = screen.getByRole('dialog', { name: '新建模拟识别批次' });
+    fireEvent.click((await screen.findAllByRole('button', { name: '新建识别批次' }))[0]!);
+    panel = screen.getByRole('dialog', { name: '新建识别批次' });
     await within(panel).findByText('可复用');
     fireEvent.click(within(panel).getByRole('radio', { name: '单集' }));
     fireEvent.change(within(panel).getByRole('combobox', { name: '选择集数' }), { target: { value: '2' } });
     fireEvent.click(within(panel).getByRole('button', { name: '确认批次信息' }));
-    dialog = screen.getByRole('dialog', { name: '确认创建模拟识别批次' });
-    fireEvent.click(within(dialog).getByRole('button', { name: '创建模拟识别批次' }));
+    dialog = screen.getByRole('dialog', { name: '确认创建识别批次' });
+    fireEvent.click(within(dialog).getByRole('button', { name: '创建识别批次' }));
     await waitFor(() => expect(bodies).toHaveLength(2));
 
     expect(bodies).toEqual([
@@ -465,7 +556,7 @@ describe('正式单剧中文识别工作台', () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(baseFetch({ batches: false, sourceIsCurrent: false }));
     renderPage();
 
-    const newButton = (await screen.findAllByRole('button', { name: '新建模拟识别批次' }))[0]!;
+    const newButton = (await screen.findAllByRole('button', { name: '新建识别批次' }))[0]!;
     expect(newButton).toBeDisabled();
     expect(screen.getAllByText('术语门禁尚未满足').length).toBeGreaterThan(0);
     expect(screen.getByRole('link', { name: '返回术语确认' })).toHaveAttribute('href', `/projects/${projectId}/terms`);
@@ -475,8 +566,8 @@ describe('正式单剧中文识别工作台', () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(baseFetch({ batches: false, readyTwo: false }));
     renderPage();
 
-    fireEvent.click((await screen.findAllByRole('button', { name: '新建模拟识别批次' }))[0]!);
-    const panel = screen.getByRole('dialog', { name: '新建模拟识别批次' });
+    fireEvent.click((await screen.findAllByRole('button', { name: '新建识别批次' }))[0]!);
+    const panel = screen.getByRole('dialog', { name: '新建识别批次' });
     expect(await within(panel).findByText(/所选范围含 1 集未校验视频/)).toBeInTheDocument();
     expect(within(panel).getByRole('button', { name: '确认批次信息' })).toBeDisabled();
 
@@ -485,7 +576,7 @@ describe('正式单剧中文识别工作台', () => {
     expect(within(panel).getByRole('button', { name: '确认批次信息' })).toBeEnabled();
   });
 
-  it('部分完成批次只提交失败集重试，成功结果不进入请求', async () => {
+  it('部分完成批次只提交服务端允许恢复的失败集，成功结果不进入请求', async () => {
     const bodies: unknown[] = [];
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
       const url = String(input);
@@ -498,13 +589,99 @@ describe('正式单剧中文识别工作台', () => {
     renderPage();
 
     fireEvent.click(await screen.findByRole('button', { name: '查看批次' }));
-    const retry = await screen.findByRole('button', { name: '仅重试失败集' });
+    const retry = await screen.findByRole('button', { name: '仅重试可恢复集' });
     fireEvent.click(retry);
-    const dialog = screen.getByRole('dialog', { name: '确认仅重试失败集' });
+    const dialog = screen.getByRole('dialog', { name: '确认仅重试可恢复集' });
     expect(within(dialog).getByText(/重试第 2 集/)).toBeInTheDocument();
-    fireEvent.click(within(dialog).getByRole('button', { name: '仅重试失败集' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: '仅重试可恢复集' }));
     await screen.findByText(/失败集重试批次 ca65378e 已创建/);
     expect(bodies).toEqual([{ episodeNumbers: [2] }]);
+  });
+
+  it('22 个历史本地预算阻断显示限额与用量入口，并只用同一稳定身份显式恢复', async () => {
+    const blockedBatchId = 'ca65378e-8935-4c4a-9e8b-13efca3d3198';
+    const recoveredBatchId = 'ca65378e-8935-4c4a-9e8b-13efca3d3199';
+    const blockedJobs = Array.from({ length: 22 }, (_, index) => {
+      const episodeNumber = index + 1;
+      const suffix = String(episodeNumber).padStart(12, '0');
+      return {
+        id: `10000000-0000-4000-8000-${suffix}`,
+        episodeNumber,
+        assetId: `20000000-0000-4000-8000-${suffix}`,
+        assetOriginalFilename: `${episodeNumber}.mp4`,
+        assetChecksum: digest,
+        status: 'failed',
+        currentAttemptId: null,
+        currentResultId: null,
+        reusedResult: false,
+        cancelRequested: false,
+        attempts: [{
+          ...attempt(`30000000-0000-4000-8000-${suffix}`),
+          status: 'failed',
+          providerRequestId: null,
+          errorCode: 'SYSTEM_CONTROL_BUDGET_HARD_LIMIT',
+          errorDetail: '预算 hard limit 阻止新的预留。',
+          localPolicyBlocked: true,
+          retryable: true,
+          externalSideEffectPossible: false,
+          usage: null,
+        }],
+        currentResult: null,
+        createdAt: '2026-08-14T08:02:00.000Z',
+        updatedAt: '2026-08-14T08:04:00.000Z',
+      };
+    });
+    const blockedDetail = {
+      ...detail('partial'),
+      id: blockedBatchId,
+      episodeNumbers: blockedJobs.map((job) => job.episodeNumber),
+      counts: { total: 22, queued: 0, running: 0, cancelRequested: 0, completed: 0, failed: 22, cancelled: 0, reconciliationRequired: 0, reused: 0 },
+      jobs: blockedJobs,
+    };
+    const keys: string[] = [];
+    const bodies: unknown[] = [];
+    let recoveryPosts = 0;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/material-manifest')) return response({ project, manifest: manifest() });
+      if (url.endsWith(`/projects/${projectId}/terms`)) return response(terms());
+      if (url.includes('/asr/batches?')) return response({ items: [blockedDetail], total: 1 });
+      if (url.endsWith(`/asr/batches/${blockedBatchId}`)) return response(blockedDetail);
+      if (url.endsWith(`/asr/batches/${blockedBatchId}/retries`) && init?.method === 'POST') {
+        recoveryPosts += 1;
+        keys.push(new Headers(init.headers).get('idempotency-key')!);
+        bodies.push(JSON.parse(String(init.body)));
+        if (recoveryPosts === 1) return response({ error: { code: 'ASR_RETRY_RESULT_UNKNOWN', message: '恢复结果暂时未知。', retryable: true, action: 'query_same_retry', requestId: 'req-budget-recovery' } }, 503);
+        return response({ ...detail('running'), id: recoveredBatchId, retryOfBatchId: blockedBatchId }, 201);
+      }
+      if (url.endsWith(`/asr/batches/${recoveredBatchId}`)) return response({ ...detail('running'), id: recoveredBatchId, retryOfBatchId: blockedBatchId });
+      throw new Error(`未模拟请求：${url}`);
+    });
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: '查看批次' }));
+    const notice = await screen.findByRole('alert', { name: '本地预算策略阻断' });
+    expect(within(notice).getByText('本地预算策略阻断 22 集')).toBeInTheDocument();
+    expect(within(notice).getByText('在管理员预算页查看')).toBeInTheDocument();
+    expect(within(notice).getByText('未产生')).toBeInTheDocument();
+    expect(within(notice).getByText(/系统不会自动重试/)).toBeInTheDocument();
+    expect(within(notice).getByRole('link', { name: '打开管理员预算设置' })).toHaveAttribute('href', 'https://milaidi.top/budgets');
+    expect(screen.queryByText('22 集失败')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '恢复 22 个预算阻断任务' }));
+    const dialog = screen.getByRole('dialog', { name: '确认恢复预算阻断任务' });
+    expect(within(dialog).getByText(/同一稳定命令身份/)).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole('button', { name: '显式恢复预算阻断任务' }));
+    expect(await within(dialog).findByText(/恢复结果暂时未知/)).toBeInTheDocument();
+    expect(recoveryPosts).toBe(1);
+    const querySame = within(dialog).getByRole('button', { name: '查询同一恢复命令结果' });
+    fireEvent.click(querySame);
+    expect(await screen.findByText(/预算阻断恢复批次 ca65378e 已创建/)).toBeInTheDocument();
+    expect(keys).toHaveLength(2);
+    expect(new Set(keys).size).toBe(1);
+    expect(bodies).toEqual([
+      { episodeNumbers: blockedJobs.map((job) => job.episodeNumber) },
+      { episodeNumbers: blockedJobs.map((job) => job.episodeNumber) },
+    ]);
   });
 
   it('取消只保存意图并继续读取权威状态，不立即伪装成已取消', async () => {
@@ -537,7 +714,7 @@ describe('正式单剧中文识别工作台', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: '查看批次' }));
     expect(await screen.findByText('结果或用量未知')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '仅重试失败集' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '仅重试可恢复集' })).not.toBeInTheDocument();
     fireEvent.click((await screen.findAllByRole('button', { name: '查看对账说明' }))[0]!);
     const panel = await screen.findByRole('dialog', { name: '需对账说明' });
     expect(within(panel).getByText(/自动重试已暂停/)).toBeInTheDocument();
@@ -548,8 +725,8 @@ describe('正式单剧中文识别工作台', () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(baseFetch({ batches: false }));
     renderPage();
 
-    fireEvent.click((await screen.findAllByRole('button', { name: '新建模拟识别批次' }))[0]!);
-    const panel = screen.getByRole('dialog', { name: '新建模拟识别批次' });
+    fireEvent.click((await screen.findAllByRole('button', { name: '新建识别批次' }))[0]!);
+    const panel = screen.getByRole('dialog', { name: '新建识别批次' });
     expect(await within(panel).findByText('可复用')).toBeInTheDocument();
     expect(fetchMock.mock.calls.filter(([input]) => String(input).includes('/asr/batch-preparation?'))).toHaveLength(1);
     expect(fetchMock.mock.calls.some(([input]) => /\/asr\/batches\/[0-9a-f-]+$/.test(String(input)))).toBe(false);

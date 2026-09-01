@@ -41,6 +41,7 @@ import { TermSourceRepository } from './term-source.repository.js';
 import { TermSourceService } from './term-source.service.js';
 import { TermVersionRepository } from './term-version.repository.js';
 import { TermWorkspaceRepository } from './term-workspace.repository.js';
+import { SystemControlRoutingService } from '../system-control/system-control.routing.service.js';
 
 const ProjectParamsSchema = Type.Object({ projectId: Type.String({ format: 'uuid' }) });
 const CandidateParamsSchema = Type.Object({
@@ -79,6 +80,14 @@ export const termRoutes: FastifyPluginAsyncTypebox = async (app) => {
   const cueRepository = new TermCueRepository(app.database);
   const versionRepository = new TermVersionRepository(app.database);
   const exportRepository = new TermExportRepository(app.database);
+  // deterministic fake 仅保留既有开发/测试兼容路径；生产 OpenAI-compatible adapter 必须经 117 route。
+  const routing = app.termExtractionAdapter.name === 'deterministic-marker-fake' && process.env.NODE_ENV !== 'production'
+    ? undefined
+    : new SystemControlRoutingService(app.database, {
+      asr: app.asrAdapterRegistry,
+      screenText: app.screenTextAdapterRegistry,
+      terms: app.termExtractionAdapter,
+    });
   const service = new TermService(
     source,
     new TermExtractionRepository(app.database),
@@ -87,6 +96,7 @@ export const termRoutes: FastifyPluginAsyncTypebox = async (app) => {
     new TermWorkspaceRepository(app.database),
     app.termExtractionAdapter,
     exportRepository,
+    routing,
   );
   const handle = async <T>(reply: FastifyReply, requestId: string, operation: () => Promise<T>) => {
     try {
@@ -106,7 +116,7 @@ export const termRoutes: FastifyPluginAsyncTypebox = async (app) => {
       params: ProjectParamsSchema,
       headers: IdempotencyHeadersSchema,
       body: StartTermExtractionBodySchema,
-      response: { 200: StartTermExtractionResultSchema, 201: StartTermExtractionResultSchema, 409: ApiErrorSchema, 422: ApiErrorSchema },
+      response: { 200: StartTermExtractionResultSchema, 202: StartTermExtractionResultSchema, 409: ApiErrorSchema, 422: ApiErrorSchema },
     },
   }, async (request, reply) => handle(reply, request.id, async () => {
     const result = await service.startExtraction({
@@ -117,7 +127,7 @@ export const termRoutes: FastifyPluginAsyncTypebox = async (app) => {
       idempotencyKey: request.headers['idempotency-key'],
       requestId: request.id,
     });
-    return reply.code(result.replay ? 200 : 201).send({ run: result.run, draft: result.draft });
+    return reply.code(result.replay ? 200 : 202).send({ run: result.run, draft: result.draft });
   }));
 
   app.get('/api/projects/:projectId/terms/candidates', {

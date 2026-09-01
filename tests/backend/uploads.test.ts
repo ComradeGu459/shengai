@@ -1,4 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
@@ -7,6 +10,8 @@ import type { UploadProtocolConfig } from '../../backend/src/config.js';
 import { createPool } from '../../backend/src/database/pool.js';
 import { InMemoryStorageFake } from '../../backend/src/modules/uploads/in-memory-storage.fake.js';
 import { StorageAuthorizationExpiredError } from '../../backend/src/modules/uploads/upload-storage.js';
+import { FilesystemDeliveryStorage, FilesystemUploadStorage } from '../../backend/src/modules/storage/filesystem-storage.js';
+import { UploadCompletionWorker } from '../../backend/src/workers/upload-completion.worker.js';
 
 const pool = createPool();
 const storage = new InMemoryStorageFake();
@@ -44,6 +49,8 @@ const createUpload = async (projectId: string, bytes: Uint8Array, options: {
   fileFingerprint?: string;
   originalFileName?: string;
   mediaKind?: 'srt' | 'video';
+  checksumValue?: string;
+  includeChecksum?: boolean;
 } = {}) => {
   const request = {
     method: 'POST' as const,
@@ -55,7 +62,9 @@ const createUpload = async (projectId: string, bytes: Uint8Array, options: {
       sizeBytes: bytes.byteLength,
       fileFingerprint: options.fileFingerprint ?? `EP01.srt|${bytes.byteLength}|1754976000000`,
       checksumAlgorithm: 'sha256' as const,
-      checksumValue: checksum(bytes),
+      ...(options.includeChecksum === false
+        ? {}
+        : { checksumValue: options.checksumValue ?? checksum(bytes) }),
     },
   };
   return { request, response: await app.inject(request) };
@@ -93,7 +102,80 @@ const uploadAllParts = async (session: Record<string, any>, bytes: Uint8Array) =
   return current;
 };
 
+const runCompletionWorker = async () => new UploadCompletionWorker(
+  pool,
+  storage,
+  { leaseMs: 60_000, retryDelayMs: 0, maxAttempts: 3 },
+  { workerId: randomUUID() },
+).runOnce();
+
+const runCompletionToTerminal = async (uploadId: string) => {
+  let result = await runCompletionWorker();
+  for (let attempt = 1; attempt < 3 && result.status === 'retryable'; attempt += 1) {
+    await pool.query(
+      `UPDATE upload_completion_jobs SET next_attempt_at=CURRENT_TIMESTAMP - INTERVAL '1 second' WHERE upload_session_id=$1`,
+      [uploadId],
+    );
+    result = await runCompletionWorker();
+  }
+  return result;
+};
+
 describe('分片上传协议', () => {
+  it('无需客户端整文件摘要即可立即创建并上传，完成后以服务端摘要落账', async () => {
+    const projectId = await createProject();
+    const bytes = new TextEncoder().encode('server-authoritative-checksum');
+    const created = await createUpload(projectId, bytes, { includeChecksum: false });
+
+    expect(created.response.statusCode).toBe(201);
+    expect(created.response.json().checksumValue).toBeNull();
+
+    const uploaded = await uploadAllParts(created.response.json(), bytes);
+    const completed = await app.inject({
+      method: 'POST',
+      url: `/api/uploads/${uploaded.id}/complete`,
+      headers: { 'idempotency-key': randomUUID() },
+      payload: { expectedVersion: uploaded.version },
+    });
+    const expectedChecksum = checksum(bytes);
+
+    expect(completed.statusCode).toBe(202);
+    expect(completed.json()).toMatchObject({ status: 'verifying', checksumValue: null });
+    expect(await runCompletionWorker()).toMatchObject({ processed: true, status: 'completed' });
+    const refreshed = await app.inject({ method: 'GET', url: `/api/uploads/${uploaded.id}` });
+    expect(refreshed.json()).toMatchObject({
+      status: 'completed',
+      checksumValue: expectedChecksum,
+      asset: { checksumValue: expectedChecksum },
+    });
+  });
+
+  it('客户端期望摘要不匹配时稳定失败且不创建素材或绑定', async () => {
+    const projectId = await createProject();
+    const bytes = new TextEncoder().encode('expected-checksum-mismatch');
+    const wrongChecksum = '0'.repeat(64);
+    const created = await createUpload(projectId, bytes, { checksumValue: wrongChecksum });
+    const uploaded = await uploadAllParts(created.response.json(), bytes);
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/uploads/${uploaded.id}/complete`,
+      headers: { 'idempotency-key': randomUUID() },
+      payload: { expectedVersion: uploaded.version },
+    });
+    const assets = await pool.query<{ count: string }>('SELECT COUNT(*) FROM assets WHERE project_id = $1', [projectId]);
+    const bindings = await pool.query<{ count: string }>(
+      `SELECT COUNT(*) FROM material_asset_bindings WHERE asset_id IN (SELECT id FROM assets WHERE project_id = $1)`,
+      [projectId],
+    );
+
+    expect(response.statusCode).toBe(202);
+    expect(await runCompletionWorker()).toMatchObject({ processed: true, status: 'failed' });
+    const refreshed = await app.inject({ method: 'GET', url: `/api/uploads/${uploaded.id}` });
+    expect(refreshed.json()).toMatchObject({ status: 'failed', errorCode: 'UPLOAD_CHECKSUM_MISMATCH', asset: null });
+    expect(assets.rows[0]?.count).toBe('0');
+    expect(bindings.rows[0]?.count).toBe('0');
+  });
+
   it('创建会话幂等重放，拒绝同键异请求与非活动项目', async () => {
     const projectId = await createProject();
     const bytes = new TextEncoder().encode('anonymous');
@@ -116,6 +198,67 @@ describe('分片上传协议', () => {
     const inactive = await createUpload(projectId, bytes);
     expect(inactive.response.statusCode).toBe(409);
     expect(inactive.response.json().error.code).toBe('PROJECT_NOT_ACTIVE');
+  });
+
+  it('create_upload 响应未知时按同一 commandId 只读恢复并隔离项目', async () => {
+    const projectId = await createProject();
+    const otherProjectId = await createProject();
+    const bytes = new TextEncoder().encode('command-read');
+    const commandId = randomUUID();
+    const created = await createUpload(projectId, bytes, { idempotencyKey: commandId });
+    expect(created.response.statusCode).toBe(201);
+
+    const before = await pool.query<{ count: string }>(
+      `SELECT COUNT(*) FROM upload_commands WHERE idempotency_key = $1`, [commandId]);
+    const recovered = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${projectId}/uploads/commands/${commandId}`,
+    });
+    const after = await pool.query<{ count: string }>(
+      `SELECT COUNT(*) FROM upload_commands WHERE idempotency_key = $1`, [commandId]);
+    const crossProject = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${otherProjectId}/uploads/commands/${commandId}`,
+    });
+    const unknown = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${projectId}/uploads/commands/${randomUUID()}`,
+    });
+
+    expect(recovered.statusCode).toBe(200);
+    expect(recovered.json()).toMatchObject({
+      commandId,
+      projectId,
+      status: 'succeeded',
+      session: { id: created.response.json().id },
+    });
+    expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
+    expect(crossProject.statusCode).toBe(404);
+    expect(crossProject.json().error.code).toBe('UPLOAD_CREATE_COMMAND_NOT_FOUND');
+    expect(unknown.statusCode).toBe(404);
+    expect(unknown.json().error.code).toBe('UPLOAD_CREATE_COMMAND_NOT_FOUND');
+  });
+
+  it('客户端暂停后可用同一 uploadId 补缺失分片，已确认分片与创建命令不变', async () => {
+    const projectId = await createProject();
+    const bytes = new TextEncoder().encode('abcdefgh');
+    const commandId = randomUUID();
+    const created = await createUpload(projectId, bytes, { idempotencyKey: commandId });
+    const initial = created.response.json();
+    const firstPart = await uploadAndConfirmPart(initial, 1, bytes.slice(0, 4));
+    const beforeResume = await app.inject({ method: 'GET', url: `/api/uploads/${initial.id}` });
+    const resumedAuthorization = await authorize(initial.id, 2, initial.fileFingerprint);
+
+    expect(beforeResume.statusCode).toBe(200);
+    expect(beforeResume.json().confirmedParts.map((part: any) => part.partNumber)).toEqual([1]);
+    expect(beforeResume.json().missingPartNumbers).toEqual([2]);
+    expect(resumedAuthorization.statusCode).toBe(200);
+    expect(firstPart.session.id).toBe(initial.id);
+    const createdCommands = await pool.query<{ count: string }>(
+      `SELECT COUNT(*) FROM upload_commands WHERE upload_session_id = $1 AND command_kind = 'create_upload'`,
+      [initial.id],
+    );
+    expect(createdCommands.rows[0]?.count).toBe('1');
   });
 
   it('拒绝不匹配的扩展名和集中配置之外的大小', async () => {
@@ -181,13 +324,15 @@ describe('分片上传协议', () => {
       payload: { expectedVersion: current.session.version },
     };
     const completed = await app.inject(completeRequest);
-    const replay = await app.inject(completeRequest);
-    const assets = await pool.query<{ count: string }>('SELECT COUNT(*) FROM assets WHERE project_id = $1', [projectId]);
 
-    expect(completed.statusCode).toBe(200);
-    expect(completed.json()).toMatchObject({ status: 'completed', asset: { sizeBytes: 8 } });
+    expect(completed.statusCode).toBe(202);
+    expect(completed.json()).toMatchObject({ status: 'verifying' });
+    expect(await runCompletionWorker()).toMatchObject({ processed: true, status: 'completed' });
+    const replay = await app.inject(completeRequest);
+    const refreshed = await app.inject({ method: 'GET', url: `/api/uploads/${initial.id}` });
+    const assets = await pool.query<{ count: string }>('SELECT COUNT(*) FROM assets WHERE project_id = $1', [projectId]);
     expect(replay.statusCode).toBe(200);
-    expect(replay.json().asset.id).toBe(completed.json().asset.id);
+    expect(replay.json().asset.id).toBe(refreshed.json().asset.id);
     expect(assets.rows[0]?.count).toBe('1');
   });
 
@@ -249,8 +394,8 @@ describe('分片上传协议', () => {
       headers: { 'idempotency-key': randomUUID() },
       payload: { expectedVersion: uploaded.version },
     });
-    expect(response.statusCode).toBe(409);
-    expect(response.json().error.code).toBe(expectedCode);
+    expect(response.statusCode).toBe(202);
+    expect(await runCompletionToTerminal(uploaded.id)).toMatchObject({ processed: true, status: 'failed' });
     const refreshed = await app.inject({ method: 'GET', url: `/api/uploads/${uploaded.id}` });
     expect(refreshed.json()).toMatchObject({ status: 'failed', errorCode: expectedCode });
   });
@@ -338,10 +483,10 @@ describe('分片上传协议', () => {
       headers: { 'idempotency-key': randomUUID() },
       payload: { expectedVersion: uploaded.session.version },
     });
-    const delayedReplay = await app.inject(confirmationRequest);
 
-    expect(completed.statusCode).toBe(200);
-    expect(completed.json().status).toBe('completed');
+    expect(completed.statusCode).toBe(202);
+    expect(await runCompletionWorker()).toMatchObject({ processed: true, status: 'completed' });
+    const delayedReplay = await app.inject(confirmationRequest);
     expect(delayedReplay.statusCode).toBe(200);
     expect(delayedReplay.json()).toMatchObject({ status: 'completed', asset: { sizeBytes: 8 } });
   });
@@ -359,12 +504,19 @@ describe('分片上传协议', () => {
     };
     storage.failAfterNextComplete();
     const interrupted = await app.inject(request);
-    const failed = await app.inject({ method: 'GET', url: `/api/uploads/${uploaded.id}` });
+    const verifying = await app.inject({ method: 'GET', url: `/api/uploads/${uploaded.id}` });
+    const firstWorker = await runCompletionWorker();
+    const retrying = await app.inject({ method: 'GET', url: `/api/uploads/${uploaded.id}` });
+    await pool.query(`UPDATE upload_completion_jobs SET next_attempt_at=CURRENT_TIMESTAMP - INTERVAL '1 second' WHERE upload_session_id=$1`, [uploaded.id]);
+    const secondWorker = await runCompletionWorker();
     const recovered = await app.inject(request);
     const assets = await pool.query<{ count: string }>('SELECT COUNT(*) FROM assets WHERE project_id = $1', [projectId]);
 
-    expect(interrupted.statusCode).toBe(503);
-    expect(failed.json()).toMatchObject({ status: 'failed', asset: null });
+    expect(interrupted.statusCode).toBe(202);
+    expect(verifying.json()).toMatchObject({ status: 'verifying', asset: null });
+    expect(firstWorker).toMatchObject({ processed: true, status: 'retryable' });
+    expect(retrying.json()).toMatchObject({ status: 'verifying', asset: null });
+    expect(secondWorker).toMatchObject({ processed: true, status: 'completed' });
     expect(storage.hasObject(uploaded.objectKey)).toBe(true);
     expect(recovered.statusCode).toBe(200);
     expect(recovered.json()).toMatchObject({ status: 'completed', asset: { sizeBytes: 8 } });
@@ -404,24 +556,25 @@ describe('分片上传协议', () => {
     const bytes = new TextEncoder().encode('abcdefgh');
     const created = await createUpload(projectId, bytes);
     const uploaded = await uploadAllParts(created.response.json(), bytes);
-    const gate = storage.pauseNextComplete();
-    const completing = app.inject({
+    const completingKey = randomUUID();
+    const abortingKey = randomUUID();
+    const [completing, losingAbort] = await Promise.all([
+      app.inject({
       method: 'POST', url: `/api/uploads/${uploaded.id}/complete`,
-      headers: { 'idempotency-key': randomUUID() }, payload: { expectedVersion: uploaded.version },
-    });
-    await gate.entered;
-    const losingAbort = await app.inject({
-      method: 'POST', url: `/api/uploads/${uploaded.id}/abort`,
-      headers: { 'idempotency-key': randomUUID() }, payload: { expectedVersion: uploaded.version },
-    });
-    gate.release();
-    const completed = await completing;
+      headers: { 'idempotency-key': completingKey }, payload: { expectedVersion: uploaded.version },
+      }),
+      app.inject({
+        method: 'POST', url: `/api/uploads/${uploaded.id}/abort`,
+        headers: { 'idempotency-key': abortingKey }, payload: { expectedVersion: uploaded.version },
+      }),
+    ]);
+    if (completing.statusCode === 202) await runCompletionWorker();
     const refreshed = await app.inject({ method: 'GET', url: `/api/uploads/${uploaded.id}` });
 
-    expect(losingAbort.statusCode).toBe(409);
-    expect(completed.statusCode).toBe(200);
-    expect(completed.json().status).toBe('completed');
-    expect(refreshed.json().status).toBe('completed');
+    expect([200, 409]).toContain(losingAbort.statusCode);
+    expect([202, 409]).toContain(completing.statusCode);
+    expect(refreshed.json().status).toBe(completing.statusCode === 202 ? 'completed' : 'aborted');
+    expect((await pool.query('SELECT COUNT(*)::int AS count FROM upload_commands WHERE upload_session_id=$1 AND command_kind IN (\'complete_upload\',\'abort_upload\')', [uploaded.id])).rows[0].count).toBe(1);
   });
 
   it('项目回收后拒绝授权、确认和完成且不产生副作用，但仍允许取消清理', async () => {
@@ -465,5 +618,85 @@ describe('分片上传协议', () => {
     expect(unchanged.json()).toMatchObject({ status: 'uploading', asset: null });
     expect(storage.hasObject(completable.objectKey)).toBe(false);
     expect(assets.rows[0]?.count).toBe('0');
+  });
+});
+
+describe('正式本地磁盘存储', () => {
+  it('production Fastify 使用同源 PUT，重建存储实例后仍可完成上传与交付读写', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qimao-filesystem-'));
+    const uploadStorage = await FilesystemUploadStorage.create(root);
+    const deliveryStorage = await FilesystemDeliveryStorage.create(root);
+    const productionPool = createPool();
+    const previousNodeEnv = process.env.NODE_ENV;
+    let productionApp: Awaited<ReturnType<typeof createApp>> | null = null;
+    try {
+      process.env.NODE_ENV = 'production';
+      productionApp = createApp({ database: productionPool, uploadStorage, deliveryStorage, uploadConfig });
+      await productionApp.ready();
+      await productionPool.query('TRUNCATE project_commands, projects CASCADE');
+      const project = await productionApp.inject({
+        method: 'POST', url: '/api/projects', headers: { 'idempotency-key': randomUUID() }, payload: { name: '磁盘存储链测试' },
+      });
+      const projectId = project.json().id as string;
+      const bytes = Buffer.from('abcd');
+      const created = await productionApp.inject({
+        method: 'POST', url: `/api/projects/${projectId}/uploads`, headers: { 'idempotency-key': randomUUID() },
+        payload: { originalFileName: 'EP01.srt', mediaKind: 'srt', sizeBytes: bytes.length, fileFingerprint: 'disk-fingerprint', checksumAlgorithm: 'sha256', checksumValue: checksum(bytes) },
+      });
+      expect(created.statusCode).toBe(201);
+      const session = created.json();
+      const authorization = await productionApp.inject({
+        method: 'POST', url: `/api/uploads/${session.id}/parts/authorize`, headers: { 'idempotency-key': randomUUID() },
+        payload: { partNumber: 1, fileFingerprint: session.fileFingerprint },
+      });
+      expect(authorization.statusCode).toBe(200);
+      expect(authorization.json().uploadRequest).toMatchObject({ method: 'PUT', url: `/api/local/uploads/${session.id}/parts/1` });
+      const uploaded = await productionApp.inject({
+        method: 'PUT', url: `/api/local/uploads/${session.id}/parts/1`,
+        headers: { authorization: `Bearer ${authorization.json().authorizationToken}`, 'content-type': 'application/octet-stream' }, payload: bytes,
+      });
+      expect(uploaded.statusCode).toBe(200);
+      const confirmed = await productionApp.inject({
+        method: 'POST', url: `/api/uploads/${session.id}/parts/confirm`, headers: { 'idempotency-key': randomUUID() }, payload: uploaded.json(),
+      });
+      expect(confirmed.statusCode).toBe(200);
+      const completed = await productionApp.inject({
+        method: 'POST', url: `/api/uploads/${session.id}/complete`, headers: { 'idempotency-key': randomUUID() }, payload: { expectedVersion: confirmed.json().version },
+      });
+      expect(completed.statusCode).toBe(202);
+      const completionWorker = new UploadCompletionWorker(
+        productionPool,
+        uploadStorage,
+        { leaseMs: 60_000, retryDelayMs: 0, maxAttempts: 3 },
+        { workerId: randomUUID() },
+      );
+      expect(await completionWorker.runOnce()).toMatchObject({ processed: true, status: 'completed' });
+      const restoredUpload = await FilesystemUploadStorage.create(root);
+      await expect(restoredUpload.headObject(session.objectKey)).resolves.toMatchObject({ sizeBytes: bytes.length, checksumValue: checksum(bytes) });
+      const restoredUploadBytes = await restoredUpload.readObject(session.objectKey);
+      expect(restoredUploadBytes).toBeInstanceOf(Uint8Array);
+      expect(Array.from(restoredUploadBytes!)).toEqual(Array.from(bytes));
+
+      const deliveryKey = 'projects/isolated/deliveries/file.bin';
+      await deliveryStorage.putObject({ objectKey: deliveryKey, bytes, contentType: 'application/octet-stream', metadata: { purpose: 'test' } });
+      const restoredDelivery = await FilesystemDeliveryStorage.create(root);
+      await expect(restoredDelivery.headObject(deliveryKey)).resolves.toMatchObject({ objectKey: deliveryKey, sizeBytes: bytes.length, checksumValue: checksum(bytes) });
+      const restoredDeliveryBytes = await restoredDelivery.readObject(deliveryKey);
+      expect(restoredDeliveryBytes).toBeInstanceOf(Uint8Array);
+      expect(Array.from(restoredDeliveryBytes!)).toEqual(Array.from(bytes));
+      await expect(restoredDelivery.deleteObject!(deliveryKey)).resolves.toBe('deleted');
+      await expect(restoredDelivery.headObject(deliveryKey)).resolves.toBeNull();
+    } finally {
+      await productionApp?.close().catch(() => undefined);
+      if (!productionApp) await productionPool.end().catch(() => undefined);
+      process.env.NODE_ENV = previousNodeEnv;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('拒绝相对或不存在的存储根，不把路径直接拼接到对象键', async () => {
+    await expect(FilesystemUploadStorage.create('relative-storage-root')).rejects.toThrow('绝对路径');
+    const root = join(tmpdir(), `qimao-missing-${randomUUID()}`);
+    await expect(FilesystemUploadStorage.create(root)).rejects.toThrow();
   });
 });

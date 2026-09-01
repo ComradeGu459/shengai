@@ -1,31 +1,89 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { createRequire } from 'node:module';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { createApp } from '../../backend/src/app.js';
-import { createPool } from '../../backend/src/database/pool.js';
+import { getDatabaseUrl } from '../../backend/src/config.js';
 import { PreReviewWorkerRepository } from '../../backend/src/modules/pre-review/pre-review.worker.repository.js';
 import { parseSrt } from '../../backend/src/modules/terms/srt-parser.js';
 import { InMemoryStorageFake } from '../../backend/src/modules/uploads/in-memory-storage.fake.js';
 import { PreReviewWorker } from '../../backend/src/workers/pre-review.worker.js';
 import { runPreReviewWorker } from '../../backend/src/workers/pre-review.worker.entry.js';
 
-const pool = createPool();
-const storage = new InMemoryStorageFake();
-const app = createApp({ database: pool, uploadStorage: storage });
-const worker = new PreReviewWorker(new PreReviewWorkerRepository(pool), {
+const requireBackend = createRequire(new URL('../../backend/package.json', import.meta.url));
+const pg = requireBackend('pg') as { Pool: new (options: Record<string, unknown>) => any };
+const { runner } = requireBackend('node-pg-migrate') as { runner: (options: Record<string, unknown>) => Promise<unknown> };
+const backendRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../backend');
+let databaseName: string; let admin: any; let pool: any; let app: any; let worker: PreReviewWorker; let storage: InMemoryStorageFake;
+const makeWorker = () => new PreReviewWorker(new PreReviewWorkerRepository(pool), {
   workerId: 'anonymous-pre-edit-worker',
   leaseMs: 30_000,
 });
 
-beforeAll(async () => app.ready());
+const testStrategyVersionId = '11111111-1111-4111-8111-111111111111';
+const testStrategyDigest = 'b'.repeat(64);
+const testRulePack = {
+  payloadType: 'pre_review_local_rule_pack_v1',
+  alignmentNearbyGapMs: 350,
+  alignmentSimilarityThreshold: 0.75,
+  maxCharacters: 28,
+  forbidSentencePunctuation: true,
+  forbidMarkup: true,
+  forbidBrackets: true,
+  requireSpeakerDashForMultipleLines: true,
+};
+beforeAll(async () => {
+  const source = new URL(getDatabaseUrl()); const adminUrl = new URL(source); adminUrl.pathname = '/postgres';
+  databaseName = `qimao_prereview_${process.pid}_${randomUUID().replaceAll('-', '').slice(0, 10)}`;
+  admin = new pg.Pool({ connectionString: adminUrl.toString(), max: 1 }); await admin.query(`CREATE DATABASE "${databaseName}"`);
+  const databaseUrl = new URL(source); databaseUrl.pathname = `/${databaseName}`;
+  await runner({ databaseUrl: databaseUrl.toString(), dir: `${backendRoot}/migrations`, direction: 'up', migrationsTable: 'schema_migrations', checkOrder: true, singleTransaction: true });
+  pool = new pg.Pool({ connectionString: databaseUrl.toString(), max: 4 }); storage = new InMemoryStorageFake();
+  const appDatabase = {
+    query: (...args: any[]) => pool.query(...args),
+    connect: (...args: any[]) => pool.connect(...args),
+    end: async () => undefined,
+  };
+  app = createApp({ database: appDatabase, uploadStorage: storage }); worker = makeWorker();
+  await app.ready();
+  await pool.query(
+    `INSERT INTO strategy_artifacts(id,artifact_kind,display_name,purpose,applicable_modules,status,created_by,origin,protected,runtime_module)
+     VALUES($1,'local_rule_pack','pre-review-test','pre-review-test',ARRAY['pre_review'],'draft','pre-review-test','custom_draft',false,'pre_review')
+     ON CONFLICT (id) DO NOTHING`,
+    ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
+  );
+  await pool.query(
+    `INSERT INTO strategy_artifact_versions(id,artifact_id,version,schema_version,payload,content_digest,created_by,source,runtime_status)
+     VALUES($1,$2,1,1,$3,$4,'pre-review-test','manual','active') ON CONFLICT (id) DO NOTHING`,
+    [testStrategyVersionId, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', testRulePack, testStrategyDigest],
+  );
+  await pool.query(
+    `INSERT INTO strategy_runtime_active_pointers(module,strategy_version_id)
+     VALUES('pre_review',$1)
+     ON CONFLICT (module) DO UPDATE SET strategy_version_id=EXCLUDED.strategy_version_id,updated_at=CURRENT_TIMESTAMP`,
+    [testStrategyVersionId],
+  );
+});
 beforeEach(async () => {
   await pool.query('TRUNCATE project_commands, projects CASCADE');
 });
 afterAll(async () => {
-  await pool.query('TRUNCATE project_commands, projects CASCADE');
-  await app.close();
-});
+  if (app) await app.close();
+  if (pool) {
+    await pool.end();
+    pool = null;
+  }
+  if (admin && databaseName) {
+    await admin.query('SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()', [databaseName]);
+    await admin.query(`DROP DATABASE IF EXISTS "${databaseName}"`);
+    const remaining = await admin.query('SELECT 1 FROM pg_database WHERE datname=$1', [databaseName]);
+    expect(remaining.rowCount).toBe(0);
+  }
+  if (admin) await admin.end();
+}, 30_000);
 
 const sha256 = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
 const encode = (value: string) => new TextEncoder().encode(value);
@@ -91,6 +149,8 @@ const seedProject = async (options: { videoDurationMs?: number } = {}) => {
   const termVersionId = randomUUID();
   const termCandidateId = randomUUID();
   const batchId = randomUUID();
+  const screenTextBatchId = randomUUID();
+  const screenTextReleaseId = randomUUID();
   const jobId = randomUUID();
   const attemptId = randomUUID();
   const resultId = randomUUID();
@@ -191,6 +251,24 @@ const seedProject = async (options: { videoDurationMs?: number } = {}) => {
       [cue.id, projectId, sourceSrtSetDigest, companyAssetId, cue.cueIndex, cue.startMs, cue.endMs, cue.text],
     );
   }
+  await pool.query(
+    `INSERT INTO screen_text_batches (
+       id, project_id, scope_kind, episode_numbers, term_version_id, manifest_id, manifest_version,
+       execution_kind, provider, adapter, model, language, deployment, input_version, output_version,
+       capabilities, config_digest, frame_strategy_version, dedupe_strategy_version,
+       term_projection, term_projection_entries, request_id, status
+     ) VALUES ($1, $2, 'single', ARRAY[1], $3, $4, 1,
+       'local', 'test', 'screen_text_test', 'screen-text-test-v1', 'zh-CN', 'test', 'input-v1', 'output-v1',
+       '{}', $5, 'frames-v1', 'dedupe-v1', '{}', '[]', $6, 'completed')`,
+    [screenTextBatchId, projectId, termVersionId, manifestId, 'c'.repeat(64), randomUUID()],
+  );
+  await pool.query(
+    `INSERT INTO screen_text_releases (
+       id, project_id, version, batch_id, term_version_id, manifest_id, draft_revision,
+       release_digest, cue_count, partial, excluded_episodes
+     ) VALUES ($1, $2, 1, $3, $4, $5, 1, $6, 0, false, '[]'::jsonb)`,
+    [screenTextReleaseId, projectId, screenTextBatchId, termVersionId, manifestId, 'd'.repeat(64)],
+  );
   const digestA = 'a'.repeat(64);
   const digestB = 'b'.repeat(64);
   await pool.query(
@@ -249,6 +327,7 @@ const seedProject = async (options: { videoDurationMs?: number } = {}) => {
     companyAssetId,
     videoAssetId,
     termVersionId,
+    screenTextReleaseId,
     sourceSrtSetDigest,
     videoBytes,
   };
@@ -323,8 +402,9 @@ describe('BACK-M3-03A 前置审改权威后端', () => {
       sourceSrtSetDigest: prepared.sourceSrtSetDigest,
       termVersionId: prepared.termVersionId,
       manifestId: prepared.manifestId,
-      algorithmVersion: 'pre-edit-align-v1',
-      formatPolicyVersion: 'pre-edit-format-v1',
+      screenTextRelease: { id: prepared.screenTextReleaseId, version: 1, partial: false, excludedEpisodes: [] },
+      algorithmVersion: `strategy-runtime:${testStrategyVersionId}`,
+      formatPolicyVersion: testStrategyDigest,
       episodes: [{
         asr: { provider: 'fake', adapter: 'deterministic_fake' },
         videoAssetId: prepared.videoAssetId,
@@ -332,6 +412,30 @@ describe('BACK-M3-03A 前置审改权威后端', () => {
         videoDurationStatus: 'known',
       }],
     });
+    const frozenSource = await pool.query<{
+      screen_text_release_id: string;
+      asr_result_id: string;
+      asr_result_digest: string;
+    }>(
+      `SELECT session.screen_text_release_id, episode.asr_result_id, episode.asr_result_digest
+         FROM pre_edit_sessions session
+         JOIN pre_edit_episodes episode ON episode.session_id = session.id
+        WHERE session.id = $1 AND episode.episode_number = 1`,
+      [prepared.sessionId],
+    );
+    expect(frozenSource.rows[0]).toMatchObject({
+      screen_text_release_id: prepared.screenTextReleaseId,
+      asr_result_id: prepared.detail.episodes[0].asr.resultId,
+    });
+    await expect(pool.query(
+      `UPDATE pre_edit_episodes SET asr_result_digest = $2
+        WHERE session_id = $1 AND episode_number = 1`,
+      [prepared.sessionId, 'f'.repeat(64)],
+    )).rejects.toThrow(/source identity is immutable/);
+    expect((await pool.query(
+      'SELECT asr_result_digest FROM pre_edit_episodes WHERE session_id = $1 AND episode_number = 1',
+      [prepared.sessionId],
+    )).rows[0].asr_result_digest).toBe(frozenSource.rows[0]!.asr_result_digest);
     expect(items.find((item) => item.currentText === '仅公司甲')?.termEvidence).toEqual([
       expect.objectContaining({ name: '仅公司甲', companyMatched: true, asrMatched: false, conflict: true }),
     ]);
@@ -352,6 +456,22 @@ describe('BACK-M3-03A 前置审改权威后端', () => {
     expect(second.statusCode, second.body).toBe(200);
     expect(first.rawPayload).toEqual(Buffer.from(prepared.videoBytes));
     expect(second.rawPayload).toEqual(first.rawPayload);
+  });
+
+  it('没有已发布画面字 Release 时明确阻断新前置审改会话', async () => {
+    const seeded = await seedProject();
+    await pool.query('DELETE FROM screen_text_releases WHERE id = $1', [seeded.screenTextReleaseId]);
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${seeded.projectId}/pre-review/sessions`,
+      headers: { 'idempotency-key': randomUUID() },
+      payload: { termVersionId: seeded.termVersionId, expectedProjectVersion: 1 },
+    });
+    expect(response.statusCode, response.body).toBe(422);
+    expect(response.json().error).toMatchObject({
+      code: 'PRE_EDIT_SOURCE_NOT_READY',
+      action: 'publish_screen_text_release',
+    });
   });
 
   it('独立轮询 Worker 可停止并推进正式 queued，会话缺少部分 ASR 时进入 limited', async () => {

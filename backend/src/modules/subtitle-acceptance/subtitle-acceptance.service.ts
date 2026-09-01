@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import type {
-  ApplyAcceptanceCueCommandBody, CreateAcceptanceIssueBody, CreateAcceptanceReleaseBody,
+  ApplyAcceptanceCueCommandBody, CreateAcceptanceIssueBody,
   CreateAcceptanceReworkBody, CreateAcceptanceSessionBody, CreateAcceptancePlaybackGrantBody,
   PassAcceptanceEpisodeBody, PassAcceptanceEpisodesBody, ResolveAcceptanceIssueBody,
   SelectAcceptanceVideoBody, UndoAcceptanceEditBody,
@@ -65,21 +65,30 @@ export class SubtitleAcceptanceService {
 
   async preflight(projectId: string, sessionId: string) {
     const session = await this.refresh(projectId, sessionId); const episodes = await Promise.all(session.episodes.map((episode) => this.getEpisode(projectId, sessionId, episode.episodeNumber)));
-    const states = episodes.map(({ episode, issues }) => ({ episodeNumber: episode.episodeNumber, eligible: !issues.some((issue) => issue.status === 'open' && (issue.severity === 'error' || issue.origin === 'manual')), errorCodes: issues.filter((issue) => issue.status === 'open' && issue.severity === 'error').map((issue) => issue.code), warningCodes: issues.filter((issue) => issue.status === 'open' && issue.severity === 'warning').map((issue) => issue.code) }));
+    const states = episodes.map(({ episode, issues }) => ({ episodeNumber: episode.episodeNumber, eligible: !issues.some((issue) => issue.status === 'open'), errorCodes: issues.filter((issue) => issue.status === 'open' && issue.severity === 'error').map((issue) => issue.code), warningCodes: issues.filter((issue) => issue.status === 'open' && issue.severity === 'warning').map((issue) => issue.code) }));
     return { sessionId, sessionRevision: session.revision, stale: session.status === 'stale', canRelease: session.status !== 'stale' && states.length > 0 && states.every((state) => state.eligible), eligibleEpisodeNumbers: states.filter((state) => state.eligible).map((state) => state.episodeNumber), episodes: states };
   }
 
   async passOne(projectId: string, sessionId: string, episodeNumber: number, body: PassAcceptanceEpisodeBody, key: string) { await this.requireFresh(projectId, sessionId); const result = await this.writes.passEpisodes({ projectId, sessionId, body: { expectedSessionRevision: body.expectedSessionRevision }, episodeNumbers: [episodeNumber], expectedEpisodeRevision: body.expectedEpisodeRevision, key }); const session = await this.session(projectId, sessionId); return { session, passedEpisodeNumbers: result.passed, blockedEpisodeNumbers: result.blocked, replay: result.replay }; }
   async passEligible(projectId: string, sessionId: string, body: PassAcceptanceEpisodesBody, key: string) { await this.requireFresh(projectId, sessionId); const result = await this.writes.passEpisodes({ projectId, sessionId, body, ...(body.episodeNumbers ? { episodeNumbers: body.episodeNumbers } : {}), key }); const session = await this.session(projectId, sessionId); return { session, passedEpisodeNumbers: result.passed, blockedEpisodeNumbers: result.blocked, replay: result.replay }; }
-  async createRework(projectId: string, sessionId: string, body: CreateAcceptanceReworkBody, key: string) { await this.requireFresh(projectId, sessionId); const result = await this.writes.createRework({ projectId, sessionId, body, key }); const items = await this.reads.listRework(projectId, sessionId); return { rework: items.items.find((item: any) => item.id === result.resourceId)!, replay: result.replay }; }
-  async createRelease(projectId: string, sessionId: string, body: CreateAcceptanceReleaseBody, key: string) { await this.requireFresh(projectId, sessionId); const result = await this.writes.createRelease({ projectId, sessionId, expectedSessionRevision: body.expectedSessionRevision, key }); const releases = await this.reads.listReleases(projectId); return { release: releases.items.find((item: any) => item.id === result.resourceId)!, replay: result.replay }; }
+  async createRework(projectId: string, sessionId: string, body: CreateAcceptanceReworkBody, key: string) {
+    if (body.reason.trim().length < 8) throw acceptanceInvalid('ACCEPTANCE_REWORK_REASON_INVALID', '返工理由去除首尾空白后至少需要 8 个字。');
+    await this.requireFresh(projectId, sessionId); const result = await this.writes.createRework({ projectId, sessionId, body, key }); const items = await this.reads.listRework(projectId, sessionId); return { rework: items.items.find((item: any) => item.id === result.resourceId)!, replay: result.replay };
+  }
   async listReleases(projectId: string) { return this.reads.listReleases(projectId); }
 
   async createPlaybackGrant(projectId: string, sessionId: string, episodeNumber: number, body: CreateAcceptancePlaybackGrantBody) {
-    await this.requireFresh(projectId, sessionId); const episode = await this.getEpisode(projectId, sessionId, episodeNumber); if (!episode.episode.selectedVideoAssetId) throw acceptanceInvalid('ACCEPTANCE_PLAYBACK_NOT_AVAILABLE', '本集没有可播放视频。');
-    if ((await this.session(projectId, sessionId)).revision !== body.expectedSessionRevision) throw acceptanceConflict('ACCEPTANCE_SESSION_VERSION_CONFLICT', '验收会话已变化。');
-    const asset = await this.pool.query('SELECT object_key FROM assets WHERE id = $1 AND project_id = $2', [episode.episode.selectedVideoAssetId, projectId]); if (!asset.rows[0]) throw acceptanceInvalid('ACCEPTANCE_PLAYBACK_NOT_AVAILABLE', '来源视频不再可用。');
-    const token = randomUUID() + randomUUID(); const expiresAt = new Date(Date.now() + 15 * 60_000); await this.pool.query('INSERT INTO acceptance_playback_grants(token_digest,session_id,episode_id,asset_id,object_key,expires_at) VALUES($1,$2,$3,$4,$5,$6)', [sha256(token), sessionId, episode.episode.id, episode.episode.selectedVideoAssetId, asset.rows[0].object_key, expiresAt]); return { assetId: episode.episode.selectedVideoAssetId, episodeNumber, url: `/api/subtitle-acceptance/playback/${token}`, expiresAt: expiresAt.toISOString() };
+    const project = await this.pool.query('SELECT lifecycle_status FROM projects WHERE id = $1', [projectId]);
+    if (!project.rows[0] || project.rows[0].lifecycle_status !== 'active') throw acceptanceConflict('ACCEPTANCE_PROJECT_NOT_ACTIVE', '项目不在可查看验收证据的状态。', 'return_to_projects');
+    const session = await this.refresh(projectId, sessionId);
+    if (session.revision !== body.expectedSessionRevision) throw acceptanceConflict('ACCEPTANCE_SESSION_VERSION_CONFLICT', '验收会话已变化。');
+    const episode = await this.reads.getEpisode(projectId, sessionId, episodeNumber); if (!episode) throw acceptanceNotFound('ACCEPTANCE_EPISODE_NOT_FOUND', '验收集不存在。');
+    const selectedAssetId = episode.episode.selectedVideoAssetId;
+    if (!selectedAssetId || !episode.episode.availableVideos.some((video) => video.assetId === selectedAssetId)) throw acceptanceInvalid('ACCEPTANCE_PLAYBACK_NOT_AVAILABLE', '本集冻结的视频选择不再可用。');
+    const asset = await this.pool.query(`SELECT asset.object_key FROM assets asset JOIN projects project ON project.id = asset.project_id
+      WHERE asset.id = $1 AND asset.project_id = $2 AND project.lifecycle_status = 'active'`, [selectedAssetId, projectId]);
+    if (!asset.rows[0] || !(await this.storage.headObject(asset.rows[0].object_key))) throw acceptanceInvalid('ACCEPTANCE_PLAYBACK_NOT_AVAILABLE', '来源视频不再可用。');
+    const token = randomUUID() + randomUUID(); const expiresAt = new Date(Date.now() + 15 * 60_000); await this.pool.query('INSERT INTO acceptance_playback_grants(token_digest,session_id,episode_id,asset_id,object_key,expires_at) VALUES($1,$2,$3,$4,$5,$6)', [sha256(token), sessionId, episode.episode.id, selectedAssetId, asset.rows[0].object_key, expiresAt]); return { assetId: selectedAssetId, episodeNumber, url: `/api/subtitle-acceptance/playback/${token}`, expiresAt: expiresAt.toISOString() };
   }
   async playback(token: string) { const grant = await this.pool.query('SELECT object_key FROM acceptance_playback_grants WHERE token_digest = $1 AND expires_at > CURRENT_TIMESTAMP', [sha256(token)]); if (!grant.rows[0]) throw acceptanceNotFound('ACCEPTANCE_PLAYBACK_GRANT_INVALID', '播放授权不存在或已过期。'); const bytes = await this.storage.readObject(grant.rows[0].object_key); if (!bytes) throw acceptanceNotFound('ACCEPTANCE_PLAYBACK_NOT_AVAILABLE', '播放对象不存在。'); return bytes; }
 }

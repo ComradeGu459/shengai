@@ -20,6 +20,7 @@ import type {
 } from '@qimao-terms-cloud/contracts';
 
 import { RetryIcon, SearchIcon } from '../../components/Icons.js';
+import { createUuid } from '../../platform/randomUuid.js';
 import {
   checkAsrEligibility,
   createAsrDispatchGroup,
@@ -369,8 +370,8 @@ export const AsrProjectDispatch = ({ projectVersions, onRecycle }: Props) => {
     const intent = current && current.body.projectIds.join(',') === ids.join(',')
       ? current
       : {
-          body: { dispatchGroupId: crypto.randomUUID(), projectIds: ids, allowPartial: true },
-          idempotencyKey: crypto.randomUUID(),
+          body: { dispatchGroupId: createUuid(), projectIds: ids, allowPartial: true },
+          idempotencyKey: createUuid(),
         };
     createIntent.current = intent;
     const handle = { dispatchGroupId: intent.body.dispatchGroupId };
@@ -467,7 +468,7 @@ export const AsrProjectDispatch = ({ projectVersions, onRecycle }: Props) => {
           {pending && <div className={styles.pendingState} role="status">{recoveryMutation.isPending ? '正在重新读取同一派发；创建请求仍为 1 次。' : '正在创建派发；创建请求已发送 1 次。'}</div>}
           {stableError && <ErrorBlock title="派发创建失败" error={stableError} />}
           {unknownResult && <div className={styles.errorBlock} role="alert"><strong>{recoveryError?.status === 404 ? '派发尚未确认' : '创建结果未知'}</strong><span>{recoveryError?.message ?? '网络中断后无法确认创建结果。'}</span>{recoveryError?.requestId && <span>本次读取请求标识 {recoveryError.requestId}</span>}<span>创建请求仍为 1 次，只能重新读取同一派发。</span><button type="button" onClick={recoverUnknown} disabled={pending}><RetryIcon />重新读取派发</button></div>}
-          {result && <div className={styles.resultBlock} role="status" tabIndex={-1} ref={resultRef}><strong>{result.acceptanceStatus === 'partial' ? '派发已部分接受' : '派发已创建'}</strong><span>已选 {result.counts.selectedProjects} / 接受 {result.counts.acceptedProjects} / 阻断 {result.counts.blockedProjects}</span><span>创建请求标识 {result.requestId}</span><Link to="/asr-dispatches">查看中文识别任务</Link></div>}
+          {result && <div className={styles.resultBlock} role="status" tabIndex={-1} ref={resultRef}><strong>{result.acceptanceStatus === 'partial' ? '派发已部分接受' : '派发已创建'}</strong><span>已选 {result.counts.selectedProjects} / 接受 {result.counts.acceptedProjects} / 阻断 {result.counts.blockedProjects}</span><span>创建请求标识 {result.requestId}</span><Link to={`/tasks?taskType=asr_dispatch&resourceId=${result.id}`}>查看任务中心</Link></div>}
           <footer>{!result && !unknownResult && !createRecoveryHandle && <button type="button" className={styles.primaryButton} disabled={pending || !eligibility.data || eligibleCount === 0} onClick={submit}>{stableError ? '再次提交同一意图' : blockedCount > 0 ? `只为 ${eligibleCount} 部可执行项目创建` : `为 ${eligibleCount} 部项目创建`}</button>}</footer>
         </aside>
       </div>}

@@ -6,288 +6,179 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RecycleBin } from '../../frontend/src/features/recycle/RecycleBin.js';
 
 const recycledProject = {
-  id: 'de65378e-8935-4c4a-9e8b-13efca3d314a',
-  name: '可恢复项目',
-  workflowStatus: 'ready',
-  lifecycleStatus: 'recycled',
-  recycledAt: '2026-08-13T02:00:00.000Z',
-  recycleExpiresAt: '2099-08-15T02:00:00.000Z',
-  version: 6,
-  updatedAt: '2026-08-13T02:00:00.000Z',
-  cleanupJob: {
-    id: 'aa65378e-8935-4c4a-9e8b-13efca3d314a',
-    status: 'scheduled',
-    attemptCount: 0,
-    leaseExpiresAt: null,
-    nextAttemptAt: null,
-    lastError: null,
-    completedAt: null,
-  },
+  id: 'de65378e-8935-4c4a-9e8b-13efca3d314a', name: '可恢复项目', workflowStatus: 'ready', lifecycleStatus: 'recycled', recycledAt: '2026-08-13T02:00:00.000Z', recycleExpiresAt: '2099-08-15T02:00:00.000Z', version: 6, updatedAt: '2026-08-13T02:00:00.000Z',
+  cleanupJob: { id: 'aa65378e-8935-4c4a-9e8b-13efca3d314a', status: 'scheduled', attemptCount: 0, leaseExpiresAt: null, nextAttemptAt: null, lastError: null, completedAt: null },
 } as const;
 
+const purging = (project = recycledProject) => ({ ...project, lifecycleStatus: 'purging' as const, version: project.version + 1, cleanupJob: { ...project.cleanupJob, status: 'leased' as const, attemptCount: 1 } });
+const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
 const renderRecycleBin = () => {
-  const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  });
-  const result = render(
-    <QueryClientProvider client={queryClient}>
-      <RecycleBin />
-    </QueryClientProvider>,
-  );
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+  const result = render(<QueryClientProvider client={queryClient}><RecycleBin /></QueryClientProvider>);
   return { ...result, queryClient };
 };
 
-afterEach(() => {
-  cleanup();
-  vi.restoreAllMocks();
+const mockApi = (state: { items: Array<typeof recycledProject | ReturnType<typeof purging>>; purge?: (url: string, init?: RequestInit) => Promise<Response> | Response }) => vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
+  const url = String(input);
+  if (url.startsWith('/api/recycle-bin')) return Promise.resolve(json({ total: state.items.length, items: state.items }));
+  if (init?.method === 'POST' && url.endsWith('/restore')) return Promise.resolve(json({ project: {} }));
+  if (init?.method === 'POST' && url.endsWith('/purge')) return Promise.resolve(state.purge?.(url, init) ?? json({ project: {} }, 201));
+  if (url.includes('/purge/commands/')) return Promise.resolve(json({ project: {} }));
+  return Promise.resolve(json({ error: { message: 'unexpected request' } }, 500));
 });
 
-describe('项目回收站', () => {
-  it('显示后端生命周期、清理失败事实和请求标识', async () => {
-    const purgingProject = {
-      ...recycledProject,
-      id: 'de65378e-8935-4c4a-9e8b-13efca3d3140',
-      name: '正在清理项目',
-      lifecycleStatus: 'purging',
-      version: 7,
-      cleanupJob: {
-        ...recycledProject.cleanupJob,
-        id: 'aa65378e-8935-4c4a-9e8b-13efca3d3140',
-        status: 'leased',
-        attemptCount: 1,
-      },
-    } as const;
-    const retryableProject = {
-      ...recycledProject,
-      id: 'de65378e-8935-4c4a-9e8b-13efca3d314b',
-      name: '等待重试项目',
-      lifecycleStatus: 'purging',
-      version: 8,
-      cleanupJob: {
-        ...recycledProject.cleanupJob,
-        id: 'aa65378e-8935-4c4a-9e8b-13efca3d314b',
-        status: 'retryable',
-        attemptCount: 2,
-        nextAttemptAt: '2026-08-13T05:00:00.000Z',
-        lastError: '临时对象存储故障',
-      },
-    } as const;
-    const failedProject = {
-      ...retryableProject,
-      id: 'de65378e-8935-4c4a-9e8b-13efca3d314c',
-      name: '最终失败项目',
-      cleanupJob: {
-        ...retryableProject.cleanupJob,
-        id: 'aa65378e-8935-4c4a-9e8b-13efca3d314c',
-        status: 'failed',
-        attemptCount: 5,
-        nextAttemptAt: null,
-        lastError: '达到后台重试上限',
-      },
-    } as const;
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
-      total: 4,
-      items: [recycledProject, purgingProject, retryableProject, failedProject],
-    }), { status: 200 }));
+afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
+describe('项目回收站永久删除与清空', () => {
+  it('仅 recycled 行有永久删除，空回收站禁用清空入口', async () => {
+    const purgingProject = purging();
+    mockApi({ items: [purgingProject] });
     renderRecycleBin();
+    await screen.findByText('清理中');
+    expect(screen.queryByRole('button', { name: '永久删除' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '恢复项目' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '清空回收站' })).toBeDisabled();
+    expect(screen.getByText('没有可清理的已回收项目。')).toBeInTheDocument();
+  });
 
-    expect(await screen.findByText('可恢复项目')).toBeInTheDocument();
-    expect(screen.getAllByText('已回收')).toHaveLength(2);
+  it('单项确认要求完整项目名和勾选，取消及 Escape 回到触发点', async () => {
+    mockApi({ items: [recycledProject] });
+    renderRecycleBin();
+    const trigger = await screen.findByRole('button', { name: '永久删除' });
+    fireEvent.click(trigger);
+    const dialog = await screen.findByRole('dialog', { name: '永久删除「可恢复项目」？' });
+    const returnButton = screen.getByRole('button', { name: '返回回收站' });
+    await waitFor(() => expect(document.activeElement).toBe(returnButton));
+    const deleteButton = screen.getAllByRole('button', { name: '永久删除' }).at(-1)!;
+    expect(deleteButton).toBeDisabled();
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '可恢复项目' } });
+    expect(deleteButton).toBeDisabled();
+    fireEvent.click(screen.getByLabelText('我已了解进入清理后无法恢复'));
+    expect(deleteButton).toBeEnabled();
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it('单项 pending 锁定全部关闭入口，服务端接受后只显示进入清理', async () => {
+    let resolvePost: ((response: Response) => void) | undefined;
+    const state = { items: [recycledProject] as Array<typeof recycledProject | ReturnType<typeof purging>>, purge: () => new Promise<Response>((resolve) => { resolvePost = resolve; }) };
+    mockApi(state);
+    renderRecycleBin();
+    fireEvent.click(await screen.findByRole('button', { name: '永久删除' }));
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '可恢复项目' } });
+    fireEvent.click(screen.getByLabelText('我已了解进入清理后无法恢复'));
+    fireEvent.click(screen.getAllByRole('button', { name: '永久删除' }).at(-1)!);
+    expect(await screen.findByText('正在提交永久删除……')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '返回回收站' })).toBeDisabled();
+    expect(screen.getByLabelText('我已了解进入清理后无法恢复')).toBeDisabled();
+    state.items = [purging()];
+    await act(async () => { resolvePost?.(json({ project: {} }, 201)); });
+    expect(await screen.findByText('项目“可恢复项目”已进入清理流程，现已不可恢复。')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '永久删除' })).not.toBeInTheDocument();
     expect(screen.getAllByText('清理中')).toHaveLength(2);
-    expect(screen.getAllByText('等待后台重试')).toHaveLength(2);
-    expect(screen.getByText('原因：临时对象存储故障')).toBeInTheDocument();
-    expect(screen.getByText('请求标识 aa65378e-8935-4c4a-9e8b-13efca3d314b')).toBeInTheDocument();
-    expect(screen.getAllByText('清理最终失败')).toHaveLength(2);
-    expect(screen.getByText('原因：达到后台重试上限')).toBeInTheDocument();
-    expect(screen.getAllByText('不可恢复')).toHaveLength(3);
   });
 
-  it('加载时保留筛选与表头骨架', () => {
-    vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise<Response>(() => undefined));
+  it('单项 unknown 只用原 Idempotency-Key GET 查询，绝不二次 POST', async () => {
+    const fetchMock = mockApi({ items: [recycledProject], purge: () => Promise.reject(new TypeError('连接中断')) });
     renderRecycleBin();
-
-    expect(screen.getByLabelText('生命周期')).toBeInTheDocument();
-    expect(screen.getByRole('columnheader', { name: '项目' })).toBeInTheDocument();
-    expect(screen.getAllByLabelText('正在加载回收站项目')).toHaveLength(3);
-    expect(screen.queryByText('回收站为空')).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByRole('button', { name: '永久删除' }));
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '可恢复项目' } });
+    fireEvent.click(screen.getByLabelText('我已了解进入清理后无法恢复'));
+    fireEvent.click(screen.getAllByRole('button', { name: '永久删除' }).at(-1)!);
+    expect(await screen.findByText('永久删除结果未知')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '查询本次命令' }));
+    expect(await screen.findByText(/已进入清理流程/)).toBeInTheDocument();
+    const posts = fetchMock.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === 'POST');
+    const commandGets = fetchMock.mock.calls.filter(([url]) => String(url).includes('/purge/commands/'));
+    expect(posts).toHaveLength(1);
+    expect(commandGets).toHaveLength(1);
+    const postKey = (posts[0]?.[1] as RequestInit).headers as Record<string, string>;
+    expect(String(commandGets[0]?.[0])).toContain(encodeURIComponent(postKey['idempotency-key']));
   });
 
-  it('把搜索、三类排序和两类状态筛选提交给服务端', async () => {
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify({ total: 0, items: [] }), { status: 200 }),
-    );
+  it('清空忽略当前筛选并全量逐项提交，显示 X/N、S/F', async () => {
+    const second = { ...recycledProject, id: 'de65378e-8935-4c4a-9e8b-13efca3d314b', name: '第二项目', version: 9, cleanupJob: { ...recycledProject.cleanupJob, id: 'aa65378e-8935-4c4a-9e8b-13efca3d314b' } } as const;
+    const fetchMock = mockApi({ items: [recycledProject, second] });
     renderRecycleBin();
-    await screen.findByText('回收站为空');
-
-    const firstUrl = String(fetchMock.mock.calls[0]?.[0]);
-    expect(firstUrl).toContain('sortBy=recycleExpiresAt');
-    expect(firstUrl).toContain('sortDirection=asc');
-
-    fireEvent.change(screen.getByPlaceholderText('搜索项目名称'), { target: { value: '匿名项目' } });
+    await screen.findByText('第二项目');
     fireEvent.change(screen.getByLabelText('生命周期'), { target: { value: 'purging' } });
-    fireEvent.change(screen.getByLabelText('后台处理'), { target: { value: 'retryable' } });
-    fireEvent.change(screen.getByLabelText('排序'), { target: { value: 'recycledAt' } });
-    fireEvent.change(screen.getByLabelText('方向'), { target: { value: 'desc' } });
-
-    await waitFor(() => {
-      const url = String(fetchMock.mock.calls.at(-1)?.[0]);
-      expect(url).toContain('search=%E5%8C%BF%E5%90%8D%E9%A1%B9%E7%9B%AE');
-      expect(url).toContain('lifecycleStatus=purging');
-      expect(url).toContain('cleanupJobStatus=retryable');
-      expect(url).toContain('sortBy=recycledAt');
-      expect(url).toContain('sortDirection=desc');
-    });
+    fireEvent.click(screen.getByRole('button', { name: '清空回收站' }));
+    expect(await screen.findByRole('dialog', { name: '清空回收站？' })).toHaveTextContent('将处理服务端全量快照中的 2 个已回收项目');
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '清空回收站' } });
+    fireEvent.click(screen.getByLabelText('我已核对项目数量并了解成功项目无法恢复'));
+    fireEvent.click(screen.getByRole('button', { name: '开始清空' }));
+    expect(await screen.findByText('已处理 2 / 总数 2，成功 2，失败 0')).toBeInTheDocument();
+    expect(screen.getAllByText('已进入清理')).toHaveLength(2);
+    expect(fetchMock.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === 'POST')).toHaveLength(2);
+    expect(screen.getByRole('button', { name: '清空回收站' })).toBeEnabled();
+    expect(screen.getAllByRole('button', { name: '恢复项目' })).toHaveLength(2);
+    expect(screen.getAllByRole('button', { name: '恢复项目' }).every((button) => !button.hasAttribute('disabled'))).toBe(true);
   });
 
-  it('恢复失败保留项目并展示后端请求标识', async () => {
-    vi.spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(new Response(JSON.stringify({ total: 1, items: [recycledProject] }), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({
-        error: {
-          code: 'PROJECT_VERSION_CONFLICT',
-          message: '项目版本已变化。',
-          retryable: false,
-          action: 'reload_project',
-          requestId: 'request-version-conflict',
-        },
-      }), { status: 409 }));
+  it('清空确认前集合变化会清除旧确认且不发送 POST', async () => {
+    const second = { ...recycledProject, id: 'de65378e-8935-4c4a-9e8b-13efca3d314b', name: '第二项目', version: 9, cleanupJob: { ...recycledProject.cleanupJob, id: 'aa65378e-8935-4c4a-9e8b-13efca3d314b' } } as const;
+    const state = { items: [recycledProject, second] as Array<typeof recycledProject | typeof second> };
+    const fetchMock = mockApi(state);
+    renderRecycleBin();
+    await screen.findByText('第二项目');
+    fireEvent.click(screen.getByRole('button', { name: '清空回收站' }));
+    await screen.findByRole('dialog', { name: '清空回收站？' });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '清空回收站' } });
+    fireEvent.click(screen.getByLabelText('我已核对项目数量并了解成功项目无法恢复'));
+    state.items = [recycledProject];
+    fireEvent.click(screen.getByRole('button', { name: '开始清空' }));
+    expect(await screen.findByText('回收站中的可清理项目已变化。已清除原确认，请重新核对数量并再次确认。')).toBeInTheDocument();
+    expect(screen.getByRole('textbox')).toHaveValue('');
+    expect(screen.getByLabelText('我已核对项目数量并了解成功项目无法恢复')).not.toBeChecked();
+    expect(fetchMock.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === 'POST')).toHaveLength(0);
+  });
 
+  it('批量部分失败保留失败理由，继续项重新进入高风险确认', async () => {
+    const second = { ...recycledProject, id: 'de65378e-8935-4c4a-9e8b-13efca3d314b', name: '第二项目', version: 9, cleanupJob: { ...recycledProject.cleanupJob, id: 'aa65378e-8935-4c4a-9e8b-13efca3d314b' } } as const;
+    let postCount = 0;
+    mockApi({ items: [recycledProject, second], purge: () => { postCount += 1; return postCount === 1 ? json({ project: {} }, 201) : json({ error: { message: '版本已变化', requestId: 'purge-failed' } }, 409); } });
+    renderRecycleBin();
+    await screen.findByText('第二项目');
+    fireEvent.click(screen.getByRole('button', { name: '清空回收站' }));
+    await screen.findByRole('dialog', { name: '清空回收站？' });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '清空回收站' } }); fireEvent.click(screen.getByLabelText('我已核对项目数量并了解成功项目无法恢复')); fireEvent.click(screen.getByRole('button', { name: '开始清空' }));
+    expect(await screen.findByText('已处理 2 / 总数 2，成功 1，失败 1')).toBeInTheDocument();
+    expect(screen.getByText(/版本已变化；请求标识 purge-failed/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '清空回收站' })).toBeEnabled();
+    expect(screen.getAllByRole('button', { name: '恢复项目' }).every((button) => !button.hasAttribute('disabled'))).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: '继续处理未完成项' }));
+    expect(await screen.findByRole('dialog', { name: '清空回收站？' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '开始清空' })).toBeDisabled();
+  });
+
+  it('页面加载、轮询式失效和筛选不自动发送 purge', async () => {
+    const fetchMock = mockApi({ items: [recycledProject] });
+    const { queryClient } = renderRecycleBin();
+    await screen.findByText('可恢复项目');
+    fireEvent.change(screen.getByLabelText('生命周期'), { target: { value: 'recycled' } });
+    await act(async () => { await queryClient.invalidateQueries({ queryKey: ['recycle-bin'] }); });
+    expect(fetchMock.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === 'POST')).toHaveLength(0);
+  });
+
+  it('批量运行中锁定页面，完成后进度面板仍保留但操作恢复', async () => {
+    let resolvePost: ((response: Response) => void) | undefined;
+    const state = { items: [recycledProject] as Array<typeof recycledProject | ReturnType<typeof purging>>, purge: () => new Promise<Response>((resolve) => { resolvePost = resolve; }) };
+    mockApi(state);
     renderRecycleBin();
     await screen.findByText('可恢复项目');
-    fireEvent.click(screen.getByRole('button', { name: '恢复项目' }));
-
-    expect(await screen.findByText(/恢复失败：项目版本已变化。/)).toHaveTextContent('请求标识 request-version-conflict');
-    expect(screen.getByText('可恢复项目')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '清空回收站' }));
+    await screen.findByRole('dialog', { name: '清空回收站？' });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '清空回收站' } });
+    fireEvent.click(screen.getByLabelText('我已核对项目数量并了解成功项目无法恢复'));
+    fireEvent.click(screen.getByRole('button', { name: '开始清空' }));
+    expect(await screen.findByText('正在提交')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '清空回收站' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '恢复项目' })).toBeDisabled();
+    await act(async () => { resolvePost?.(json({ project: {} }, 201)); });
+    expect(await screen.findByText('已处理 1 / 总数 1，成功 1，失败 0')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '清空回收站' })).toBeEnabled();
     expect(screen.getByRole('button', { name: '恢复项目' })).toBeEnabled();
-  });
-
-  it('恢复结果未知时以同一幂等键重试，成功后移出列表', async () => {
-    const fetchMock = vi.spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(new Response(JSON.stringify({ total: 1, items: [recycledProject] }), { status: 200 }))
-      .mockRejectedValueOnce(new TypeError('连接中断'))
-      .mockResolvedValueOnce(new Response(JSON.stringify({
-        project: {
-          id: recycledProject.id,
-          name: recycledProject.name,
-          workflowStatus: 'ready',
-          lifecycleStatus: 'active',
-          recycleExpiresAt: null,
-          version: 7,
-          createdAt: '2026-08-12T02:00:00.000Z',
-          updatedAt: '2026-08-13T04:00:00.000Z',
-          createdBy: 'local-user',
-          updatedBy: 'local-user',
-        },
-      }), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ total: 0, items: [] }), { status: 200 }));
-
-    renderRecycleBin();
-    await screen.findByText('可恢复项目');
-    fireEvent.click(screen.getByRole('button', { name: '恢复项目' }));
-    expect(await screen.findByText(/恢复失败：连接中断/)).toHaveTextContent('结果未知');
-
-    fireEvent.click(screen.getByRole('button', { name: '恢复项目' }));
-    expect(await screen.findByText(/项目“可恢复项目”已恢复/)).toBeInTheDocument();
-    await waitFor(() => expect(screen.queryByText('可恢复项目')).not.toBeInTheDocument());
-
-    const firstHeaders = fetchMock.mock.calls[1]?.[1]?.headers as Record<string, string>;
-    const retryHeaders = fetchMock.mock.calls[2]?.[1]?.headers as Record<string, string>;
-    expect(firstHeaders['idempotency-key']).toBeTruthy();
-    expect(retryHeaders['idempotency-key']).toBe(firstHeaders['idempotency-key']);
-  });
-
-  it('同一查询刷新确认清理完成时显示轻提示并移除项目', async () => {
-    const purgingProject = {
-      ...recycledProject,
-      id: 'de65378e-8935-4c4a-9e8b-13efca3d314e',
-      name: '即将清理完成项目',
-      lifecycleStatus: 'purging',
-      cleanupJob: {
-        ...recycledProject.cleanupJob,
-        id: 'aa65378e-8935-4c4a-9e8b-13efca3d314e',
-        status: 'leased',
-        attemptCount: 1,
-      },
-    } as const;
-    vi.spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(new Response(JSON.stringify({ total: 1, items: [purgingProject] }), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ total: 0, items: [] }), { status: 200 }));
-
-    const { queryClient } = renderRecycleBin();
-    await screen.findByText('即将清理完成项目');
-    await act(async () => {
-      await queryClient.invalidateQueries({ queryKey: ['recycle-bin'] });
-    });
-
-    expect(await screen.findByText('项目“即将清理完成项目”已清理，已从普通回收站列表移除。')).toBeInTheDocument();
-    expect(screen.queryByText('即将清理完成项目')).not.toBeInTheDocument();
-  });
-
-  it('CleanupJob 状态筛选中 retryable 转 leased 并消失时不误报已清理', async () => {
-    const retryableProject = {
-      ...recycledProject,
-      id: 'de65378e-8935-4c4a-9e8b-13efca3d314f',
-      name: '状态迁移项目',
-      lifecycleStatus: 'purging',
-      cleanupJob: {
-        ...recycledProject.cleanupJob,
-        id: 'aa65378e-8935-4c4a-9e8b-13efca3d314f',
-        status: 'retryable',
-        attemptCount: 2,
-      },
-    } as const;
-    vi.spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(new Response(JSON.stringify({ total: 0, items: [] }), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ total: 1, items: [retryableProject] }), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ total: 0, items: [] }), { status: 200 }));
-
-    const { queryClient } = renderRecycleBin();
-    await screen.findByText('回收站为空');
-    fireEvent.change(screen.getByLabelText('后台处理'), { target: { value: 'retryable' } });
-    await screen.findByText('状态迁移项目');
-    await act(async () => {
-      await queryClient.invalidateQueries({ queryKey: ['recycle-bin'] });
-    });
-
-    await screen.findByText('没有匹配的回收项目');
-    expect(screen.queryByText(/状态迁移项目.*已清理/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/已从普通回收站列表移除/)).not.toBeInTheDocument();
-  });
-
-  it('前后响应均为不完整结果窗口时项目缺席不误报已清理', async () => {
-    const firstWindowProject = {
-      ...recycledProject,
-      id: 'de65378e-8935-4c4a-9e8b-13efca3d3150',
-      name: '窗口第一页项目',
-      lifecycleStatus: 'purging',
-      cleanupJob: {
-        ...recycledProject.cleanupJob,
-        id: 'aa65378e-8935-4c4a-9e8b-13efca3d3150',
-        status: 'leased',
-      },
-    } as const;
-    const secondWindowProject = {
-      ...firstWindowProject,
-      id: 'de65378e-8935-4c4a-9e8b-13efca3d3151',
-      name: '窗口第二页项目',
-      cleanupJob: {
-        ...firstWindowProject.cleanupJob,
-        id: 'aa65378e-8935-4c4a-9e8b-13efca3d3151',
-      },
-    } as const;
-    vi.spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(new Response(JSON.stringify({ total: 2, items: [firstWindowProject] }), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ total: 2, items: [secondWindowProject] }), { status: 200 }));
-
-    const { queryClient } = renderRecycleBin();
-    await screen.findByText('窗口第一页项目');
-    await act(async () => {
-      await queryClient.invalidateQueries({ queryKey: ['recycle-bin'] });
-    });
-
-    await screen.findByText('窗口第二页项目');
-    expect(screen.queryByText('窗口第一页项目')).not.toBeInTheDocument();
-    expect(screen.queryByText(/已从普通回收站列表移除/)).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '清空回收站进度' })).toBeInTheDocument();
   });
 });

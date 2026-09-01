@@ -69,7 +69,7 @@ export const AsrScopeSchema = Type.Union([
 
 export const CreateAsrBatchBodySchema = Type.Object({
   scope: AsrScopeSchema,
-  termVersionId: Type.String({ format: 'uuid' }),
+  termVersionId: Type.Optional(Type.Union([Type.String({ format: 'uuid' }), Type.Null()])),
   forceNewRecognition: Type.Optional(Type.Boolean()),
 }, { additionalProperties: false });
 
@@ -92,12 +92,14 @@ export const AsrHotwordReceiptStatusSchema = Type.Union([
   Type.Literal('simulated'),
   Type.Literal('submitted'),
   Type.Literal('partially_submitted'),
+  Type.Literal('unused'),
   Type.Literal('unsupported'),
   Type.Literal('unknown'),
 ]);
 
 export const AsrHotwordReceiptReasonSchema = Type.Union([
   Type.Literal('partial_submission'),
+  Type.Literal('no_confirmed_term_version'),
   Type.Literal('unsupported'),
   Type.Literal('unknown'),
 ]);
@@ -147,7 +149,7 @@ export const AsrHotwordCapabilitiesSchema = Type.Object({
 
 export const AsrHotwordPreviewSchema = Type.Object({
   projectId: Type.String({ format: 'uuid' }),
-  termVersionId: Type.String({ format: 'uuid' }),
+  termVersionId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
   provider: Type.String({ minLength: 1, maxLength: 40 }),
   adapter: Type.String({ minLength: 1, maxLength: 80 }),
   model: Type.String({ minLength: 1, maxLength: 80 }),
@@ -162,7 +164,7 @@ export const AsrHotwordPreviewSchema = Type.Object({
 export const AsrBatchHotwordEvidenceSchema = Type.Object({
   projectId: Type.String({ format: 'uuid' }),
   batchId: Type.String({ format: 'uuid' }),
-  termVersionId: Type.String({ format: 'uuid' }),
+  termVersionId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
   provider: Type.String({ minLength: 1, maxLength: 40 }),
   adapter: Type.String({ minLength: 1, maxLength: 80 }),
   model: Type.String({ minLength: 1, maxLength: 80 }),
@@ -184,6 +186,14 @@ export const AsrUsageSchema = Type.Object({
   finalAmount: Type.String(),
   reconciliationStatus: Type.Union([Type.Literal('final'), Type.Literal('pending')]),
   providerRequestId: Type.Union([Type.String(), Type.Null()]),
+  conversionSnapshotId: Type.Optional(Type.Union([Type.String({ format: 'uuid' }), Type.Null()])),
+  rateDigest: Type.Optional(Type.Union([Type.String({ pattern: '^[0-9a-f]{64}$' }), Type.Null()])),
+  conversionEffectiveAt: Type.Optional(Type.Union([Type.String({ format: 'date-time' }), Type.Null()])),
+  originalCurrency: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  originalEstimatedAmount: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  originalFinalAmount: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  estimatedAmountCny: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  finalAmountCny: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 }, { additionalProperties: false });
 
 export const AsrQualitySummarySchema = Type.Object({
@@ -212,13 +222,75 @@ export const AsrResultSchema = Type.Object({
   projectId: Type.String({ format: 'uuid' }),
   episodeNumber: EpisodeNumberSchema,
   assetId: Type.String({ format: 'uuid' }),
-  termVersionId: Type.String({ format: 'uuid' }),
+  termVersionId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
   configDigest: Type.String({ minLength: 64, maxLength: 64 }),
   hotwordDigest: Type.String({ minLength: 64, maxLength: 64 }),
   qualityStatus: AsrQualityStatusSchema,
   qualitySummary: AsrQualitySummarySchema,
   cues: Type.Array(AsrCueSchema),
   createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false });
+
+export const AsrSrtComparisonEpisodeSchema = Type.Union([
+  Type.Literal(2), Type.Literal(8), Type.Literal(29),
+]);
+export const AsrSrtComparisonSamplePositionSchema = Type.Union([
+  Type.Literal('start'), Type.Literal('middle'), Type.Literal('end'),
+]);
+export const AsrSrtComparisonCueSchema = Type.Object({
+  id: Type.String({ minLength: 1, maxLength: 64 }),
+  cueIndex: Type.Integer({ minimum: 1 }),
+  startMs: Type.Integer({ minimum: 0 }),
+  endMs: Type.Integer({ minimum: 1 }),
+  text: Type.String({ minLength: 1, maxLength: 240 }),
+  textTruncated: Type.Boolean(),
+  confidence: Type.Union([Type.Number({ minimum: 0, maximum: 1 }), Type.Null()]),
+}, { additionalProperties: false });
+export const AsrSrtComparisonOverlapSchema = Type.Object({
+  companyCueId: Type.String({ minLength: 1, maxLength: 64 }),
+  asrCueId: Type.String({ format: 'uuid' }),
+  overlapMs: Type.Integer({ minimum: 1 }),
+}, { additionalProperties: false });
+export const AsrSrtComparisonMappingRelationSchema = Type.Union([
+  Type.Literal('none'), Type.Literal('one_to_one'), Type.Literal('one_to_many'),
+]);
+export const AsrSrtComparisonMappingSchema = Type.Object({
+  companyCueId: Type.String({ minLength: 1, maxLength: 64 }),
+  asrCueIds: Type.Array(Type.String({ format: 'uuid' }), { maxItems: 8 }),
+  relation: AsrSrtComparisonMappingRelationSchema,
+}, { additionalProperties: false });
+export const AsrSrtComparisonSampleSchema = Type.Object({
+  position: AsrSrtComparisonSamplePositionSchema,
+  companyCue: Type.Union([AsrSrtComparisonCueSchema, Type.Null()]),
+  asrCues: Type.Array(AsrSrtComparisonCueSchema, { maxItems: 8 }),
+  asrCuesTruncated: Type.Boolean(),
+  overlaps: Type.Array(AsrSrtComparisonOverlapSchema, { maxItems: 8 }),
+  mapping: Type.Union([AsrSrtComparisonMappingSchema, Type.Null()]),
+}, { additionalProperties: false });
+export const AsrSrtComparisonStatusSchema = Type.Union([
+  Type.Literal('ready'), Type.Literal('missing_company_srt'),
+  Type.Literal('missing_asr_result'), Type.Literal('missing_both'),
+]);
+export const AsrSrtComparisonEpisodeResultSchema = Type.Object({
+  episodeNumber: AsrSrtComparisonEpisodeSchema,
+  status: AsrSrtComparisonStatusSchema,
+  companyCueCount: Type.Integer({ minimum: 0 }),
+  asrCueCount: Type.Integer({ minimum: 0 }),
+  samples: Type.Array(AsrSrtComparisonSampleSchema, { maxItems: 3 }),
+}, { additionalProperties: false });
+export const AsrSrtComparisonReviewOptionSchema = Type.Union([
+  Type.Object({ code: Type.Literal('missing_word'), label: Type.Literal('漏词') }, { additionalProperties: false }),
+  Type.Object({ code: Type.Literal('extra_word'), label: Type.Literal('额外') }, { additionalProperties: false }),
+  Type.Object({ code: Type.Literal('proper_name'), label: Type.Literal('专名') }, { additionalProperties: false }),
+  Type.Object({ code: Type.Literal('timing'), label: Type.Literal('时间') }, { additionalProperties: false }),
+  Type.Object({ code: Type.Literal('match'), label: Type.Literal('一致') }, { additionalProperties: false }),
+]);
+export const AsrSrtComparisonSchema = Type.Object({
+  projectId: Type.String({ format: 'uuid' }),
+  batchId: Type.String({ format: 'uuid' }),
+  episodeNumbers: Type.Array(AsrSrtComparisonEpisodeSchema, { minItems: 3, maxItems: 3, uniqueItems: true }),
+  manualReviewOptions: Type.Array(AsrSrtComparisonReviewOptionSchema, { minItems: 1, maxItems: 5 }),
+  episodes: Type.Array(AsrSrtComparisonEpisodeResultSchema, { minItems: 3, maxItems: 3 }),
 }, { additionalProperties: false });
 
 export const AsrAttemptSchema = Type.Object({
@@ -230,6 +302,7 @@ export const AsrAttemptSchema = Type.Object({
   providerRequestId: Type.Union([Type.String(), Type.Null()]),
   errorCode: Type.Union([Type.String(), Type.Null()]),
   errorDetail: Type.Union([Type.String(), Type.Null()]),
+  localPolicyBlocked: Type.Boolean(),
   retryable: Type.Boolean(),
   externalSideEffectPossible: Type.Boolean(),
   startedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
@@ -240,6 +313,8 @@ export const AsrAttemptSchema = Type.Object({
   usage: Type.Union([AsrUsageSchema, Type.Null()]),
   result: Type.Union([AsrResultSchema, Type.Null()]),
   createdAt: Type.String({ format: 'date-time' }),
+  routingVersionId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  deploymentVersionId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
 }, { additionalProperties: false });
 
 export const AsrJobSchema = Type.Object({
@@ -257,6 +332,8 @@ export const AsrJobSchema = Type.Object({
   currentResult: Type.Union([AsrResultSchema, Type.Null()]),
   createdAt: Type.String({ format: 'date-time' }),
   updatedAt: Type.String({ format: 'date-time' }),
+  routingVersionId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  deploymentVersionId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
 }, { additionalProperties: false });
 
 export const AsrBatchBlockerSchema = Type.Object({
@@ -283,7 +360,7 @@ export const AsrBatchSummarySchema = Type.Object({
   retryOfBatchId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
   scopeKind: Type.Union([Type.Literal('all'), Type.Literal('selected'), Type.Literal('single')]),
   episodeNumbers: Type.Array(EpisodeNumberSchema),
-  termVersionId: Type.String({ format: 'uuid' }),
+  termVersionId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
   termVersionIsLatest: Type.Boolean(),
   manifestId: Type.String({ format: 'uuid' }),
   manifestVersion: Type.Integer({ minimum: 1 }),
@@ -298,6 +375,8 @@ export const AsrBatchSummarySchema = Type.Object({
   counts: AsrBatchCountsSchema,
   createdAt: Type.String({ format: 'date-time' }),
   updatedAt: Type.String({ format: 'date-time' }),
+  routingVersionId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  deploymentVersionId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
 }, { additionalProperties: false });
 
 export const AsrBatchDetailSchema = Type.Object({
@@ -326,7 +405,7 @@ export const AsrBatchListSchema = Type.Object({
 }, { additionalProperties: false });
 
 export const AsrBatchPreparationQuerySchema = Type.Object({
-  termVersionId: Type.String({ format: 'uuid' }),
+  termVersionId: Type.Optional(Type.Union([Type.String({ format: 'uuid' }), Type.Null()])),
   forceNewRecognition: Type.Optional(QueryBooleanSchema),
 }, { additionalProperties: false });
 
@@ -354,7 +433,7 @@ export const AsrBatchPreparationEpisodeSchema = Type.Object({
 
 export const AsrBatchPreparationSchema = Type.Object({
   projectId: Type.String({ format: 'uuid' }),
-  termVersionId: Type.String({ format: 'uuid' }),
+  termVersionId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
   manifestId: Type.String({ format: 'uuid' }),
   manifestVersion: Type.Integer({ minimum: 1 }),
   provider: Type.String({ minLength: 1, maxLength: 40 }),
@@ -596,6 +675,15 @@ export type AsrUsage = Static<typeof AsrUsageSchema>;
 export type AsrQualitySummary = Static<typeof AsrQualitySummarySchema>;
 export type AsrCue = Static<typeof AsrCueSchema>;
 export type AsrResult = Static<typeof AsrResultSchema>;
+export type AsrSrtComparisonEpisode = Static<typeof AsrSrtComparisonEpisodeSchema>;
+export type AsrSrtComparisonSamplePosition = Static<typeof AsrSrtComparisonSamplePositionSchema>;
+export type AsrSrtComparisonCue = Static<typeof AsrSrtComparisonCueSchema>;
+export type AsrSrtComparisonOverlap = Static<typeof AsrSrtComparisonOverlapSchema>;
+export type AsrSrtComparisonMapping = Static<typeof AsrSrtComparisonMappingSchema>;
+export type AsrSrtComparisonSample = Static<typeof AsrSrtComparisonSampleSchema>;
+export type AsrSrtComparisonEpisodeResult = Static<typeof AsrSrtComparisonEpisodeResultSchema>;
+export type AsrSrtComparisonReviewOption = Static<typeof AsrSrtComparisonReviewOptionSchema>;
+export type AsrSrtComparison = Static<typeof AsrSrtComparisonSchema>;
 export type AsrAttempt = Static<typeof AsrAttemptSchema>;
 export type AsrJob = Static<typeof AsrJobSchema>;
 export type AsrBatchSummary = Static<typeof AsrBatchSummarySchema>;

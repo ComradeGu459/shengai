@@ -14,7 +14,9 @@ export type AsrErrorCode =
   | 'ASR_DISPATCH_IDEMPOTENCY_KEY_REUSED'
   | 'ASR_DISPATCH_GROUP_ID_REUSED'
   | 'ASR_DISPATCH_CANCEL_IDEMPOTENCY_KEY_REUSED'
-  | 'ASR_FAKE_DISABLED';
+  | 'ASR_FAKE_DISABLED'
+  | 'ASR_ADAPTER_UNAVAILABLE'
+  | 'ASR_ROUTING_NOT_ACTIVE';
 
 export class AsrDomainError extends Error {
   constructor(

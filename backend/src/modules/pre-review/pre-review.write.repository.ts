@@ -19,6 +19,7 @@ import {
   renderSrt,
   resolveDecision,
   scanFormatIssues,
+  type PreReviewRulePack,
   sha256,
   type AlignmentCue,
   type ReleaseCue,
@@ -43,6 +44,7 @@ interface SessionLockRow extends QueryResultRow {
   id: string;
   project_id: string;
   source_digest: string;
+  strategy_version_id: string | null;
   status: string;
   default_policy: 'company_primary' | 'asr_text_primary';
   revision: number;
@@ -119,7 +121,7 @@ const saveCommand = async (
 
 const lockSession = async (client: PoolClient, projectId: string, sessionId: string) => {
   const result = await client.query<SessionLockRow>(
-    `SELECT id, project_id, source_digest, status, default_policy, revision
+    `SELECT id, project_id, source_digest, strategy_version_id, status, default_policy, revision
        FROM pre_edit_sessions WHERE id = $1 AND project_id = $2 FOR UPDATE`,
     [sessionId, projectId],
   );
@@ -134,6 +136,18 @@ const requireWritable = (session: SessionLockRow) => {
       session.status === 'stale' ? '来源已经变化，旧会话只读。' : '会话尚未准备完成。',
     );
   }
+};
+
+const loadRulePack = async (client: PoolClient, session: SessionLockRow): Promise<PreReviewRulePack> => {
+  if (!session.strategy_version_id) {
+    throw preReviewConflict('PRE_EDIT_STRATEGY_NOT_ACTIVE', '前置审改会话没有绑定策略版本。', 'publish_strategy');
+  }
+  const result = await client.query<{ rule_pack: PreReviewRulePack }>(
+    `SELECT v.payload AS rule_pack FROM strategy_artifact_versions v JOIN strategy_artifacts a ON a.id=v.artifact_id WHERE v.id = $1 AND a.runtime_module='pre_review' AND v.runtime_status IN ('active','retired','approved') FOR SHARE`,
+    [session.strategy_version_id],
+  );
+  if (!result.rows[0]) throw preReviewConflict('PRE_EDIT_STRATEGY_NOT_ACTIVE', '绑定的策略版本不可读取。', 'publish_strategy');
+  return result.rows[0].rule_pack;
 };
 
 const loadItems = async (client: PoolClient, predicate: string, values: unknown[]) =>
@@ -167,7 +181,7 @@ const loadItems = async (client: PoolClient, predicate: string, values: unknown[
 
 const asAlignment = (cue: PreEditCue | undefined): AlignmentCue | null => cue ? { ...cue } : null;
 
-const evaluatePolicyItem = (item: WritableItemRow, policy: PreEditItem['effectivePolicy']) => {
+const evaluatePolicyItem = (item: WritableItemRow, policy: PreEditItem['effectivePolicy'], rulePack: PreReviewRulePack) => {
   const companyCue = item.company_cues.find((cue) => cue.cueId === item.target_company_cue_id)
     ?? item.company_cues[0];
   const system = effectiveSystemDecision({
@@ -175,7 +189,7 @@ const evaluatePolicyItem = (item: WritableItemRow, policy: PreEditItem['effectiv
   });
   const timing = companyCue ?? item.asr_cues[0];
   const issues = ['remove_company', 'ignore_asr'].includes(system.action) ? [] : scanFormatIssues(
-    system.text,
+    system.text, rulePack,
     timing ? {
       startMs: timing.startMs,
       endMs: companyCue?.endMs ?? item.asr_cues.at(-1)!.endMs,
@@ -252,6 +266,17 @@ export class PreReviewWriteRepository {
         || project.rows[0].version !== input.snapshot.projectVersion) {
         throw preReviewConflict('PRE_EDIT_SOURCE_CHANGED', '项目版本已经变化，请刷新后重新创建会话。');
       }
+      const strategy = await client.query<{ id: string; content_digest: string }>(
+        `SELECT version.id, version.content_digest
+           FROM strategy_runtime_active_pointers pointer
+           JOIN strategy_artifact_versions version ON version.id = pointer.strategy_version_id
+           JOIN strategy_artifacts artifact ON artifact.id = version.artifact_id
+          WHERE pointer.module = 'pre_review' AND artifact.runtime_module = 'pre_review' AND version.runtime_status = 'active'
+          FOR UPDATE`,
+      );
+      if (!strategy.rows[0]) {
+        throw preReviewConflict('PRE_EDIT_STRATEGY_NOT_ACTIVE', '前置审改尚未发布可用规则，请先完成策略发布。', 'publish_strategy');
+      }
       const active = await client.query(
         `SELECT 1 FROM pre_edit_sessions
           WHERE project_id = $1 AND status IN ('preparing', 'ready', 'limited')`,
@@ -264,14 +289,16 @@ export class PreReviewWriteRepository {
         `INSERT INTO pre_edit_sessions (
            project_id, project_version, source_srt_set_digest, term_version_id,
            manifest_id, manifest_version, source_digest, source_snapshot,
-           algorithm_version, format_policy_version
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+           strategy_version_id, strategy_content_digest, algorithm_version, format_policy_version,
+           screen_text_release_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          RETURNING id`,
         [
           input.snapshot.projectId, input.snapshot.projectVersion, input.snapshot.sourceSrtSetDigest,
           input.snapshot.termVersionId, input.snapshot.manifestId, input.snapshot.manifestVersion,
-          input.snapshot.sourceDigest, JSON.stringify(input.snapshot), input.snapshot.algorithmVersion,
-          input.snapshot.formatPolicyVersion,
+          input.snapshot.sourceDigest, JSON.stringify(input.snapshot), strategy.rows[0].id,
+          strategy.rows[0].content_digest, `strategy-runtime:${strategy.rows[0].id}`,
+          strategy.rows[0].content_digest, input.snapshot.screenTextRelease.id,
         ],
       );
       const sessionId = session.rows[0]!.id;
@@ -385,6 +412,7 @@ export class PreReviewWriteRepository {
       await client.query('BEGIN');
       const session = await lockSession(client, input.projectId, input.sessionId);
       requireWritable(session);
+      const rulePack = await loadRulePack(client, session);
       if (session.revision !== input.body.expectedSessionRevision) {
         throw preReviewConflict('PRE_EDIT_SESSION_VERSION_CONFLICT', '会话版本已经变化。');
       }
@@ -416,7 +444,7 @@ export class PreReviewWriteRepository {
       let requiresHumanDecisionCount = 0;
       for (const item of items.rows) {
         if (item.decision_origin === 'human') protectedHumanDecisionCount += 1;
-        else if (evaluatePolicyItem(item, input.body.policy).safe) safeUpdateCount += 1;
+        else if (evaluatePolicyItem(item, input.body.policy, rulePack).safe) safeUpdateCount += 1;
         else requiresHumanDecisionCount += 1;
       }
       await client.query('COMMIT');
@@ -461,6 +489,7 @@ export class PreReviewWriteRepository {
       }
       const session = await lockSession(client, input.projectId, input.sessionId);
       requireWritable(session);
+      const rulePack = await loadRulePack(client, session);
       if (session.revision !== input.body.expectedSessionRevision) {
         throw preReviewConflict('PRE_EDIT_SESSION_VERSION_CONFLICT', '会话版本已经变化。');
       }
@@ -505,7 +534,7 @@ export class PreReviewWriteRepository {
         const policy = input.body.scope === 'item' || input.body.scope === 'episodes' || input.body.scope === 'series'
           ? input.body.policy
           : item.policy_override ?? item.episode_policy_override ?? item.default_policy;
-        const { system, issues, safe } = evaluatePolicyItem(item, policy);
+        const { system, issues, safe } = evaluatePolicyItem(item, policy, rulePack);
         await client.query(
           `UPDATE pre_edit_items SET system_action = $2, system_text = $3 WHERE id = $1`,
           [item.id, system.action, system.text],
@@ -588,6 +617,7 @@ export class PreReviewWriteRepository {
       }
       const session = await lockSession(client, input.projectId, input.sessionId);
       requireWritable(session);
+      const rulePack = await loadRulePack(client, session);
       const items = await loadItems(client, 'item.id = $1 AND item.session_id = $2', [input.itemId, input.sessionId]);
       const item = items.rows[0];
       if (!item) throw preReviewNotFound('PRE_EDIT_ITEM_NOT_FOUND', '审改条目不存在。');
@@ -611,7 +641,7 @@ export class PreReviewWriteRepository {
       }
       const timing = companyCue ?? item.asr_cues[0];
       const issues: PreEditFormatIssue[] = ['remove_company', 'ignore_asr'].includes(resolved.action)
-        ? [] : scanFormatIssues(resolved.text, timing ? {
+        ? [] : scanFormatIssues(resolved.text, rulePack, timing ? {
           startMs: timing.startMs,
           endMs: companyCue?.endMs ?? item.asr_cues.at(-1)!.endMs,
           videoDurationMs: item.video_duration_ms === null ? null : Number(item.video_duration_ms),
@@ -677,6 +707,7 @@ export class PreReviewWriteRepository {
       }
       const session = await lockSession(client, input.projectId, input.sessionId);
       requireWritable(session);
+      const rulePack = await loadRulePack(client, session);
       const items = await loadItems(client, 'item.id = $1 AND item.session_id = $2', [input.itemId, input.sessionId]);
       const item = items.rows[0];
       if (!item) throw preReviewNotFound('PRE_EDIT_ITEM_NOT_FOUND', '审改条目不存在。');
@@ -690,7 +721,7 @@ export class PreReviewWriteRepository {
         ?? item.company_cues[0];
       const timing = companyCue ?? item.asr_cues[0];
       const issues = ['remove_company', 'ignore_asr'].includes(item.system_action) ? [] : scanFormatIssues(
-        item.system_text,
+        item.system_text, rulePack,
         timing ? {
           startMs: timing.startMs,
           endMs: companyCue?.endMs ?? item.asr_cues.at(-1)!.endMs,

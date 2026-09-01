@@ -282,11 +282,10 @@ export class AsrDispatchRepository {
     );
     for (const row of ready.rows) {
       const termVersionId = row.eligibility_snapshot?.termVersionId;
-      if (!termVersionId) throw new Error(`Dispatch ready 项目缺少术语版本：${row.project_id}`);
       try {
         const created = await this.batchCommands.create({
           projectId: row.project_id,
-          body: { scope: { kind: 'all' }, termVersionId },
+          body: { scope: { kind: 'all' }, termVersionId: termVersionId ?? null },
           idempotencyKey: `dispatch:${groupId}:${row.project_id}`,
           rejectIfActiveBatch: true,
         });

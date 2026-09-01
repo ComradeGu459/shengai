@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 
 import { createApp } from '../../backend/src/app.js';
@@ -17,13 +17,38 @@ import {
 import { buildHotwordProjection } from '../../backend/src/modules/asr/asr-hotwords.js';
 import { AsrWorkerRepository } from '../../backend/src/modules/asr/asr-worker.repository.js';
 import { developmentAsrSchedulingPolicy } from '../../backend/src/modules/asr/asr-scheduling-policy.js';
+import { SystemControlBudgetService } from '../../backend/src/modules/system-control/system-control.budget.service.js';
 import { AsrWorker } from '../../backend/src/workers/asr.worker.js';
 import { runAsrWorker } from '../../backend/src/workers/asr.worker.entry.js';
+import { toBudgetDecimal } from '../../backend/src/workers/asr.worker.js';
 
 const pool = createPool();
 const app = createApp({ database: pool });
 
-beforeAll(async () => app.ready());
+const activateAsrRouting = async (routingPool: DatabasePool, descriptor: { provider: string; adapter: string; model: string; language: string; configDigest: string; hotwordCapabilities: { supported: boolean; maxEntries: number | null; maxCharacters: number | null }; billing?: unknown }, targetCount = 1, capacities: { maxConcurrentJobs: number; perProjectMax: number; queueLimit: number } | Array<{ maxConcurrentJobs: number; perProjectMax: number; queueLimit: number }> = { maxConcurrentJobs: 4, perProjectMax: 2, queueLimit: 100 }) => {
+  const routingVersionId = randomUUID();
+  const targets: Array<{ deploymentVersionId: string; routingTargetId: string }> = [];
+  for (let index = 0; index < targetCount; index += 1) {
+    const deploymentId = randomUUID(); const deploymentVersionId = randomUUID(); const routingTargetId = randomUUID();
+    await routingPool.query(`INSERT INTO engine_deployments (id,capability,execution_kind,display_name,provider,adapter_key,status) VALUES ($1,'asr','cloud_api',$2,$3,$4,'enabled')`, [deploymentId, `test-${descriptor.adapter}-${index + 1}`, descriptor.provider, descriptor.adapter]);
+    await routingPool.query(`INSERT INTO engine_deployment_versions (id,deployment_id,version,model,language,capabilities_snapshot,secret_reference_summary,config_digest,billing_snapshot) VALUES ($1,$2,1,$3,$4,$5,$6,$7,$8)`, [deploymentVersionId, deploymentId, descriptor.model, descriptor.language, JSON.stringify({ capability: 'asr', executionKind: 'cloud_api', provider: descriptor.provider, adapterKey: descriptor.adapter, model: descriptor.model, language: descriptor.language, descriptorDigest: descriptor.configDigest, capabilities: { hotword: descriptor.hotwordCapabilities } }), JSON.stringify({ present: false, referenceDigest: null, redactedLabel: null }), descriptor.configDigest, JSON.stringify(descriptor.billing)]);
+    targets.push({ deploymentVersionId, routingTargetId });
+  }
+  await routingPool.query(`INSERT INTO routing_policy_versions (id,environment,workflow_stage,version) VALUES ($1,'development','asr',(SELECT COALESCE(MAX(version),0)+1 FROM routing_policy_versions WHERE environment='development' AND workflow_stage='asr'))`, [routingVersionId]);
+  await routingPool.query(`INSERT INTO routing_policy_pools (routing_version_id,pool_id) VALUES ($1,'asr_api'),($1,'ocr_api'),($1,'ocr_self_hosted_worker')`, [routingVersionId]);
+  for (const [index, target] of targets.entries()) {
+    const capacity = Array.isArray(capacities) ? capacities[index] ?? capacities[capacities.length - 1]! : capacities;
+    await routingPool.query(`INSERT INTO routing_policy_targets (routing_version_id,pool_id,routing_target_id,deployment_version_id,priority,role,max_concurrent_jobs,per_project_max,queue_limit) VALUES ($1,'asr_api',$2,$3,$4,$5,$6,$7,$8)`, [routingVersionId, target.routingTargetId, target.deploymentVersionId, index + 1, index === 0 ? 'preferred' : 'standard', capacity.maxConcurrentJobs, capacity.perProjectMax, capacity.queueLimit]);
+  }
+  await routingPool.query(`INSERT INTO routing_policy_status_events (routing_version_id,status,request_id,actor_subject) VALUES ($1,'active','test-routing','test')`, [routingVersionId]);
+  await routingPool.query(`INSERT INTO active_control_plane_pointers (environment,workflow_stage,routing_version_id) VALUES ('development','asr',$1) ON CONFLICT (environment,workflow_stage) DO UPDATE SET routing_version_id=EXCLUDED.routing_version_id,updated_at=CURRENT_TIMESTAMP`, [routingVersionId]);
+  return { routingVersionId, targets };
+};
+
+beforeAll(async () => {
+  await app.ready();
+  await activateAsrRouting(pool, createDefaultAsrAdapterRegistry().defaultDescriptor);
+});
 beforeEach(async () => {
   await pool.query('DELETE FROM asr_dispatch_groups');
   await pool.query('DELETE FROM projects');
@@ -50,8 +75,8 @@ describe('BACK-M3-02D 多项目派发与公平调度', () => {
     expect(projected.json()).toMatchObject({
       counts: {
         selectedProjects: 3,
-        eligibleProjects: 1,
-        blockedProjects: 2,
+        eligibleProjects: 2,
+        blockedProjects: 1,
         totalEpisodes: 5,
         newJobs: 4,
       },
@@ -65,8 +90,10 @@ describe('BACK-M3-02D 多项目派发与公平调度', () => {
       });
     expect(projected.json().items.find((item: any) => item.projectId === missingTerms.projectId))
       .toMatchObject({
-        eligible: false,
-        blockers: [{ code: 'ASR_TERM_VERSION_NOT_FOUND', action: 'confirm_terms' }],
+        eligible: true,
+        termVersionId: null,
+        hotwords: { termCount: 0, aliasCount: 0 },
+        blockers: [],
       });
 
     const selected = [eligible.projectId, missingVideo.projectId, missingTerms.projectId];
@@ -106,19 +133,31 @@ describe('BACK-M3-02D 多项目派发与公平调度', () => {
       acceptanceStatus: 'partial',
       executionStatus: 'queued',
       counts: {
-        acceptedProjects: 1,
-        blockedProjects: 2,
-        totalEpisodes: 2,
-        newJobs: 2,
+        acceptedProjects: 2,
+        blockedProjects: 1,
+        totalEpisodes: 3,
+        newJobs: 3,
         reusableResults: 0,
       },
       results: expect.arrayContaining([
         expect.objectContaining({ projectId: eligible.projectId, acceptanceStatus: 'accepted' }),
         expect.objectContaining({ projectId: missingVideo.projectId, acceptanceStatus: 'blocked' }),
+        expect.objectContaining({
+          projectId: missingTerms.projectId,
+          acceptanceStatus: 'accepted',
+          batchId: expect.any(String),
+          batch: expect.objectContaining({ termVersionId: null }),
+        }),
       ]),
     });
     const accepted = partial.json().results.find((item: any) => item.projectId === eligible.projectId);
     expect(accepted.batch).toMatchObject({ status: 'queued', episodeNumbers: [1, 2] });
+    const noTermPreparation = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${missingTerms.projectId}/asr/batch-preparation`,
+    });
+    expect(noTermPreparation.statusCode, noTermPreparation.body).toBe(200);
+    expect(noTermPreparation.json()).toMatchObject({ termVersionId: null, hotwords: { termCount: 0, aliasCount: 0 } });
 
     const replay = await app.inject({
       method: 'POST',
@@ -227,6 +266,68 @@ describe('BACK-M3-02D 多项目派发与公平调度', () => {
     expect(claims.slice(0, 4).every(Boolean)).toBe(true);
     expect(new Set(claims.slice(0, 4).map((claim) => claim!.projectId)).size).toBe(4);
     expect(claims[4]).toBeNull();
+  });
+
+  it('队列超过 queueLimit 时仍按最早顺位持续排空', async () => {
+    const descriptor = createDefaultAsrAdapterRegistry().defaultDescriptor;
+    await activateAsrRouting(pool, descriptor, 1, { maxConcurrentJobs: 1, perProjectMax: 1, queueLimit: 2 });
+    const source = await seedProject(Array.from({ length: 11 }, (_, index) => ({ episodeNumber: index + 1 })));
+    const created = await createBatch({ ...source, scope: { kind: 'all' } });
+    expect(created.statusCode, created.body).toBe(201);
+
+    const outcomes = await runJobs(11, 'asr-queue-drain-worker');
+    expect(outcomes.every((outcome) => outcome.processed)).toBe(true);
+    expect(outcomes.map((outcome: any) => outcome.episodeNumber)).toEqual(
+      Array.from({ length: 11 }, (_, index) => index + 1),
+    );
+    const attempts = await pool.query<{ count: string }>(
+      'SELECT count(*)::text AS count FROM asr_attempts WHERE job_id IN (SELECT id FROM asr_jobs WHERE batch_id=$1)',
+      [created.json().id],
+    );
+    expect(attempts.rows[0]?.count).toBe('11');
+  });
+
+  it('route 8/6 容量实际限制 claim，不被 Worker 默认 lane 覆盖', async () => {
+    const descriptor = createDefaultAsrAdapterRegistry().defaultDescriptor;
+    await activateAsrRouting(pool, descriptor, 1, { maxConcurrentJobs: 8, perProjectMax: 6, queueLimit: 300 });
+    const first = await seedProject(Array.from({ length: 7 }, (_, index) => ({ episodeNumber: index + 1 })));
+    const firstBatch = await createBatch({ ...first, scope: { kind: 'all' } });
+    expect(firstBatch.statusCode, firstBatch.body).toBe(201);
+
+    const repository = new AsrWorkerRepository(pool);
+    const now = new Date();
+    const claim = (workerId: string) => repository.claim({
+      workerId,
+      now,
+      leaseExpiresAt: new Date(now.getTime() + 60_000),
+      policy: developmentAsrSchedulingPolicy,
+    });
+    const firstClaims = [];
+    for (let index = 0; index < 6; index += 1) firstClaims.push(await claim(`route-8-6-first-${index + 1}`));
+    expect(firstClaims.every(Boolean)).toBe(true);
+    expect(firstClaims.every((item) => item?.projectId === first.projectId)).toBe(true);
+    expect(await claim('route-8-6-first-over-limit')).toBeNull();
+
+    const second = await seedProject(Array.from({ length: 3 }, (_, index) => ({ episodeNumber: index + 1 })));
+    const secondBatch = await createBatch({ ...second, scope: { kind: 'all' } });
+    expect(secondBatch.statusCode, secondBatch.body).toBe(201);
+    const secondClaims = [await claim('route-8-6-second-1'), await claim('route-8-6-second-2'), await claim('route-8-6-second-over-limit')];
+    expect(secondClaims.slice(0, 2).every(Boolean)).toBe(true);
+    expect(secondClaims.slice(0, 2).every((item) => item?.projectId === second.projectId)).toBe(true);
+    expect(secondClaims[2]).toBeNull();
+  });
+
+  it('没有 active 路由时 ASR 创建稳定阻断且不写入批次', async () => {
+    const source = await seedProject([{ episodeNumber: 1 }]);
+    await pool.query("DELETE FROM active_control_plane_pointers WHERE environment='development' AND workflow_stage='asr'");
+    const before = await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM asr_batches');
+    const response = await createBatch({ ...source, scope: { kind: 'all' } });
+    expect(response.statusCode, response.body).toBe(409);
+    expect(response.json().error).toMatchObject({ code: 'ASR_ROUTING_NOT_ACTIVE', action: 'publish_routing_policy' });
+    const after = await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM asr_batches');
+    expect(after.rows[0]!.count).toBe(before.rows[0]!.count);
+    const active = await pool.query<{ routing_version_id: string }>(`SELECT e.routing_version_id FROM routing_policy_status_events e WHERE e.status='active' ORDER BY e.created_at DESC,e.id DESC LIMIT 1`);
+    if (active.rows[0]) await pool.query(`INSERT INTO active_control_plane_pointers (environment,workflow_stage,routing_version_id) VALUES ('development','asr',$1) ON CONFLICT (environment,workflow_stage) DO UPDATE SET routing_version_id=EXCLUDED.routing_version_id,updated_at=CURRENT_TIMESTAMP`, [active.rows[0].routing_version_id]);
   });
 });
 afterAll(async () => {
@@ -490,6 +591,83 @@ describe('BACK-M3-02A S2 ASR 权威批次', () => {
     ])).rejects.toThrow('ASR results, cues and usage are immutable');
   });
 
+  it('ASR Worker 在默认关闭预算保护时保留预留、提醒与 Usage', async () => {
+    const descriptor = createAsrAdapterDescriptor({
+      provider: 'anonymous_budget_stub',
+      adapter: 'anonymous_budget_stub_v1',
+      model: 'anonymous-budget-v1',
+      language: 'zh-CN',
+      configVersion: 'anonymous-budget-v1',
+      billing: { billingClass: 'metered', currency: 'CNY', maximumAmount: '1', billingUnit: 'request', maximumQuantity: '1' },
+    });
+    class BudgetStub implements AsrAdapter {
+      readonly descriptor = descriptor;
+      calls = 0;
+
+      async execute(input: AsrAdapterInput) {
+        this.calls += 1;
+        const providerRequestId = `anonymous-budget:${input.jobId}:${input.attemptNumber}`;
+        return {
+          kind: 'completed' as const,
+          effectClass: 'completed' as const,
+          providerRequestId,
+          cues: [{ cueIndex: 1, startMs: 0, endMs: 1_000, text: '预算旁路零网络结果', confidence: 0.95 }],
+          qualityStatus: 'pass' as const,
+          qualitySummary: {
+            audioCoverageRatio: 1, emptyResult: false, cueCount: 1, longSegmentCount: 0,
+            timelineIssueCount: 0, termHitCount: 0, lowConfidenceCount: 0, hallucinationSignalCount: 0,
+          },
+          hotwordReceipt: 'simulated' as const,
+          hotwordReceiptFacts: { submittedCount: input.hotwords.words.length, omittedCount: 0, reasonCode: null },
+          usage: {
+            provider: descriptor.provider, mediaDurationMs: 1_000, billingUnit: 'request', billingQuantity: 1,
+            currency: 'CNY', estimatedAmount: '0', finalAmount: '0', reconciliationStatus: 'final' as const,
+            providerRequestId,
+          },
+        };
+      }
+    }
+
+    const adapter = new BudgetStub();
+    const registry = new AsrAdapterRegistry([adapter], descriptor.adapter);
+    const stubPool = createPool();
+    const stubApp = createApp({ database: stubPool, asrAdapterRegistry: registry });
+    const policyId = randomUUID();
+    const previousRoute = await stubPool.query<{ routing_version_id: string }>(
+      `SELECT routing_version_id FROM active_control_plane_pointers WHERE environment='development' AND workflow_stage='asr'`,
+    );
+    try {
+      await activateAsrRouting(stubPool, descriptor);
+      await stubPool.query(`INSERT INTO budget_policy_versions(id,environment,version) VALUES($1,'development',(SELECT COALESCE(MAX(version),0)+1 FROM budget_policy_versions WHERE environment='development'))`, [policyId]);
+      await stubPool.query(`INSERT INTO budget_policy_rules(budget_policy_version_id,resource_pool,currency,period,warning_limit,hard_limit) VALUES($1,'asr_api','CNY','day',0,0.000001),($1,'ocr_api','CNY','day',0,0.000001)`, [policyId]);
+      await stubPool.query(`INSERT INTO budget_policy_status_events(budget_policy_version_id,status,request_id,actor_subject) VALUES($1,'active','asr-budget-bypass','test')`, [policyId]);
+      await stubPool.query(`INSERT INTO active_budget_policy_pointers(environment,budget_policy_version_id) VALUES('development',$1) ON CONFLICT (environment) DO UPDATE SET budget_policy_version_id=EXCLUDED.budget_policy_version_id,updated_at=CURRENT_TIMESTAMP`, [policyId]);
+      await stubApp.ready();
+
+      const source = await seedProject([{ episodeNumber: 1 }], stubPool);
+      const created = await createBatch({ ...source, scope: { kind: 'single', episodeNumber: 1 } }, stubApp);
+      expect(created.statusCode, created.body).toBe(201);
+      const worker = new AsrWorker(stubPool, registry, { leaseMs: 60_000, pollIntervalMs: 50 }, { workerId: 'asr-budget-bypass-worker' });
+      expect(await worker.runOnce()).toMatchObject({ processed: true, outcome: 'completed' });
+      expect(adapter.calls).toBe(1);
+      expect((await stubPool.query<{ count: string }>('SELECT count(*)::text AS count FROM budget_reservations WHERE budget_policy_version_id=$1', [policyId])).rows[0]?.count).toBe('1');
+      expect((await stubPool.query<{ status: string; warning: boolean }>('SELECT status,warning FROM budget_reservations WHERE budget_policy_version_id=$1', [policyId])).rows[0]).toMatchObject({ status: 'settled', warning: true });
+      expect((await stubPool.query<{ count: string }>('SELECT count(*)::text AS count FROM asr_usage WHERE attempt_id=(SELECT current_attempt_id FROM asr_jobs WHERE batch_id=$1)', [created.json().id])).rows[0]?.count).toBe('1');
+    } finally {
+      await stubPool.query('DELETE FROM active_budget_policy_pointers WHERE budget_policy_version_id=$1', [policyId]);
+      if (previousRoute.rows[0]) {
+        await stubPool.query(
+          `UPDATE active_control_plane_pointers SET routing_version_id=$1,updated_at=CURRENT_TIMESTAMP WHERE environment='development' AND workflow_stage='asr'`,
+          [previousRoute.rows[0].routing_version_id],
+        );
+      } else {
+        await stubPool.query(`DELETE FROM active_control_plane_pointers WHERE environment='development' AND workflow_stage='asr'`);
+      }
+      await stubPool.query('TRUNCATE project_commands, projects CASCADE');
+      await stubApp.close();
+    }
+  }, 20_000);
+
   it('取消命令幂等终止未开始任务，同键不能取消另一批次', async () => {
     const source = await seedProject([{ episodeNumber: 1 }, { episodeNumber: 2 }]);
     const first = await createBatch({ ...source, scope: { kind: 'all' } });
@@ -710,16 +888,110 @@ describe('BACK-M3-02A S2 ASR 权威批次', () => {
     expect(parentAfterRetry.jobs[2].status).toBe('reconciliation_required');
   });
 
+  it('预算硬阻断的安全失败集可重试，完成集与带外部事实的失败集均排除且重放不增批次', async () => {
+    const source = await seedProject([
+      { episodeNumber: 1 },
+      ...Array.from({ length: 50 }, (_, index) => ({
+        episodeNumber: index + 2,
+        fileName: `EP${String(index + 2).padStart(2, '0')}.fake-always-fail.mp4`,
+      })),
+    ]);
+    const original = await createBatch({ ...source, scope: { kind: 'all' } });
+    await runJobs(51, 'budget-retry-fixture-worker');
+    const failed = await pool.query<{ id: string }>(
+      `UPDATE asr_attempts SET error_code='SYSTEM_CONTROL_BUDGET_HARD_LIMIT',retryable=FALSE
+        WHERE job_id IN (SELECT id FROM asr_jobs WHERE batch_id=$1 AND status='failed')
+        RETURNING id`,
+      [original.json().id],
+    );
+    expect(failed.rowCount).toBe(50);
+
+    const classified = await getBatch(source.projectId, original.json().id);
+    expect(classified.jobs[0].attempts[0]).toMatchObject({ localPolicyBlocked: false });
+    expect(classified.jobs.slice(1).every((job: any) => job.attempts[0].localPolicyBlocked === true
+      && job.attempts[0].retryable === true
+      && job.attempts[0].providerRequestId === null
+      && job.attempts[0].externalSideEffectPossible === false)).toBe(true);
+    expect((await pool.query<{ count: string }>('SELECT count(*)::text AS count FROM asr_batches WHERE retry_of_batch_id=$1', [original.json().id])).rows[0]?.count).toBe('0');
+
+    const key = randomUUID();
+    const retried = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${source.projectId}/asr/batches/${original.json().id}/retries`,
+      headers: { 'idempotency-key': key },
+      payload: {},
+    });
+    expect(retried.statusCode, retried.body).toBe(201);
+    expect(retried.json()).toMatchObject({
+      retryOfBatchId: original.json().id,
+      episodeNumbers: Array.from({ length: 50 }, (_, index) => index + 2),
+      jobs: expect.arrayContaining([
+        expect.objectContaining({ episodeNumber: 2, status: 'queued', attempts: [] }),
+        expect.objectContaining({ episodeNumber: 51, status: 'queued', attempts: [] }),
+      ]),
+    });
+    expect(retried.json().jobs).toHaveLength(50);
+    const replay = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${source.projectId}/asr/batches/${original.json().id}/retries`,
+      headers: { 'idempotency-key': key },
+      payload: {},
+    });
+    expect(replay.statusCode, replay.body).toBe(200);
+    expect(replay.json()).toEqual(retried.json());
+    const sourceAfter = await getBatch(source.projectId, original.json().id);
+    expect(sourceAfter.jobs[0]).toMatchObject({ episodeNumber: 1, status: 'completed' });
+    expect(sourceAfter.jobs.slice(1).every((job: any) => job.status === 'failed')).toBe(true);
+
+    await pool.query(
+      `UPDATE asr_attempts SET provider_request_id='provider-identity'
+        WHERE id=(SELECT current_attempt_id FROM asr_jobs WHERE batch_id=$1 AND episode_number=2)`,
+      [original.json().id],
+    );
+    await pool.query(
+      `UPDATE asr_attempts SET external_side_effect_possible=TRUE
+        WHERE id=(SELECT current_attempt_id FROM asr_jobs WHERE batch_id=$1 AND episode_number=3)`,
+      [original.json().id],
+    );
+    await pool.query(
+      `UPDATE asr_attempts SET error_code='ASR_NON_BUDGET_FAILURE',retryable=FALSE
+        WHERE id=(SELECT current_attempt_id FROM asr_jobs WHERE batch_id=$1 AND episode_number=4)`,
+      [original.json().id],
+    );
+    for (const episodeNumber of [2, 3, 4]) {
+      const rejected = await app.inject({
+        method: 'POST',
+        url: `/api/projects/${source.projectId}/asr/batches/${original.json().id}/retries`,
+        headers: { 'idempotency-key': randomUUID() },
+        payload: { episodeNumbers: [episodeNumber] },
+      });
+      expect(rejected.statusCode, rejected.body).toBe(409);
+      expect(rejected.json().error.code).toBe('ASR_RETRY_SCOPE_INVALID');
+    }
+  }, 20_000);
+
   it('租约过期由新 Worker 接管为新尝试，旧尝试保留失败与零费用事实', async () => {
     const source = await seedProject([{ episodeNumber: 1 }]);
     const created = await createBatch({ ...source, scope: { kind: 'single', episodeNumber: 1 } });
     const jobId = created.json().jobs[0].id;
+    const target = await pool.query<{ routing_target_id: string; deployment_version_id: string }>(
+      `SELECT t.routing_target_id, t.deployment_version_id
+         FROM asr_jobs j
+         JOIN routing_policy_targets t
+           ON t.routing_version_id = j.routing_version_id
+          AND t.pool_id = 'asr_api'
+          AND t.priority = 1
+        WHERE j.id = $1`,
+      [jobId],
+    );
+    expect(target.rows[0]).toBeTruthy();
     const expired = new Date('2026-08-14T00:00:00.000Z');
     const oldAttempt = await pool.query<{ id: string }>(
       `INSERT INTO asr_attempts
-         (job_id, attempt_number, status, lease_owner, lease_expires_at)
-       VALUES ($1,1,'leased','dead-worker',$2) RETURNING id`,
-      [jobId, expired],
+         (job_id, attempt_number, status, lease_owner, lease_expires_at,
+          routing_target_id, routing_target_priority, deployment_version_id)
+       VALUES ($1,1,'leased','dead-worker',$2,$3,1,$4) RETURNING id`,
+      [jobId, expired, target.rows[0]!.routing_target_id, target.rows[0]!.deployment_version_id],
     );
     await pool.query(
       `UPDATE asr_jobs SET status = 'leased', current_attempt_id = $2 WHERE id = $1`,
@@ -788,6 +1060,71 @@ describe('BACK-M3-02A S2 ASR 权威批次', () => {
     });
   });
 
+  it('零网络 ASR 按全局 priority 前进，unknown/unauthorized 结构化停止且不创建下一 Attempt', async () => {
+    const descriptor = createDefaultAsrAdapterRegistry().defaultDescriptor;
+    await activateAsrRouting(pool, descriptor, 2);
+    const source = await seedProject([{ episodeNumber: 1, fileName: 'EP01.fake-route-fail-once.mp4' }]);
+    const created = await createBatch({ ...source, scope: { kind: 'all' } });
+    expect(created.statusCode, created.body).toBe(201);
+    expect((await runJobs(1, 'asr-route-first-worker'))[0]).toMatchObject({ outcome: 'failed' });
+    expect((await pool.query(`SELECT attempt_number,effect_class,routing_target_priority FROM asr_attempts WHERE job_id=$1 ORDER BY attempt_number`, [created.json().jobs[0].id])).rows)
+      .toEqual([{ attempt_number: 1, effect_class: 'external_not_accepted', routing_target_priority: 1 }]);
+    expect((await pool.query('SELECT count(*)::int AS total FROM routing_advance_events WHERE job_id=$1', [created.json().jobs[0].id])).rows[0].total).toBe(1);
+    expect((await runJobs(1, 'asr-route-second-worker'))[0]).toMatchObject({ outcome: 'completed' });
+    expect((await pool.query(`SELECT attempt_number,effect_class,routing_target_priority FROM asr_attempts WHERE job_id=$1 ORDER BY attempt_number`, [created.json().jobs[0].id])).rows)
+      .toEqual([
+        { attempt_number: 1, effect_class: 'external_not_accepted', routing_target_priority: 1 },
+        { attempt_number: 2, effect_class: 'completed', routing_target_priority: 2 },
+      ]);
+
+    const unauthorized = await seedProject([{ episodeNumber: 1, fileName: 'EP01.fake-unauthorized.mp4' }]);
+    const denied = await createBatch({ ...unauthorized, scope: { kind: 'all' } });
+    expect(denied.statusCode, denied.body).toBe(201);
+    expect((await runJobs(1, 'asr-unauthorized-worker'))[0]).toMatchObject({ outcome: 'failed' });
+    expect((await pool.query(`SELECT attempt_number,effect_class,routing_target_priority FROM asr_attempts WHERE job_id=$1 ORDER BY attempt_number`, [denied.json().jobs[0].id])).rows)
+      .toEqual([{ attempt_number: 1, effect_class: 'unauthorized', routing_target_priority: 1 }]);
+
+    const unknown = await seedProject([{ episodeNumber: 1, fileName: 'EP01.fake-reconcile.mp4' }]);
+    const unknownBatch = await createBatch({ ...unknown, scope: { kind: 'all' } });
+    expect(unknownBatch.statusCode, unknownBatch.body).toBe(201);
+    expect((await runJobs(1, 'asr-unknown-worker'))[0]).toMatchObject({ outcome: 'reconciliation_required' });
+    expect((await pool.query(`SELECT attempt_number,effect_class,routing_target_priority FROM asr_attempts WHERE job_id=$1 ORDER BY attempt_number`, [unknownBatch.json().jobs[0].id])).rows)
+      .toEqual([{ attempt_number: 1, effect_class: 'external_unknown', routing_target_priority: 1 }]);
+
+    await activateAsrRouting(pool, descriptor, 1);
+  });
+
+  it('ASR 逐目标 queue/per-project 容量隔离：下一目标在途不占初始目标额度', async () => {
+    const descriptor = createDefaultAsrAdapterRegistry().defaultDescriptor;
+    const route = await activateAsrRouting(pool, descriptor, 2, [
+      { maxConcurrentJobs: 1, perProjectMax: 1, queueLimit: 1 },
+      { maxConcurrentJobs: 1, perProjectMax: 1, queueLimit: 0 },
+    ]);
+
+    const advancedSource = await seedProject([{ episodeNumber: 1, fileName: 'EP01.fake-route-fail-once.mp4' }]);
+    const advanced = await createBatch({ ...advancedSource, scope: { kind: 'all' } });
+    expect((await runJobs(1, 'asr-capacity-advance'))[0]).toMatchObject({ outcome: 'failed' });
+    expect((await pool.query(`SELECT a.routing_target_priority,a.status FROM asr_attempts a JOIN asr_jobs j ON j.current_attempt_id IS NULL AND j.id=a.job_id WHERE j.id=$1 ORDER BY a.attempt_number`, [advanced.json().jobs[0].id])).rows)
+      .toEqual([{ routing_target_priority: 1, status: 'failed' }]);
+
+    const repository = new AsrWorkerRepository(pool);
+    const now = new Date();
+    const standbyClaim = await repository.claim({ workerId: 'asr-capacity-standby', now, leaseExpiresAt: new Date(now.getTime() + 60_000), policy: developmentAsrSchedulingPolicy });
+    expect(standbyClaim?.routingTargetPriority).toBe(2);
+    const localA = await seedProject([{ episodeNumber: 1 }]);
+    const batchA = await createBatch({ ...localA, scope: { kind: 'all' } });
+    expect(batchA.statusCode).toBe(201);
+    const claimA = await repository.claim({ workerId: 'asr-capacity-a', now, leaseExpiresAt: new Date(now.getTime() + 60_000), policy: developmentAsrSchedulingPolicy });
+    expect(claimA?.routingTargetId).toBe(route.targets[0]!.routingTargetId);
+    const localB = await seedProject([{ episodeNumber: 1 }]);
+    const batchB = await createBatch({ ...localB, scope: { kind: 'all' } });
+    expect(batchB.statusCode).toBe(201);
+    const claimB = await repository.claim({ workerId: 'asr-capacity-b', now, leaseExpiresAt: new Date(now.getTime() + 60_000), policy: developmentAsrSchedulingPolicy });
+    expect(claimB).toBeNull();
+    const target2InFlight = await pool.query<{ count: string }>(`SELECT count(*)::text AS count FROM asr_attempts a WHERE a.routing_target_priority=2 AND a.status='leased'`);
+    expect(target2InFlight.rows[0]!.count).toBe('1');
+  });
+
   it('第二个零网络 stub 通过同一 API、registry、Worker 和读取链路保存登记元数据与同构用量', async () => {
     const descriptor = createAsrAdapterDescriptor({
       provider: 'anonymous_stub',
@@ -796,6 +1133,7 @@ describe('BACK-M3-02A S2 ASR 权威批次', () => {
       language: 'zh-CN',
       configVersion: 'anonymous-stub-config-v1',
       hotwordCapabilities: { maxEntries: 2, maxCharacters: 20 },
+      billing: { billingClass: 'unmetered_local', currency: 'CNY', maximumAmount: '0', billingUnit: 'zero_network_call', maximumQuantity: '0' },
     });
     class AnonymousZeroNetworkStub implements AsrAdapter {
       readonly descriptor = descriptor;
@@ -849,6 +1187,7 @@ describe('BACK-M3-02A S2 ASR 权威批次', () => {
     const adapter = new AnonymousZeroNetworkStub();
     const registry = new AsrAdapterRegistry([adapter], descriptor.adapter);
     const stubPool = createPool();
+    await activateAsrRouting(stubPool, descriptor);
     const stubApp = createApp({ database: stubPool, asrAdapterRegistry: registry });
     await stubApp.ready();
     try {
@@ -986,4 +1325,154 @@ describe('BACK-M3-02A S2 ASR 权威批次', () => {
       await stubApp.close();
     }
   });
+
+  it('长小数 billingQuantity 在 settle 边界收敛，结算异常不终止 daemon 且不重发 Adapter', async () => {
+    expect(toBudgetDecimal(1_234 / 60_000)).toBe('0.020566666667');
+
+    const descriptor = createAsrAdapterDescriptor({
+      provider: 'anonymous_long_quantity',
+      adapter: 'anonymous_long_quantity_v1',
+      model: 'anonymous-zero-network-v1',
+      language: 'zh-CN',
+      configVersion: 'anonymous-long-quantity-v1',
+      billing: { billingClass: 'unmetered_local', currency: 'CNY', maximumAmount: '0', billingUnit: 'minute', maximumQuantity: '1' },
+    });
+    class LongQuantityStub implements AsrAdapter {
+      readonly descriptor = descriptor;
+      calls: AsrAdapterInput[] = [];
+
+      async execute(input: AsrAdapterInput) {
+        this.calls.push(input);
+        const providerRequestId = `anonymous-long:${input.jobId}:${input.attemptNumber}`;
+        return {
+          kind: 'completed' as const,
+          providerRequestId,
+          cues: [{ cueIndex: 1, startMs: 0, endMs: 1_234, text: '长小数零网络识别结果', confidence: 0.9 }],
+          qualityStatus: 'pass' as const,
+          qualitySummary: {
+            audioCoverageRatio: 1, emptyResult: false, cueCount: 1, longSegmentCount: 0,
+            timelineIssueCount: 0, termHitCount: 0, lowConfidenceCount: 0, hallucinationSignalCount: 0,
+          },
+          hotwordReceipt: 'simulated' as const,
+          hotwordReceiptFacts: { submittedCount: input.hotwords.words.length, omittedCount: 0, reasonCode: null },
+          usage: {
+            provider: descriptor.provider, mediaDurationMs: 1_234, billingUnit: 'minute',
+            billingQuantity: 1_234 / 60_000, currency: 'CNY', estimatedAmount: '0', finalAmount: '0',
+            reconciliationStatus: 'final' as const, providerRequestId,
+          },
+        };
+      }
+    }
+
+    const adapter = new LongQuantityStub();
+    const registry = new AsrAdapterRegistry([adapter], descriptor.adapter);
+    const stubPool = createPool();
+    await activateAsrRouting(stubPool, descriptor);
+    const stubApp = createApp({ database: stubPool, asrAdapterRegistry: registry });
+    await stubApp.ready();
+    const settleSpy = vi.spyOn(SystemControlBudgetService.prototype, 'settle')
+      .mockRejectedValueOnce(new Error('settle regression'))
+      .mockResolvedValue(undefined);
+    try {
+      const source = await seedProject([{ episodeNumber: 1 }, { episodeNumber: 2 }], stubPool);
+      const created = await createBatch({ ...source, scope: { kind: 'all' } }, stubApp);
+      expect(created.statusCode, created.body).toBe(201);
+
+      const controller = new AbortController();
+      const loop = runAsrWorker({
+        database: stubPool,
+        registry,
+        signal: controller.signal,
+        policyReader: { read: async () => ({ ...developmentAsrSchedulingPolicy, maxGlobalInFlight: 1 }) },
+      });
+      let batch = await getBatch(source.projectId, created.json().id, stubApp);
+      for (let poll = 0; poll < 100 && batch.status !== 'completed'; poll += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        batch = await getBatch(source.projectId, created.json().id, stubApp);
+      }
+      controller.abort();
+      await loop;
+
+      expect(batch.status).toBe('completed');
+      expect(batch.jobs.every((job: { status: string }) => job.status === 'completed')).toBe(true);
+      expect(adapter.calls).toHaveLength(2);
+      expect(settleSpy.mock.calls[0]?.[0]).toMatchObject({ finalQuantity: '0.020566666667' });
+    } finally {
+      settleSpy.mockRestore();
+      await stubPool.query('TRUNCATE project_commands, projects CASCADE');
+      await stubApp.close();
+    }
+  });
+
+  it('只读对比第2/8/29集公司 SRT 与已完成 ASR raw cues，按首中尾采样并保留一对多映射', async () => {
+    await activateAsrRouting(pool, createDefaultAsrAdapterRegistry().defaultDescriptor);
+    const source = await seedProject([
+      { episodeNumber: 2 },
+      { episodeNumber: 8 },
+      { episodeNumber: 29 },
+    ]);
+    const assets = await pool.query<{ episode_number: number; asset_id: string }>(
+      `SELECT episode_number, asset_id
+         FROM material_asset_bindings
+        WHERE manifest_id = $1 AND role = 'asr_video'
+        ORDER BY episode_number`,
+      [source.manifestId],
+    );
+    const assetByEpisode = new Map(assets.rows.map((row) => [row.episode_number, row.asset_id]));
+    const cues = [
+      [2, 1, 0, 3_600, '公司开头长句'],
+      [2, 2, 4_000, 5_000, '公司中段句'],
+      [2, 3, 6_000, 7_000, '公司结尾句'],
+      [8, 1, 0, 1_000, '第八集公司句'],
+    ] as const;
+    for (const [episodeNumber, cueIndex, startMs, endMs, text] of cues) {
+      await pool.query(
+        `INSERT INTO term_cues
+           (id, project_id, source_srt_set_digest, asset_id, episode_number, cue_index, start_ms, end_ms, text)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [randomUUID(), source.projectId, 'a'.repeat(64), assetByEpisode.get(episodeNumber), episodeNumber, cueIndex, startMs, endMs, text],
+      );
+    }
+    const created = await createBatch({ ...source, scope: { kind: 'selected', episodeNumbers: [2, 29] } });
+    expect(created.statusCode, created.body).toBe(201);
+    expect(await runJobs(2, 'asr-srt-compare-worker')).toHaveLength(2);
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${source.projectId}/asr/batches/${created.json().id}/srt-compare`,
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    const comparison = response.json();
+    expect(comparison.episodeNumbers).toEqual([2, 8, 29]);
+    expect(comparison.manualReviewOptions).toEqual([
+      { code: 'missing_word', label: '漏词' },
+      { code: 'extra_word', label: '额外' },
+      { code: 'proper_name', label: '专名' },
+      { code: 'timing', label: '时间' },
+      { code: 'match', label: '一致' },
+    ]);
+    expect(comparison.episodes).toHaveLength(3);
+    expect(comparison.episodes[0]).toMatchObject({
+      episodeNumber: 2, status: 'ready', companyCueCount: 3, asrCueCount: 2,
+    });
+    expect(comparison.episodes[0].samples).toHaveLength(3);
+    expect(comparison.episodes[0].samples[0]).toMatchObject({
+      position: 'start',
+      companyCue: { text: '公司开头长句', startMs: 0, endMs: 3_600, textTruncated: false },
+      asrCues: [
+        { cueIndex: 1, startMs: 0, endMs: 1_800 },
+        { cueIndex: 2, startMs: 1_900, endMs: 3_600 },
+      ],
+      asrCuesTruncated: false,
+      mapping: { relation: 'one_to_many', asrCueIds: [expect.any(String), expect.any(String)] },
+    });
+    expect(comparison.episodes[0].samples[0].overlaps.map((item: { overlapMs: number }) => item.overlapMs)).toEqual([1_800, 1_700]);
+    expect(comparison.episodes[0].samples[1]).toMatchObject({ position: 'middle', asrCues: [], overlaps: [], mapping: { relation: 'none', asrCueIds: [] } });
+    expect(comparison.episodes[1]).toMatchObject({ episodeNumber: 8, status: 'missing_asr_result', companyCueCount: 1, asrCueCount: 0 });
+    expect(comparison.episodes[1].samples).toHaveLength(3);
+    expect(comparison.episodes[1].samples[0]).toMatchObject({ companyCue: { text: '第八集公司句' }, asrCues: [], mapping: { relation: 'none' } });
+    expect(comparison.episodes[2]).toMatchObject({ episodeNumber: 29, status: 'missing_company_srt', companyCueCount: 0, asrCueCount: 2, samples: [] });
+    expect(JSON.stringify(comparison)).not.toContain('objectKey');
+  });
+
 });

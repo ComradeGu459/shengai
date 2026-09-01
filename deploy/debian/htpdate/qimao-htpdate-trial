@@ -1,0 +1,154 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+# 一天试用专用 HTTP 时间共识调度器（domestic-relaxed Rev1）。
+# 只通过 Debian htpdate 获取/校正时间；本脚本不解析 HTTP Date，不使用 curl/date 设置时钟。
+# 该门不等同 NTPSynchronized=yes，不得解锁生产 TLS/JWT/Access/Secret 或真实厂商调用。
+
+readonly HTPDATE=/usr/sbin/htpdate
+readonly LOG_DIR=${LOGS_DIRECTORY:?LOGS_DIRECTORY is required}
+readonly LOG_FILE=${LOG_DIR}/htpdate-trial.log
+readonly STATE_DIR=${STATE_DIRECTORY:?STATE_DIRECTORY is required}
+readonly FAILURE_FILE=${STATE_DIR}/consecutive-failures
+readonly SOURCE_DIR=${RUNTIME_DIRECTORY:?RUNTIME_DIRECTORY is required}
+readonly MIN_SUCCESS=2
+readonly MAX_SPREAD=5
+readonly MAX_MEDIAN=30
+readonly NORMAL_MEDIAN=5
+readonly MAX_OFFSET=30
+readonly FAILURE_STOP_THRESHOLD=6
+
+readonly -a SOURCES=(
+  www.aliyun.com
+  www.qq.com
+  www.baidu.com
+)
+readonly -a OPERATORS=(
+  mainland-aliyun
+  mainland-qq
+  mainland-baidu
+)
+readonly -a REGIONS=(mainland mainland mainland)
+
+test -d "${LOG_DIR}" && test ! -L "${LOG_DIR}"
+test -d "${STATE_DIR}" && test ! -L "${STATE_DIR}"
+test -d "${SOURCE_DIR}" && test ! -L "${SOURCE_DIR}"
+touch "${LOG_FILE}"
+chown root:root "${LOG_FILE}"
+chmod 0600 "${LOG_FILE}"
+touch "${FAILURE_FILE}"
+chown root:root "${FAILURE_FILE}"
+chmod 0600 "${FAILURE_FILE}"
+
+exec >>"${LOG_FILE}" 2>&1
+printf '\n[%s] trial_only_http_consensus round start\n' "$(/bin/date --iso-8601=seconds)"
+
+if [[ ! -x "${HTPDATE}" ]]; then
+  echo "trial_time_gate_failed reason=htpdate_missing"
+  exit 1
+fi
+
+success_count=0
+international_count=0
+mainland_count=0
+successful_sources=()
+offset_file="${SOURCE_DIR}/offsets"
+: >"${offset_file}"
+
+for i in "${!SOURCES[@]}"; do
+  source="${SOURCES[$i]}"
+  operator="${OPERATORS[$i]}"
+  region="${REGIONS[$i]}"
+  output="${SOURCE_DIR}/${i}.out"
+  printf 'query source=%s operator=%s region=%s\n' "${source}" "${operator}" "${region}"
+
+  set +e
+  "${HTPDATE}" -q -d -4 -n "${source}" >"${output}" 2>&1
+  rc=$?
+  set -e
+
+  # htpdate 1.3.7 -d 输出唯一受信偏移字段为 `offset: <seconds>`；不读取或解析 HTTP Date。
+  offset="$(awk 'tolower($1)=="offset:" { value=$2 } END { if (value != "") print value }' "${output}")"
+  if [[ ${rc} -ne 0 || -z "${offset}" ]] || ! awk -v x="${offset}" 'BEGIN { exit !(x == x && x ~ /^[-+]?[0-9]+([.][0-9]+)?$/) }'; then
+    printf 'query_failed source=%s rc=%s offset=%s\n' "${source}" "${rc}" "${offset:-missing}"
+    continue
+  fi
+
+  printf '%s %s %s\n' "${offset}" "${operator}" "${region}" >>"${offset_file}"
+  success_count=$((success_count + 1))
+  if [[ "${region}" == international ]]; then
+    international_count=$((international_count + 1))
+  else
+    mainland_count=$((mainland_count + 1))
+  fi
+  successful_sources+=("${source}")
+  printf 'query_ok source=%s offset=%s\n' "${source}" "${offset}"
+done
+
+if [[ ${success_count} -lt ${MIN_SUCCESS} || ${mainland_count} -ne ${success_count} ]]; then
+  echo "trial_time_gate_failed reason=source_count_or_region success=${success_count} international=${international_count} mainland=${mainland_count}"
+  failure=1
+else
+  sorted="${SOURCE_DIR}/sorted"
+  awk '{ print $1 }' "${offset_file}" | LC_ALL=C sort -n >"${sorted}"
+  gate="$(awk -v max_spread="${MAX_SPREAD}" -v max_median="${MAX_MEDIAN}" -v normal_median="${NORMAL_MEDIAN}" -v max_offset="${MAX_OFFSET}" '
+    { values[NR]=$1; sum += $1; if (NR==1 || $1<min) min=$1; if (NR==1 || $1>max) max=$1; abs=($1<0)?-$1:$1; if (NR==1 || abs>maxabs) maxabs=abs }
+    END {
+      n=NR; if (n<2) { print "fail"; exit }
+      if (n%2) median=values[(n+1)/2]; else median=(values[n/2]+values[n/2+1])/2
+      absmedian=(median<0)?-median:median
+      spread=max-min
+      hard=(absmedian > max_median || maxabs > max_offset)?1:0
+      class=(absmedian <= normal_median)?"normal":"warning"
+      if (spread <= max_spread && absmedian <= max_median && maxabs <= max_offset) printf "pass class=%s median=%.6f spread=%.6f maxabs=%.6f success=%d hard=0\n", class, median, spread, maxabs, n
+      else printf "fail class=%s median=%.6f spread=%.6f maxabs=%.6f success=%d hard=%d\n", class, median, spread, maxabs, n, hard
+    }' "${sorted}")"
+  echo "consensus_gate ${gate}"
+  if [[ "${gate}" != pass* ]]; then
+    echo "trial_time_gate_failed reason=offset_spread_or_median"
+    failure=1
+    if [[ "${gate}" == *"hard=1"* ]]; then hard_stop=1; fi
+  else
+    printf 'adjust_start sources=%s\n' "$(IFS=,; echo "${successful_sources[*]}")"
+    set +e
+    "${HTPDATE}" -a -l -d -4 -n "${successful_sources[@]}"
+    adjust_rc=$?
+    set -e
+    if [[ ${adjust_rc} -ne 0 ]]; then
+      echo "trial_time_gate_failed reason=adjust_rc rc=${adjust_rc}"
+      failure=1
+    else
+      echo "adjust_ok"
+      failure=0
+    fi
+  fi
+fi
+
+if [[ ${failure:-1} -eq 0 ]]; then
+  printf '0\n' >"${FAILURE_FILE}.tmp"
+  chown root:root "${FAILURE_FILE}.tmp"
+  chmod 0600 "${FAILURE_FILE}.tmp"
+  mv -f "${FAILURE_FILE}.tmp" "${FAILURE_FILE}"
+  echo "trial_time_gate_success consecutive_failures=0"
+  exit 0
+fi
+
+previous="$(cat "${FAILURE_FILE}" 2>/dev/null || echo 0)"
+if ! [[ "${previous}" =~ ^[0-9]+$ ]]; then previous=0; fi
+current=$((previous + 1))
+printf '%s\n' "${current}" >"${FAILURE_FILE}.tmp"
+chown root:root "${FAILURE_FILE}.tmp"
+chmod 0600 "${FAILURE_FILE}.tmp"
+mv -f "${FAILURE_FILE}.tmp" "${FAILURE_FILE}"
+echo "trial_time_gate_failure consecutive_failures=${current}"
+
+if [[ ${current} -ge ${FAILURE_STOP_THRESHOLD} || ${hard_stop:-0} -eq 1 ]]; then
+  echo "trial_time_gate_failed consecutive_failures=${current} hard_stop=${hard_stop:-0} stopping_owned_test_units"
+  for unit in postgresql.service nginx.service qimao-backend.service qimao-terms-cloud-worker.service; do
+    if /bin/systemctl cat "${unit}" >/dev/null 2>&1 && [[ "$(/bin/systemctl show "${unit}" -p ActiveState --value)" == active ]]; then
+      /bin/systemctl stop "${unit}"
+      echo "owned_unit_stopped unit=${unit}"
+    fi
+  done
+fi
+exit 1

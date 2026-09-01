@@ -21,11 +21,11 @@ export class AsrService {
     private readonly reads: AsrReadRepository,
     private readonly eligibility: AsrEligibilityRepository,
     private readonly dispatches: AsrDispatchRepository,
-    private readonly fakeEnabled: boolean,
+    private readonly asrCommandsEnabled: boolean,
   ) {}
 
   create(projectId: string, body: CreateAsrBatchBody, idempotencyKey: string) {
-    if (!this.fakeEnabled) {
+    if (!this.asrCommandsEnabled) {
       throw new AsrDomainError(
         'ASR_FAKE_DISABLED',
         '生产环境未启用模拟识别，真实供应商仍需单独授权。',
@@ -63,7 +63,7 @@ export class AsrService {
     idempotencyKey: string,
     requestId: string,
   ) {
-    if (!this.fakeEnabled) {
+    if (!this.asrCommandsEnabled) {
       throw new AsrDomainError(
         'ASR_FAKE_DISABLED',
         '生产环境未启用模拟识别，真实供应商仍需单独授权。',
@@ -96,12 +96,18 @@ export class AsrService {
     return batch;
   }
 
+  async compareSrt(projectId: string, batchId: string) {
+    const comparison = await this.reads.compareSrt(projectId, batchId);
+    if (!comparison) throw asrNotFound('ASR_BATCH_NOT_FOUND', 'ASR 批次不存在。');
+    return comparison;
+  }
+
   cancel(projectId: string, batchId: string, idempotencyKey: string) {
     return this.commands.cancel({ projectId, batchId, idempotencyKey });
   }
 
   retry(projectId: string, batchId: string, body: RetryAsrBatchBody, idempotencyKey: string) {
-    if (!this.fakeEnabled) {
+    if (!this.asrCommandsEnabled) {
       throw new AsrDomainError(
         'ASR_FAKE_DISABLED',
         '生产环境未启用模拟识别，真实供应商仍需单独授权。',

@@ -82,12 +82,12 @@ export class AsrEligibilityRepository {
       blockers.push(blocker('ASR_PROJECT_NOT_ACTIVE', '项目已进入回收流程。', 'restore_project'));
     }
     const termVersion = await client.query<{ id: string }>(
-      'SELECT id FROM term_versions WHERE project_id = $1 ORDER BY version DESC, id DESC LIMIT 1',
+      `SELECT version.id FROM term_versions version
+         JOIN term_drafts draft ON draft.id = version.draft_id
+        WHERE version.project_id = $1 AND draft.status = 'confirmed'
+        ORDER BY version.version DESC, version.id DESC LIMIT 1`,
       [projectId],
     );
-    if (!termVersion.rows[0]) {
-      blockers.push(blocker('ASR_TERM_VERSION_NOT_FOUND', '项目还没有已确认术语版本。', 'confirm_terms'));
-    }
     const manifest = await client.query<{ id: string }>(
       'SELECT id FROM material_manifests WHERE project_id = $1 ORDER BY version DESC, id DESC LIMIT 1',
       [projectId],
@@ -135,9 +135,9 @@ export class AsrEligibilityRepository {
             'prepare_asr_videos',
           ));
         }
-        if (termVersion.rows[0]) {
+        {
           const projection = applyAsrHotwordCapabilities(
-            await buildHotwordProjection(client, termVersion.rows[0].id),
+            await buildHotwordProjection(client, termVersion.rows[0]?.id ?? null),
             this.adapterDescriptor,
           );
           hotwords = projection.summary;
@@ -153,7 +153,7 @@ export class AsrEligibilityRepository {
                    WHERE result.project_id = $1
                      AND result.episode_number = source.episode_number
                      AND result.asset_id = source.asset_id
-                     AND result.term_version_id = $4
+                     AND result.term_version_id IS NOT DISTINCT FROM $4
                      AND result.config_digest = $5
                      AND result.hotword_digest = $6
                      AND result.quality_status IN ('pass','warning')
@@ -161,7 +161,7 @@ export class AsrEligibilityRepository {
               [projectId,
                 readySources.map((source) => source.episode_number),
                 readySources.map((source) => source.asset_id),
-                termVersion.rows[0].id,
+                termVersion.rows[0]?.id ?? null,
                 this.adapterDescriptor.configDigest,
                 projection.summary.digest],
             );
@@ -247,11 +247,22 @@ export class AsrEligibilityRepository {
     if (project.rows[0].lifecycle_status !== 'active') {
       throw asrConflict('ASR_PROJECT_NOT_ACTIVE', '项目已进入回收流程，不能准备识别批次。', 'restore_project');
     }
-    const termVersion = await client.query(
-      'SELECT id FROM term_versions WHERE id = $1 AND project_id = $2',
-      [query.termVersionId, projectId],
-    );
-    if (!termVersion.rows[0]) {
+    const termVersion = query.termVersionId !== undefined && query.termVersionId !== null
+      ? await client.query<{ id: string }>(
+        `SELECT version.id FROM term_versions version JOIN term_drafts draft ON draft.id = version.draft_id
+          WHERE version.id = $1 AND version.project_id = $2 AND draft.status = 'confirmed'`,
+        [query.termVersionId, projectId],
+      )
+      : await client.query<{ id: string }>(
+        `SELECT version.id FROM term_versions version JOIN term_drafts draft ON draft.id = version.draft_id
+          WHERE version.project_id = $1 AND draft.status = 'confirmed'
+          ORDER BY version.version DESC, version.id DESC LIMIT 1`,
+        [projectId],
+      );
+    const lockedTermVersionId = query.termVersionId === null
+      ? null
+      : termVersion.rows[0]?.id ?? null;
+    if (query.termVersionId !== undefined && query.termVersionId !== null && !lockedTermVersionId) {
       throw asrInvalid(
         'ASR_TERM_VERSION_NOT_FOUND',
         '必须选择属于当前项目的已确认术语版本。',
@@ -292,7 +303,7 @@ export class AsrEligibilityRepository {
       [manifest.rows[0].id, episodeNumbers],
     );
     const hotwords = applyAsrHotwordCapabilities(
-      await buildHotwordProjection(client, query.termVersionId),
+      await buildHotwordProjection(client, lockedTermVersionId),
       this.adapterDescriptor,
     );
     const readySources = sources.rows.filter(
@@ -315,14 +326,14 @@ export class AsrEligibilityRepository {
            FROM asr_results result
            JOIN unnest($2::integer[], $3::uuid[]) AS source(episode_number, asset_id)
              ON source.episode_number = result.episode_number AND source.asset_id = result.asset_id
-          WHERE result.project_id = $1 AND result.term_version_id = $4
+          WHERE result.project_id = $1 AND result.term_version_id IS NOT DISTINCT FROM $4
             AND result.config_digest = $5 AND result.hotword_digest = $6
             AND result.quality_status IN ('pass','warning')
           ORDER BY result.episode_number, result.asset_id, result.revision DESC, result.id DESC`,
         [projectId,
           readySources.map((source) => source.episode_number),
           readySources.map((source) => source.asset_id),
-          query.termVersionId,
+          lockedTermVersionId,
           this.adapterDescriptor.configDigest,
           hotwords.summary.digest],
       );
@@ -368,7 +379,7 @@ export class AsrEligibilityRepository {
     const blocked = episodes.filter((episode) => episode.status === 'blocked').length;
     return {
       projectId,
-      termVersionId: query.termVersionId,
+      termVersionId: lockedTermVersionId,
       manifestId: manifest.rows[0].id,
       manifestVersion: manifest.rows[0].version,
       provider: this.adapterDescriptor.provider,
@@ -506,7 +517,6 @@ export class AsrEligibilityRepository {
            SELECT *, CASE
              WHEN lifecycle_status <> 'active' THEN 'blocked'
              WHEN active_batch_count > 0 THEN 'active'
-             WHEN term_version_id IS NULL THEN 'missing_terms'
              WHEN manifest_id IS NULL OR total_episodes = 0 OR ready_episodes <> total_episodes
                THEN 'missing_videos'
              WHEN latest_batch_status IN ('failed','partial','reconciliation_required') THEN 'failed'

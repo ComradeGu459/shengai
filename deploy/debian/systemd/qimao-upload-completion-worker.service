@@ -1,0 +1,33 @@
+[Unit]
+Description=Qimao Terms Cloud upload completion worker
+After=network-online.target postgresql.service qimao-backend.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=qimao
+Group=qimao
+WorkingDirectory=/opt/qimao-terms-cloud/current
+EnvironmentFile=/etc/qimao-terms-cloud/backend.env
+EnvironmentFile=/etc/qimao-terms-cloud/object-storage.env
+Environment=NODE_ENV=production
+ExecStartPre=/usr/bin/test -r /etc/qimao-terms-cloud/backend.env
+ExecStartPre=/usr/bin/test -r /etc/qimao-terms-cloud/object-storage.env
+ExecStartPre=/usr/bin/test -r /opt/qimao-terms-cloud/current/backend/dist/workers/upload-completion.worker.entry.js
+ExecStart=/usr/local/bin/node --preserve-symlinks-main /opt/qimao-terms-cloud/current/backend/dist/workers/upload-completion.worker.entry.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/qimao-terms-cloud
+UMask=0027
+StandardOutput=append:/var/log/qimao-terms-cloud/upload-completion-worker.log
+StandardError=append:/var/log/qimao-terms-cloud/upload-completion-worker.error.log
+
+[Install]
+WantedBy=multi-user.target

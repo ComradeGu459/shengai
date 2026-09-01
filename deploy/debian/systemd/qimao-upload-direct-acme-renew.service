@@ -1,0 +1,13 @@
+[Unit]
+Description=Renew upload.milaidi.online TLS certificate
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/usr/bin/certbot
+ConditionPathExists=/etc/letsencrypt/live/upload.milaidi.online/fullchain.pem
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/certbot renew --quiet --deploy-hook=/usr/local/sbin/qimao-upload-direct-acme-reload
+PrivateTmp=true
+ProtectHome=true
+NoNewPrivileges=true

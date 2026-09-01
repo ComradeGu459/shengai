@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto';
 import {
   ApiErrorSchema,
   ProjectLifecycleCommandBodySchema,
+  PurgeProjectCommandParamsSchema,
+  PurgeProjectCommandResultSchema,
   RecycleProjectCommandResultSchema,
   RecycleBinListSchema,
   RecycleBinQuerySchema,
@@ -76,6 +78,25 @@ export const projectLifecycleRoutes: FastifyPluginAsyncTypebox = async (app) => 
     throw error;
   };
 
+  app.get('/api/projects/:projectId/purge/commands/:commandId', {
+    schema: {
+      params: PurgeProjectCommandParamsSchema,
+      response: {
+        200: PurgeProjectCommandResultSchema,
+        404: ApiErrorSchema,
+      },
+    },
+  }, async (request, reply) => {
+    const project = await service.findPurgeCommand({
+      projectId: request.params.projectId,
+      idempotencyKey: request.params.commandId,
+    });
+    if (!project) {
+      return sendError(reply, request.id, 404, 'PURGE_COMMAND_NOT_FOUND', '永久删除命令不存在。', false, 'reload_recycle_bin');
+    }
+    return reply.send({ project });
+  });
+
   app.post('/api/projects/:projectId/recycle', {
     schema: {
       params: ProjectParamsSchema,
@@ -98,7 +119,7 @@ export const projectLifecycleRoutes: FastifyPluginAsyncTypebox = async (app) => 
           projectId: request.params.projectId,
           expectedVersion: request.body.expectedVersion,
         }),
-        actor: 'local-user',
+        actor: request.employeePrincipal?.subject ?? 'local-user',
       });
       return reply.code(result.replay ? 200 : 201).send({
         project: result.project,
@@ -130,11 +151,41 @@ export const projectLifecycleRoutes: FastifyPluginAsyncTypebox = async (app) => 
           projectId: request.params.projectId,
           expectedVersion: request.body.expectedVersion,
         }),
-        actor: 'local-user',
+        actor: request.employeePrincipal?.subject ?? 'local-user',
       });
       return reply.send({
         project: result.project,
       });
+    } catch (error) {
+      return handleLifecycleError(error, request.id, reply);
+    }
+  });
+
+  app.post('/api/projects/:projectId/purge', {
+    schema: {
+      params: ProjectParamsSchema,
+      headers: IdempotencyHeadersSchema,
+      body: ProjectLifecycleCommandBodySchema,
+      response: {
+        200: PurgeProjectCommandResultSchema,
+        201: PurgeProjectCommandResultSchema,
+        404: ApiErrorSchema,
+        409: ApiErrorSchema,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const result = await service.purge({
+        projectId: request.params.projectId,
+        expectedVersion: request.body.expectedVersion,
+        idempotencyKey: request.headers['idempotency-key'],
+        requestHash: requestHash({
+          projectId: request.params.projectId,
+          expectedVersion: request.body.expectedVersion,
+        }),
+        actor: request.employeePrincipal?.subject ?? 'local-user',
+      });
+      return reply.code(result.replay ? 200 : 201).send({ project: result.project });
     } catch (error) {
       return handleLifecycleError(error, request.id, reply);
     }

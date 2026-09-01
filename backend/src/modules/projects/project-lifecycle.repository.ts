@@ -371,6 +371,106 @@ export class ProjectLifecycleRepository {
     }
   }
 
+  async purge(input: {
+    projectId: string;
+    expectedVersion: number;
+    idempotencyKey: string;
+    requestHash: string;
+    actor: string;
+    now: Date;
+  }): Promise<{ project: Project; replay: boolean }> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+        `project-lifecycle:${input.idempotencyKey}`,
+      ]);
+      const existing = await findLifecycleCommand(client, input.idempotencyKey);
+      if (existing) {
+        assertCommandMatches(existing, { commandKind: 'purge_project', ...input });
+        await client.query('COMMIT');
+        return { project: existing.result_project, replay: true };
+      }
+
+      const projectResult = await client.query<ProjectRow>(
+        `SELECT ${projectColumns} FROM projects WHERE id = $1 FOR UPDATE`,
+        [input.projectId],
+      );
+      const current = projectResult.rows[0];
+      if (!current || current.lifecycle_status === 'purged') throw new ProjectLifecycleNotFoundError();
+      if (current.lifecycle_status === 'purging') throw new ProjectLifecycleStateError('PROJECT_PURGING');
+      if (current.lifecycle_status !== 'recycled') throw new ProjectLifecycleStateError('PROJECT_NOT_RECYCLED');
+      if (current.version !== input.expectedVersion) {
+        throw new ProjectLifecycleVersionConflictError(current.version);
+      }
+
+      const updatedResult = await client.query<ProjectRow>(
+        `UPDATE projects
+            SET lifecycle_status = 'purging', version = version + 1,
+                updated_at = $2, updated_by = $3
+          WHERE id = $1
+        RETURNING ${projectColumns}`,
+        [input.projectId, input.now, input.actor],
+      );
+      const project = toProject(updatedResult.rows[0]!);
+      await client.query(
+        `INSERT INTO cleanup_jobs
+           (project_id, status, attempt_count, lease_owner, lease_expires_at,
+            next_attempt_at, last_error, completed_at, created_at, updated_at)
+         VALUES ($1, 'scheduled', 0, NULL, NULL, $2, NULL, NULL, $3, $3)
+         ON CONFLICT (project_id) DO UPDATE
+           SET status = 'scheduled', attempt_count = 0, lease_owner = NULL,
+               lease_expires_at = NULL, next_attempt_at = EXCLUDED.next_attempt_at,
+               last_error = NULL, completed_at = NULL, updated_at = EXCLUDED.updated_at`,
+        [input.projectId, input.now, input.now],
+      );
+      await client.query(
+        `INSERT INTO project_lifecycle_audit_events (project_id, event_kind, details, created_at)
+         VALUES ($1, 'project_purge_requested', '{}', $2)`,
+        [input.projectId, input.now],
+      );
+      await client.query(
+        `INSERT INTO project_lifecycle_commands
+           (idempotency_key, command_kind, project_id, request_hash, result_project,
+            terminated_upload_count, created_at)
+         VALUES ($1, 'purge_project', $2, $3, $4, 0, $5)`,
+        [input.idempotencyKey, input.projectId, input.requestHash, JSON.stringify(project), input.now],
+      );
+      await client.query('COMMIT');
+      return { project, replay: false };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async findPurgeCommand(input: { projectId: string; idempotencyKey: string }): Promise<Project | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+        `project-lifecycle:${input.idempotencyKey}`,
+      ]);
+      const result = await client.query<Pick<LifecycleCommandRow, 'result_project'>>(
+        `SELECT result_project
+           FROM project_lifecycle_commands
+          WHERE project_id = $1
+            AND idempotency_key = $2
+            AND command_kind = 'purge_project'`,
+        [input.projectId, input.idempotencyKey],
+      );
+      await client.query('COMMIT');
+      return result.rows[0]?.result_project ?? null;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async listRecycleBin(input: RecycleBinQuery): Promise<RecycleBinList> {
     const values: unknown[] = [];
     const predicates = [`project.lifecycle_status IN ('recycled', 'purging')`];
@@ -610,7 +710,11 @@ export class ProjectLifecycleRepository {
       await client.query('DELETE FROM upload_sessions WHERE project_id = $1', [input.job.projectId]);
       await client.query('DELETE FROM assets WHERE project_id = $1', [input.job.projectId]);
       await client.query('DELETE FROM project_commands WHERE project_id = $1', [input.job.projectId]);
-      await client.query('DELETE FROM project_lifecycle_commands WHERE project_id = $1', [input.job.projectId]);
+      await client.query(
+        `DELETE FROM project_lifecycle_commands
+          WHERE project_id = $1 AND command_kind <> 'purge_project'`,
+        [input.job.projectId],
+      );
       await client.query('DELETE FROM project_lifecycle_audit_events WHERE project_id = $1', [input.job.projectId]);
       await client.query(
         `INSERT INTO project_purge_tombstones

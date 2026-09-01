@@ -76,6 +76,20 @@ export const RecycleProjectCommandResultSchema = Type.Object({
   terminatedUploadCount: Type.Integer({ minimum: 0 }),
 });
 
+export const PurgeProjectCommandResultSchema = Type.Object({
+  project: ProjectSchema,
+});
+
+/**
+ * purge 的稳定只读恢复身份。
+ * commandId 与 POST 的 Idempotency-Key 是同一身份；命令记录只有在
+ * purge 事务提交后才存在，因此 GET 不伪造 queued/unknown 状态。
+ */
+export const PurgeProjectCommandParamsSchema = Type.Object({
+  projectId: Type.String({ format: 'uuid' }),
+  commandId: Type.String({ minLength: 8, maxLength: 200 }),
+}, { additionalProperties: false });
+
 export const ProjectLifecycleCommandResultSchema = RestoreProjectCommandResultSchema;
 
 export type ProjectLifecycleCommandBody = Static<typeof ProjectLifecycleCommandBodySchema>;
@@ -86,6 +100,8 @@ export type RecycleBinItem = Static<typeof RecycleBinItemSchema>;
 export type RecycleBinList = Static<typeof RecycleBinListSchema>;
 export type RestoreProjectCommandResult = Static<typeof RestoreProjectCommandResultSchema>;
 export type RecycleProjectCommandResult = Static<typeof RecycleProjectCommandResultSchema>;
+export type PurgeProjectCommandResult = Static<typeof PurgeProjectCommandResultSchema>;
+export type PurgeProjectCommandParams = Static<typeof PurgeProjectCommandParamsSchema>;
 export type ProjectLifecycleCommandResult = RestoreProjectCommandResult;
 
 void LifecycleStatusSchema;

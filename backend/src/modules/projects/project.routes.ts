@@ -17,6 +17,11 @@ const IdempotencyHeadersSchema = Type.Object({
 });
 const ProjectParamsSchema = Type.Object({ projectId: Type.String({ format: 'uuid' }) });
 
+const parseProjectListPagination = (query: { limit?: number | string; offset?: number | string }) => ({
+  limit: Number(query.limit ?? 50),
+  offset: Number(query.offset ?? 0),
+});
+
 export const projectRoutes: FastifyPluginAsyncTypebox = async (app) => {
   const repository = new ProjectRepository(app.database);
 
@@ -48,18 +53,19 @@ export const projectRoutes: FastifyPluginAsyncTypebox = async (app) => {
         querystring: ListProjectsQuerySchema,
         response: {
           200: ProjectListSchema,
+          400: ApiErrorSchema,
           500: ApiErrorSchema,
         },
       },
     },
     async (request) => {
       const query = request.query;
+      const pagination = parseProjectListPagination(query);
       return repository.list({
         ...(query.search?.trim() ? { search: query.search.trim() } : {}),
         ...(query.workflowStatus ? { workflowStatus: query.workflowStatus } : {}),
         lifecycleStatus: query.lifecycleStatus ?? 'active',
-        limit: query.limit ?? 50,
-        offset: query.offset ?? 0,
+        ...pagination,
       });
     },
   );
@@ -97,7 +103,7 @@ export const projectRoutes: FastifyPluginAsyncTypebox = async (app) => {
         result = await repository.create({
           name,
           idempotencyKey: request.headers['idempotency-key'],
-          actor: 'local-user',
+          actor: request.employeePrincipal?.subject ?? 'local-user',
         });
       } catch (error) {
         if (error instanceof IdempotencyConflictError) {

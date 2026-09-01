@@ -10,6 +10,7 @@ import type {
 } from '@qimao-terms-cloud/contracts';
 
 import { AsrApiError } from './api.js';
+import { createUuid } from '../../platform/randomUuid.js';
 
 export const batchStatusLabels: Record<AsrBatchStatus, string> = {
   blocked: '已阻断',
@@ -44,6 +45,7 @@ export const receiptLabels: Record<AsrHotwordReceiptStatus, string> = {
   simulated: '模拟已应用',
   submitted: '已提交',
   partially_submitted: '部分提交',
+  unused: '未使用',
   unsupported: '不支持热词',
   unknown: '回执未知',
 };
@@ -58,6 +60,7 @@ export const hotwordOmissionReasonLabels: Record<AsrHotwordOmissionReason, strin
 
 export const hotwordReceiptReasonLabels: Record<AsrHotwordReceiptReason, string> = {
   partial_submission: '适配器仅接受部分热词',
+  no_confirmed_term_version: '没有已确认术语版本',
   unsupported: '适配器不支持热词',
   unknown: '提交结果未知',
 };
@@ -97,4 +100,15 @@ export const isUnknownAsrResult = (error: unknown) =>
 export const stableIntent = <T extends { signature: string; key: string }>(
   current: T | null,
   signature: string,
-) => current?.signature === signature ? current : ({ signature, key: crypto.randomUUID() } as T);
+) => current?.signature === signature ? current : ({ signature, key: createUuid() } as T);
+
+export interface AsrRuntimeSnapshot {
+  provider: string;
+  adapter: string;
+  model: string;
+  language: string;
+  configDigest: string;
+}
+
+export const formatRuntimeSnapshot = ({ provider, adapter, model }: AsrRuntimeSnapshot) =>
+  `${provider} · ${adapter} · ${model}`;

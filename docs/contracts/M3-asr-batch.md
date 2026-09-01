@@ -100,16 +100,20 @@ PostgreSQL 是批次、逐集任务、尝试、结果、状态、用量和审计
 - 通过匿名脚本化输入生成确定 Cue、警告、失败、未知结果、取消和租约恢复场景；
 - UI 必须明显显示“模拟识别”，历史记录保存 `provider=fake`，不得冒充真实识别。
 
-S2 同时必须建立可替换的正式适配边界，但不实现任何真实厂商空壳：
+S2 同时建立可替换的正式适配边界；本切片加入腾讯云录音文件适配器候选，但仍保持显式注入、默认 fake：
 
 - 批次、Job、Attempt、Result、Cue、Usage 和前端人工流程只依赖统一 ASR 领域契约，不依赖某一家厂商 SDK、回调结构或错误码；
 - 适配器必须声明稳定的 `provider / adapter / model / language / configDigest` 元数据；共享读取契约允许返回已登记的厂商标识，不把这些字段限定为 fake 字面量；
 - Worker 按批次保存的适配器标识从后端登记表解析适配器，默认仍只有 `deterministic_fake`，员工请求不能任意指定未批准厂商；
 - 内部执行输入至少能取得不可变 Asset 的 `assetId / objectKey / originalFilename / mediaKind / sizeBytes / checksum`，以及与 `hotwordDigest` 一致的实际热词投影；普通 API 和日志仍只返回热词摘要，不暴露完整术语或对象地址；
 - 适配器输出统一映射 Cue、质量、供应商请求标识、可重试/未知结果和标准化用量事实；Usage 持久化不得由仓储写死为 fake，fake 只是返回全零的同构用量；
-- 增加第二个仅测试用、零网络的匿名 stub 通过同一注册、执行和持久化路径，证明新增真实厂商不需要修改批次/Job/结果状态机或公开 API 形状；不得因此添加阿里云、腾讯云、火山、讯飞等未授权厂商代码、SDK 或密钥占位。
+- 腾讯适配器只依赖注入的官方 SDK 方法边界 `CreateRecTask` / `DescribeTaskStatus` 和私有 COS 短时 GET URL；它不读取或复制整对象，不把供应商原始错误、URL 或密钥写入结果/日志；默认注册表不启用它。
+- 腾讯任务一旦取得 `TaskId`，后续执行只查询同一标识；查询超时、状态未知或进程恢复均返回 `reconciliation_required`，禁止盲目再次 `CreateRecTask`。未受理和鉴权拒绝分别映射为稳定失败事实。
+- 生产装配仅在后端 Worker 的 root-only 环境或等价注入引用中显式开启：`QIMAO_TENCENT_ASR_ENABLED=true`、`QIMAO_TENCENT_ASR_REGION`、`QIMAO_TENCENT_ASR_SECRET_ID`、`QIMAO_TENCENT_ASR_SECRET_KEY`；任一缺失/半配置在启动前 fail-closed，生产不回退 deterministic fake。SDK 仅使用官方 Node 包 `tencentcloud-sdk-nodejs-asr`（不得进入浏览器），API endpoint 固定为 `asr.tencentcloudapi.com`，Region 由服务端配置。
+- COS 源对象只由既有 Asset/objectKey 派生并通过注入的 COS 预签名器签发单对象 HTTPS GET，TTL 默认且上限 600 秒；COS 凭据与腾讯 AI Secret 分离，二者均不进入前端、普通响应或日志。
+- 适配器的真实 SDK 客户端、Secret 引用、价格/额度配置和生产路由仍需单独授权；本切片只提供零网络可注入实现与专项测试，不改变批次/Job/结果状态机或公开 API 形状。
 
-真实 API 进入前必须另行完成：
+真实 API 进入生产前仍必须另行完成：
 
 1. 基于当前官方文档的中文准确率、热词支持、时间戳、文件上限、异步回调、数据留存和价格选品；
 2. 用户明确批准供应商、少量测试范围、预算上限和密钥使用；

@@ -87,6 +87,16 @@
 .rejected { color: #9b2d2d; background: #ffebe9; }
 .staleNotice { padding: 10px 12px; margin-top: 12px; color: #6b4a00; background: #fff9e8; border-radius: 8px; }
 .blockerList { display: flex; flex-direction: column; gap: 5px; padding: 11px 12px; margin-top: 12px; color: #8f2828; background: #fff3f2; border-radius: 8px; }
+.policyBlockNotice { display: grid; gap: 12px; padding: 14px; margin-top: 12px; color: #7f2929; background: #fff4f3; border: 1px solid #f0c5c1; border-radius: 9px; }
+.policyBlockNotice > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.policyBlockNotice > header > div { display: flex; flex-direction: column; gap: 4px; }
+.policyBlockNotice header span, .policyBlockNotice p, .policyBlockFacts span, .policyBlockFacts small { color: inherit; font-size: 12px; line-height: 1.5; }
+.policyBlockNotice header a { min-height: 36px; flex: 0 0 auto; display: inline-flex; align-items: center; padding: 0 12px; color: #7f2929; font-weight: 650; text-decoration: none; background: #fff; border: 1px solid #dca8a3; border-radius: 8px; }
+.policyBlockNotice header a:hover { text-decoration: underline; text-underline-offset: 3px; }
+.policyBlockFacts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; overflow: hidden; background: #f0c5c1; border: 1px solid #f0c5c1; border-radius: 8px; }
+.policyBlockFacts > div { min-width: 0; display: flex; flex-direction: column; gap: 4px; padding: 10px 11px; background: #fff; }
+.policyBlockFacts strong { font-size: 12px; overflow-wrap: anywhere; }
+.policyBlockNotice p { margin: 0; }
 
 .pageState, .emptyState, .listError { min-height: 300px; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 36px; text-align: center; border: 1px solid var(--border); border-radius: 12px; }
 .emptyState, .listError { min-height: 250px; margin-top: 0; border-radius: 0 0 12px 12px; }
@@ -168,6 +178,26 @@
 .attemptHistory small { color: var(--text-muted); }
 .attemptHistory p { margin: 0; color: #8f2828; font-size: 12px; }
 
+.srtComparisonContent { display: grid; gap: 14px; }
+.comparisonSummary { display: flex; flex-direction: column; gap: 4px; padding: 11px 12px; color: var(--text-secondary); background: var(--surface-subtle); border: 1px solid var(--border); border-radius: 8px; }
+.comparisonSummary strong { color: var(--text-primary); }
+.comparisonSummary span, .comparisonEpisode header small { color: var(--text-muted); font-size: 12px; line-height: 1.5; }
+.comparisonEpisode { display: grid; gap: 10px; padding: 12px; background: #fff; border: 1px solid var(--border); border-radius: 9px; }
+.comparisonEpisode > header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.comparisonEpisode > header span { color: var(--accent); font-size: 12px; }
+.comparisonSample { display: grid; gap: 9px; padding-top: 10px; border-top: 1px solid var(--border); }
+.comparisonSample h4 { margin: 0; font-size: 13px; }
+.compareColumns { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.compareColumns > div { min-width: 0; padding: 9px 10px; background: var(--surface-subtle); border-radius: 8px; }
+.compareLabel { color: var(--text-muted); font-size: 11px; }
+.compareColumns p { margin: 7px 0 0; line-height: 1.5; overflow-wrap: anywhere; }
+.compareColumns p small { display: block; margin-top: 3px; color: var(--text-muted); font-size: 11px; }
+.comparisonEmpty { color: var(--text-muted); }
+.mappingFact { margin: 0; color: var(--text-secondary); font-size: 12px; }
+.reviewOptions { display: flex; flex-wrap: wrap; gap: 7px; }
+.reviewOptions button { min-height: 32px; padding: 0 10px; color: var(--text-secondary); background: #fff; border: 1px solid var(--border-strong); border-radius: 7px; }
+.reviewOptions button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+
 @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
 @media (max-width: 1180px) {
   .gateSummary { grid-template-columns: repeat(4, minmax(100px, 1fr)); }
@@ -175,6 +205,7 @@
   .toolbar { flex-wrap: wrap; }
   .searchField { flex-basis: 260px; }
   .detailFacts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .policyBlockFacts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 1040px) {
   .projectContext { align-items: flex-start; flex-direction: column; padding-top: 12px; padding-bottom: 12px; }
@@ -185,10 +216,12 @@
   .batchDetail > header > div:last-child { flex-wrap: wrap; }
 }
 @media (max-width: 720px) {
-  .gateSummary, .detailFacts, .identitySummary { grid-template-columns: 1fr; }
+  .gateSummary, .detailFacts, .identitySummary, .policyBlockFacts { grid-template-columns: 1fr; }
   .gateSummary > button { grid-column: auto; }
   .pageNotice, .tableFooter { align-items: flex-start; flex-direction: column; }
   .toolbar label, .searchField { width: 100%; }
   .toolbar input, .toolbar select { flex: 1; min-width: 0; }
   .receiptRow { grid-template-columns: 1fr; }
+  .compareColumns { grid-template-columns: 1fr; }
+  .policyBlockNotice > header { flex-direction: column; }
 }

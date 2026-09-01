@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Qimao trial-only HTTP consensus every five minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Persistent=false
+RandomizedDelaySec=0
+Unit=qimao-htpdate-trial.service
+
+[Install]
+WantedBy=timers.target

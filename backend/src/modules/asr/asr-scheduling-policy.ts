@@ -14,8 +14,8 @@ export interface AsrSchedulingPolicyReader {
 export const developmentAsrSchedulingPolicy = Object.freeze<AsrSchedulingPolicy>({
   version: 'development-default-v1',
   source: 'development_default',
-  maxGlobalInFlight: 4,
-  maxPerProjectInFlight: 1,
+  maxGlobalInFlight: 20,
+  maxPerProjectInFlight: 20,
   maxStartsPerWindow: null,
   rateWindowMs: 60_000,
 });

@@ -88,7 +88,7 @@ export class ScreenTextReadRepository {
         COALESCE(c.rejected, 0)::int AS candidate_rejected,
         a.id AS attempt_id, a.attempt_number, a.status AS attempt_status,
         a.execution_kind, a.provider, a.adapter, a.model, a.language, a.deployment,
-        a.input_version, a.output_version, a.config_digest, a.capabilities, a.input_digest,
+        a.input_version, a.output_version, a.config_digest, a.runtime_config, a.runtime_config_digest, a.capabilities, a.input_digest,
         a.receipt, a.stats AS attempt_stats, a.usage, a.error_code, a.error_detail,
         a.retryable, a.created_at AS attempt_created_at
       FROM screen_text_jobs j
@@ -308,6 +308,7 @@ export class ScreenTextReadRepository {
         language: row.language, deployment: row.deployment, inputVersion: row.input_version,
         outputVersion: row.output_version, configDigest: row.config_digest, capabilities: row.capabilities,
       },
+      ...(row.runtime_config ? { runtimeConfig: row.runtime_config, runtimeConfigDigest: row.runtime_config_digest } : {}),
       frameStrategyVersion: row.frame_strategy_version,
       dedupeStrategyVersion: row.dedupe_strategy_version,
       termProjection: row.term_projection,
@@ -323,6 +324,8 @@ export class ScreenTextReadRepository {
       },
       status: row.status, revision: row.revision,
       counts, jobs: jobRows.map((job) => this.mapJob(job)),
+      routingVersionId: row.routing_version_id ?? null,
+      deploymentVersionId: row.deployment_version_id ?? null,
       createdAt: date(row.created_at), updatedAt: date(row.updated_at),
     };
   }
@@ -342,6 +345,8 @@ export class ScreenTextReadRepository {
         failed: number(row.job_failed), cancelled: number(row.job_cancelled),
         reconciliationRequired: number(row.job_reconciliation_required),
       },
+      routingVersionId: row.routing_version_id ?? null,
+      deploymentVersionId: row.deployment_version_id ?? null,
       createdAt: date(row.created_at), updatedAt: date(row.updated_at),
     };
   }
@@ -352,6 +357,16 @@ export class ScreenTextReadRepository {
       termVersionId: row.term_version_id, manifestId: row.manifest_id,
       draftRevision: row.draft_revision, releaseDigest: row.release_digest,
       cueCount: row.cue_count,
+      partial: row.partial === true,
+      excludedEpisodes: Array.isArray(row.excluded_episodes) ? row.excluded_episodes.map((item: any) => ({
+        episodeNumber: item.episodeNumber,
+        jobId: item.jobId,
+        status: item.status,
+        attemptId: item.attemptId ?? null,
+        errorCode: item.errorCode ?? null,
+        effectClass: item.effectClass ?? null,
+        providerRequestId: item.providerRequestId ?? null,
+      })) : [],
       exports: exportRows.map((item) => ({
         id: item.id, episodeNumber: item.episode_number, filename: item.filename,
         sha256: item.sha256, sizeBytes: item.size_bytes,
@@ -378,6 +393,7 @@ export class ScreenTextReadRepository {
           language: row.language, deployment: row.deployment, inputVersion: row.input_version,
           outputVersion: row.output_version, capabilities: row.capabilities, configDigest: row.config_digest,
         },
+        ...(row.runtime_config ? { runtimeConfig: row.runtime_config, runtimeConfigDigest: row.runtime_config_digest } : {}),
         inputDigest: row.input_digest, receipt: row.receipt, stats: row.attempt_stats,
         usage: row.usage, errorCode: row.error_code, errorDetail: row.error_detail,
         retryable: row.retryable, createdAt: date(row.attempt_created_at),

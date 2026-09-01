@@ -15,6 +15,7 @@ import {
   type RefObject,
 } from 'react';
 
+import { createUuid } from '../../platform/randomUuid.js';
 import {
   activateTermTemplate,
   createManualTermCandidate,
@@ -334,7 +335,7 @@ export const TemplateDialog = ({ data, writable, returnFocus, onClose, onChanged
       const signature = JSON.stringify(body);
       const intent = intentRef.current?.signature === signature
         ? intentRef.current
-        : { signature, key: crypto.randomUUID() };
+        : { signature, key: createUuid() };
       intentRef.current = intent;
       const created = await createTermTemplate(body, intent.key);
       if (activate) await activateTermTemplate(created.id, { expectedActiveTemplateVersionId: data.activeTemplateVersionId });

@@ -34,6 +34,10 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 .versionOnly, .resultMessage { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 15px 18px; margin-top: 14px; border: 1px solid var(--border); border-radius: 10px; }
 .versionOnly p { margin: 4px 0 0; color: var(--text-secondary); font-size: 13px; }
 .resultMessage { color: #12663d; background: #f0fbf5; border-color: #bce9d0; }
+.workflowNext { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 15px 18px; margin-top: 14px; background: #f7f8ff; border: 1px solid #cfd4ff; border-radius: 10px; }
+.workflowNext > div { min-width: 0; }
+.workflowNext p { margin: 4px 0 0; color: var(--text-secondary); font-size: 13px; line-height: 1.5; }
+.workflowNext > button { min-height: 38px; flex: 0 0 auto; padding: 0 15px; color: var(--text-secondary); background: #fff; border: 1px solid var(--border-strong); border-radius: 8px; }
 .failureList { margin-top: 8px; border: 1px solid #f0c5c1; border-radius: 9px; overflow: hidden; }
 .failureList > div { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 12px; color: #8f2828; background: #fff7f6; border-bottom: 1px solid #f0d8d5; }
 .failureList > div:last-child { border-bottom: 0; }
@@ -163,7 +167,7 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 }
 @media (max-width: 720px) {
   .sourceSummary { grid-template-columns: 1fr; }
-  .pageNotice, .versionOnly, .exportHistory > header, .exportHistory > div { align-items: flex-start; flex-direction: column; }
+  .pageNotice, .versionOnly, .workflowNext, .exportHistory > header, .exportHistory > div { align-items: flex-start; flex-direction: column; }
   .toolbar label, .searchField { width: 100%; }
   .toolbar input, .toolbar select { flex: 1; }
   .tableFooter { align-items: flex-start; flex-direction: column; }

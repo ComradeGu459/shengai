@@ -1,0 +1,35 @@
+[Unit]
+Description=Qimao Terms Cloud backend API
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=qimao
+Group=qimao
+WorkingDirectory=/opt/qimao-terms-cloud/current
+EnvironmentFile=/etc/qimao-terms-cloud/backend.env
+EnvironmentFile=-/etc/qimao-terms-cloud/object-storage.env
+Environment=NODE_ENV=production
+Environment=QIMAO_SYSTEM_CONTROL_RUNTIME_SNAPSHOT_PATH=/var/lib/qimao-terms-cloud/runtime/telemetry.json
+ExecStartPre=/usr/bin/test -r /etc/qimao-terms-cloud/backend.env
+ExecStartPre=/usr/bin/test -r /opt/qimao-terms-cloud/current/backend/dist/server.js
+ExecStart=/usr/local/bin/node --preserve-symlinks-main /opt/qimao-terms-cloud/current/backend/dist/server.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+StateDirectory=qimao-terms-cloud/storage
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/qimao-terms-cloud/storage /var/log/qimao-terms-cloud
+UMask=0027
+StandardOutput=append:/var/log/qimao-terms-cloud/backend.log
+StandardError=append:/var/log/qimao-terms-cloud/backend.error.log
+
+[Install]
+WantedBy=multi-user.target

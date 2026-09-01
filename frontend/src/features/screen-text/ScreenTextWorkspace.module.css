@@ -288,6 +288,11 @@ button:disabled { color: #9b9ca4; background: #f1f1f4; cursor: not-allowed; }
 .episodeChoices { max-height: 190px; margin-top: 12px; padding: 10px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; overflow-y: auto; background: #f7f7f9; }
 .field { margin-top: 12px; }
 .manualForm { display: grid; gap: 10px; }
+.releaseExclusions { max-height: 220px; margin-top: 12px; padding: 9px 10px; display: grid; gap: 7px; overflow-y: auto; background: #fff7f7; border: 1px solid #edcccc; }
+.releaseExclusions > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding-bottom: 6px; border-bottom: 1px solid #f1dddd; }
+.releaseExclusions > div:last-child { padding-bottom: 0; border-bottom: 0; }
+.releaseExclusions strong { color: #7d3232; font-size: 12px; }
+.releaseExclusions span { color: #9f5c5c; font-size: 11px; }
 .releaseList { display: grid; gap: 10px; }
 .historyToolbar { margin-bottom: 10px; display: grid; grid-template-columns: minmax(0, 1fr) 180px; gap: 8px; }
 .historyToolbar input,
@@ -295,6 +300,10 @@ button:disabled { color: #9b9ca4; background: #f1f1f4; cursor: not-allowed; }
 .releaseList section { border: 1px solid var(--border); }
 .releaseList header { padding: 9px 11px; display: flex; justify-content: space-between; gap: 10px; background: #f7f7f9; }
 .releaseList header span { color: var(--text-muted); font-size: 11px; }
+.releaseList header .statusTag { display: inline-flex; }
+.releaseList header .statusTag.warning { color: #8a5b0d; }
+.releaseList header .statusTag.success { color: #217a4b; }
+.releaseExclusionSummary { display: block !important; color: #8a5b0d; font-size: 11px; line-height: 1.5; background: #fff8e8; border-top: 1px solid #f0e0ae; border-bottom: 1px solid #f0e0ae; }
 .releaseList section > div { padding: 8px 11px; display: flex; flex-wrap: wrap; gap: 8px; }
 .releaseList a { color: var(--accent); font-size: 12px; }
 

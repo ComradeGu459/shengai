@@ -19,8 +19,11 @@ interface SessionRow extends QueryResultRow {
   manifest_id: string;
   manifest_version: number;
   source_digest: string;
+  strategy_version_id: string | null;
+  strategy_content_digest: string | null;
   algorithm_version: string;
   format_policy_version: string;
+  source_snapshot: any;
   status: PreEditSession['status'];
   default_policy: PreEditSession['defaultPolicy'];
   revision: number;
@@ -67,8 +70,9 @@ interface EpisodeRow extends QueryResultRow {
 const sessionColumns = `
   session.id, session.project_id, session.project_version, session.source_srt_set_digest,
   session.term_version_id, session.manifest_id, session.manifest_version, session.source_digest,
+  session.strategy_version_id, session.strategy_content_digest,
   session.algorithm_version, session.format_policy_version, session.status, session.default_policy,
-  session.revision, session.error_code, session.error_detail, session.created_at, session.updated_at,
+  session.source_snapshot, session.revision, session.error_code, session.error_detail, session.created_at, session.updated_at,
   count(episode.id)::text AS episode_total,
   count(episode.id) FILTER (WHERE episode.status = 'completed')::text AS episode_completed,
   count(episode.id) FILTER (WHERE episode.limited_reason IS NOT NULL)::text AS episode_limited`;
@@ -82,8 +86,11 @@ const mapSession = (row: SessionRow): PreEditSession => ({
   manifestId: row.manifest_id,
   manifestVersion: row.manifest_version,
   sourceDigest: row.source_digest,
+  strategyVersionId: row.strategy_version_id,
+  strategyContentDigest: row.strategy_content_digest,
   algorithmVersion: row.algorithm_version,
   formatPolicyVersion: row.format_policy_version,
+  screenTextRelease: row.source_snapshot?.screenTextRelease ?? null,
   status: row.status,
   defaultPolicy: row.default_policy,
   revision: row.revision,

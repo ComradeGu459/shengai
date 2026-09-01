@@ -38,7 +38,7 @@ export class ProjectCleanupWorker {
       for (const target of multipartTargets) {
         const now = this.now();
         try {
-          await this.storage.abortMultipart(target.storageUploadId);
+          await this.storage.abortMultipart({ storageUploadId: target.storageUploadId, objectKey: target.objectKey });
           const objectOutcome = await this.storage.deleteObject(target.objectKey);
           await this.repository.recordMultipartCleanup(target, { ok: true }, now);
           await this.repository.recordAudit(job.projectId, 'multipart_cleanup_completed', {
@@ -58,7 +58,6 @@ export class ProjectCleanupWorker {
         const outcome = await this.storage.deleteObject(asset.objectKey);
         await this.repository.recordAudit(job.projectId, `object_${outcome}`, {
           assetId: asset.id,
-          objectKey: asset.objectKey,
         }, this.now());
       }
 

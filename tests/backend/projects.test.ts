@@ -62,6 +62,34 @@ describe('项目 API 与 PostgreSQL', () => {
     });
   });
 
+  it('项目列表在唯一 HTTP 边界接受字符串分页并稳定拒绝非法边界', async () => {
+    await app.inject({
+      method: 'POST',
+      url: '/api/projects',
+      headers: { 'idempotency-key': randomUUID() },
+      payload: { name: '分页边界项目' },
+    });
+
+    for (const query of [
+      'lifecycleStatus=active&limit=50&offset=0',
+      'lifecycleStatus=active&limit=1&offset=0',
+      'lifecycleStatus=active&limit=100&offset=1',
+    ]) {
+      const response = await app.inject({ method: 'GET', url: `/api/projects?${query}` });
+      expect(response.statusCode, response.body).toBe(200);
+      expect(response.json().items).toBeInstanceOf(Array);
+    }
+
+    for (const query of [
+      'limit=0', 'limit=101', 'limit=-1', 'limit=abc', 'limit=1.5', 'limit=01',
+      'offset=-1', 'offset=abc', 'offset=1.5', 'offset=01',
+    ]) {
+      const response = await app.inject({ method: 'GET', url: `/api/projects?${query}` });
+      expect(response.statusCode, `${query}: ${response.body}`).toBe(400);
+      expect(response.json()).toMatchObject({ error: { code: 'REQUEST_VALIDATION_FAILED', retryable: false } });
+    }
+  });
+
   it('相同幂等键不会创建重复项目', async () => {
     const idempotencyKey = randomUUID();
     const request = {

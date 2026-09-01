@@ -12,7 +12,7 @@ import type {
 } from '@qimao-terms-cloud/contracts';
 
 import type { ScreenTextEvidenceStorage } from './screen-text.evidence-storage.js';
-import { ScreenTextDomainError, screenTextConflict, screenTextNotFound } from './screen-text.errors.js';
+import { screenTextConflict, screenTextNotFound } from './screen-text.errors.js';
 import { ScreenTextReadRepository } from './screen-text.read.repository.js';
 import { ScreenTextPlaybackRepository } from './screen-text.playback.repository.js';
 import { ScreenTextWriteRepository } from './screen-text.write.repository.js';
@@ -23,13 +23,9 @@ export class ScreenTextService {
     private readonly writes: ScreenTextWriteRepository,
     private readonly playback: ScreenTextPlaybackRepository,
     private readonly evidenceStorage: ScreenTextEvidenceStorage,
-    private readonly fakeEnabled: boolean,
   ) {}
 
   create(projectId: string, body: CreateScreenTextBatchBody, key: string, requestId: string) {
-    if (!this.fakeEnabled) throw new ScreenTextDomainError(
-      'SCREEN_TEXT_FAKE_DISABLED', '生产环境未启用零网络画面字适配器。', 503, 'contact_administrator', false,
-    );
     return this.writes.create({ projectId, body, idempotencyKey: key, requestId });
   }
 

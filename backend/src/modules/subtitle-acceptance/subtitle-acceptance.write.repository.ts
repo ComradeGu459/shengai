@@ -65,7 +65,7 @@ export class SubtitleAcceptanceWriteRepository {
       const active = await client.query("SELECT id FROM acceptance_sessions WHERE project_id = $1 AND status IN ('draft','preflighting','ready_to_release','blocked') FOR UPDATE", [input.projectId]);
       if (active.rows[0]) throw acceptanceConflict('ACCEPTANCE_SESSION_ACTIVE', '同一项目已有可写验收会话。', 'resume_acceptance');
       const sessionId = randomUUID();
-      const sourceSnapshot = { preEditReleaseId: input.snapshot.preEditReleaseId, preEditReleaseVersion: input.snapshot.preEditReleaseVersion, preEditHeadReleaseId: input.snapshot.preEditHeadReleaseId, screenTextReleaseId: input.snapshot.screenTextReleaseId, screenTextReleaseVersion: input.snapshot.screenTextReleaseVersion, screenTextHeadReleaseId: input.snapshot.screenTextHeadReleaseId, manifestId: input.snapshot.manifestId, manifestVersion: input.snapshot.manifestVersion, termVersionId: input.snapshot.termVersionId, termVersion: input.snapshot.termVersion, ruleVersion: input.snapshot.ruleVersion };
+      const sourceSnapshot = { preEditReleaseId: input.snapshot.preEditReleaseId, preEditReleaseVersion: input.snapshot.preEditReleaseVersion, preEditHeadReleaseId: input.snapshot.preEditHeadReleaseId, screenTextReleaseId: input.snapshot.screenTextReleaseId, screenTextReleaseVersion: input.snapshot.screenTextReleaseVersion, screenTextHeadReleaseId: input.snapshot.screenTextHeadReleaseId, screenTextExcludedEpisodes: input.snapshot.screenTextExcludedEpisodes, manifestId: input.snapshot.manifestId, manifestVersion: input.snapshot.manifestVersion, termVersionId: input.snapshot.termVersionId, termVersion: input.snapshot.termVersion, ruleVersion: input.snapshot.ruleVersion };
       await client.query(`INSERT INTO acceptance_sessions(id,project_id,project_version,pre_edit_release_id,pre_edit_head_release_id,screen_text_release_id,screen_text_head_release_id,manifest_id,manifest_version,term_version_id,rule_version,source_digest,source_snapshot,status)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'draft')`, [sessionId, input.projectId, project.version, input.snapshot.preEditReleaseId, input.snapshot.preEditHeadReleaseId, input.snapshot.screenTextReleaseId, input.snapshot.screenTextHeadReleaseId, input.snapshot.manifestId, input.snapshot.manifestVersion, input.snapshot.termVersionId, input.snapshot.ruleVersion, input.snapshot.sourceDigest, JSON.stringify(sourceSnapshot)]);
       for (const sourceEpisode of input.snapshot.episodes) {
@@ -101,18 +101,23 @@ export class SubtitleAcceptanceWriteRepository {
   }
 
   private async syncAutomaticIssues(client: PoolClient, sessionId: string, episodeId: string) {
-    const [episodeResult, cuesResult, metadataResult] = await Promise.all([
-      client.query('SELECT selected_video_asset_id, authoritative_duration_ms FROM acceptance_episodes WHERE id = $1', [episodeId]),
-      cueSnapshot(client, episodeId),
-      client.query('SELECT id, source_metadata FROM acceptance_cues WHERE episode_id = $1 AND NOT deleted', [episodeId]),
-    ]);
+    const closedResult = await client.query(`SELECT code, track, cue_id, time_ms, status, resolution_reason
+      FROM acceptance_issues WHERE episode_id = $1 AND origin = 'automatic' AND status <> 'open'`, [episodeId]);
+    const closedByIdentity = new Map(closedResult.rows.map((row: any) => [
+      stableDigest({ code: row.code, track: row.track, cueId: row.cue_id, timeMs: row.time_ms }),
+      { status: row.status, resolutionReason: row.resolution_reason },
+    ]));
+    const episodeResult = await client.query('SELECT selected_video_asset_id, authoritative_duration_ms FROM acceptance_episodes WHERE id = $1', [episodeId]);
+    const cuesResult = await cueSnapshot(client, episodeId);
+    const metadataResult = await client.query('SELECT id, source_metadata FROM acceptance_cues WHERE episode_id = $1 AND NOT deleted', [episodeId]);
     const metadata = new Map(metadataResult.rows.filter((row: any) => row.source_metadata?.pairGroupId).map((row: any) => [row.id, { groupId: row.source_metadata.pairGroupId, position: row.source_metadata.position }]));
     const episode = episodeResult.rows[0];
     const issues = scanAcceptanceQuality({ cues: cuesResult, selectedVideoAssetId: episode.selected_video_asset_id, durationMs: episode.authoritative_duration_ms === null ? null : Number(episode.authoritative_duration_ms), pairByCueId: metadata });
     await client.query("DELETE FROM acceptance_issues WHERE episode_id = $1 AND origin = 'automatic'", [episodeId]);
     for (const issue of issues) {
-      await client.query(`INSERT INTO acceptance_issues(session_id,episode_id,episode_number,origin,code,severity,track,cue_id,time_ms,note)
-        SELECT $1,$2,episode_number,'automatic',$3,$4,$5,$6,$7,$8 FROM acceptance_episodes WHERE id = $2`, [sessionId, episodeId, issue.code, issue.severity, issue.track, issue.cueId, issue.timeMs, issue.note]);
+      const closed = closedByIdentity.get(stableDigest({ code: issue.code, track: issue.track, cueId: issue.cueId, timeMs: issue.timeMs }));
+      await client.query(`INSERT INTO acceptance_issues(session_id,episode_id,episode_number,origin,code,severity,track,cue_id,time_ms,note,status,resolution_reason)
+        SELECT $1,$2,episode_number,'automatic',$3,$4,$5,$6,$7,$8,$9,$10 FROM acceptance_episodes WHERE id = $2`, [sessionId, episodeId, issue.code, issue.severity, issue.track, issue.cueId, issue.timeMs, issue.note, closed?.status ?? 'open', closed?.resolutionReason ?? null]);
     }
   }
 
@@ -158,8 +163,10 @@ export class SubtitleAcceptanceWriteRepository {
       const event = await client.query('SELECT * FROM acceptance_edit_events WHERE id = $1 AND episode_id = $2 FOR UPDATE', [input.eventId, episode.id]);
       if (!event.rows[0] || event.rows[0].event_kind === 'pass') throw acceptanceInvalid('ACCEPTANCE_EDIT_NOT_REVERSIBLE', '指定事件不可撤销或恢复。');
       const before = await cueSnapshot(client, episode.id); const target: AcceptanceCue[] = input.direction === 'undo' ? event.rows[0].before_snapshot : event.rows[0].after_snapshot;
+      const metadataResult = await client.query('SELECT id, source_metadata FROM acceptance_cues WHERE episode_id = $1', [episode.id]);
+      const metadataByCueId = new Map(metadataResult.rows.map((row: any) => [row.id, row.source_metadata]));
       await client.query('DELETE FROM acceptance_cues WHERE episode_id = $1', [episode.id]);
-      for (const cue of target) await client.query(`INSERT INTO acceptance_cues(id,session_id,episode_id,episode_number,track,ordinal,source_cue_id,start_ms,end_ms,text,deleted,revision,source_metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'{}')`, [cue.id, input.sessionId, episode.id, episode.episode_number, cue.track, cue.ordinal, cue.sourceCueId, cue.startMs, cue.endMs, cue.text, cue.deleted, cue.revision]);
+      for (const cue of target) await client.query(`INSERT INTO acceptance_cues(id,session_id,episode_id,episode_number,track,ordinal,source_cue_id,start_ms,end_ms,text,deleted,revision,source_metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, [cue.id, input.sessionId, episode.id, episode.episode_number, cue.track, cue.ordinal, cue.sourceCueId, cue.startMs, cue.endMs, cue.text, cue.deleted, cue.revision, JSON.stringify(metadataByCueId.get(cue.id) ?? {})]);
       const after = await cueSnapshot(client, episode.id); const restoredId = randomUUID();
       await client.query('INSERT INTO acceptance_edit_events(id,session_id,episode_id,event_kind,before_snapshot,after_snapshot,reverses_event_id,restores_event_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)', [restoredId, input.sessionId, episode.id, input.direction, JSON.stringify(before), JSON.stringify(after), input.direction === 'undo' ? input.eventId : null, input.direction === 'redo' ? input.eventId : null]);
       await this.afterEpisodeMutation(client, input.sessionId, episode.id); await this.saveCommand(client, input.projectId, input.key, kind, hash, restoredId, { resourceId: restoredId }); return { replay: false, resourceId: restoredId };
@@ -196,7 +203,7 @@ export class SubtitleAcceptanceWriteRepository {
 
   private async assertPassable(client: PoolClient, episode: EpisodeLock) {
     await this.syncAutomaticIssues(client, episode.session_id, episode.id);
-    const blockers = await client.query("SELECT 1 FROM acceptance_issues WHERE episode_id = $1 AND status = 'open' AND (severity = 'error' OR origin = 'manual') LIMIT 1", [episode.id]);
+    const blockers = await client.query("SELECT 1 FROM acceptance_issues WHERE episode_id = $1 AND status = 'open' LIMIT 1", [episode.id]);
     if (!episode.selected_video_asset_id || !episode.authoritative_duration_ms || blockers.rows[0]) throw acceptanceInvalid('ACCEPTANCE_PASS_BLOCKED', '本集尚有未完成的硬检查或人工问题。', 'resolve_acceptance_issues');
   }
 
@@ -210,7 +217,9 @@ export class SubtitleAcceptanceWriteRepository {
       for (const episode of episodes.rows) {
         try { await this.assertPassable(client, episode); const signature = acceptanceSignature({ selectedVideoAssetId: episode.selected_video_asset_id, authoritativeDurationMs: episode.authoritative_duration_ms === null ? null : Number(episode.authoritative_duration_ms) }, await cueSnapshot(client, episode.id)); await client.query("UPDATE acceptance_episodes SET status = 'passed', pass_signature = $2, passed_at = CURRENT_TIMESTAMP, revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $1", [episode.id, signature]); await client.query('INSERT INTO acceptance_edit_events(id,session_id,episode_id,event_kind,before_snapshot,after_snapshot) VALUES($1,$2,$3,\'pass\',\'[]\',\'[]\')', [randomUUID(), input.sessionId, episode.id]); passed.push(episode.episode_number); } catch (error) { if (error instanceof Error && error.name === 'SubtitleAcceptanceError') { blocked.push(episode.episode_number); continue; } throw error; }
       }
-      const status = blocked.length ? 'draft' : 'ready_to_release'; await client.query('UPDATE acceptance_sessions SET revision = revision + 1, status = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1', [input.sessionId, status]); const id = randomUUID(); await this.saveCommand(client, input.projectId, input.key, 'pass_episodes', hash, id, { resourceId: id, passed, blocked }); return { replay: false, resourceId: id, passed, blocked };
+      const allEpisodes = await client.query('SELECT status FROM acceptance_episodes WHERE session_id = $1', [input.sessionId]);
+      const status = allEpisodes.rows.length > 0 && allEpisodes.rows.every((episode) => episode.status === 'passed') ? 'ready_to_release' : 'draft';
+      await client.query('UPDATE acceptance_sessions SET revision = revision + 1, status = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1', [input.sessionId, status]); const id = randomUUID(); await this.saveCommand(client, input.projectId, input.key, 'pass_episodes', hash, id, { resourceId: id, passed, blocked }); return { replay: false, resourceId: id, passed, blocked };
     });
   }
 
@@ -218,20 +227,11 @@ export class SubtitleAcceptanceWriteRepository {
     const hash = stableDigest(input.body); return this.transaction(async (client) => {
       await this.lockProject(client, input.projectId); const replay = await this.replay(client, input.projectId, input.key, 'create_rework', hash); if (replay) return { replay: true, resourceId: replay.resourceId };
       const session = await client.query('SELECT * FROM acceptance_sessions WHERE id = $1 AND project_id = $2 FOR UPDATE', [input.sessionId, input.projectId]); if (!session.rows[0]) throw acceptanceNotFound('ACCEPTANCE_SESSION_NOT_FOUND', '验收会话不存在。'); if (session.rows[0].revision !== input.body.expectedSessionRevision) throw acceptanceConflict('ACCEPTANCE_SESSION_VERSION_CONFLICT', '验收会话已变化。');
+      if (['stale', 'released'].includes(session.rows[0].status)) throw acceptanceConflict('ACCEPTANCE_SESSION_NOT_WRITABLE', '验收会话已经只读。');
+      const selectedEpisodes = await client.query('SELECT episode_number FROM acceptance_episodes WHERE session_id = $1 AND episode_number = ANY($2::integer[]) FOR UPDATE', [input.sessionId, input.body.episodeNumbers]);
+      if (selectedEpisodes.rowCount !== input.body.episodeNumbers.length) throw acceptanceInvalid('ACCEPTANCE_EPISODE_NOT_FOUND', '返工集数必须全部属于当前验收会话。');
       const id = randomUUID(); await client.query('INSERT INTO acceptance_rework_requests(id,project_id,session_id,episode_numbers,tracks,reason) VALUES($1,$2,$3,$4,$5,$6)', [id, input.projectId, input.sessionId, input.body.episodeNumbers, input.body.tracks, input.body.reason.trim()]); await client.query("UPDATE acceptance_episodes SET status = 'rework_required', pass_signature = NULL, passed_at = NULL, revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE session_id = $1 AND episode_number = ANY($2::integer[])", [input.sessionId, input.body.episodeNumbers]); await client.query("UPDATE acceptance_sessions SET revision = revision + 1, status = 'draft', updated_at = CURRENT_TIMESTAMP WHERE id = $1", [input.sessionId]); await this.saveCommand(client, input.projectId, input.key, 'create_rework', hash, id, { resourceId: id }); return { replay: false, resourceId: id };
     });
   }
 
-  async createRelease(input: { projectId: string; sessionId: string; expectedSessionRevision: number; key: string }) {
-    const hash = stableDigest({ expectedSessionRevision: input.expectedSessionRevision }); return this.transaction(async (client) => {
-      await this.lockProject(client, input.projectId); const replay = await this.replay(client, input.projectId, input.key, 'create_release', hash); if (replay) return { replay: true, resourceId: replay.resourceId };
-      const session = await client.query('SELECT * FROM acceptance_sessions WHERE id = $1 AND project_id = $2 FOR UPDATE', [input.sessionId, input.projectId]); if (!session.rows[0]) throw acceptanceNotFound('ACCEPTANCE_SESSION_NOT_FOUND', '验收会话不存在。'); if (session.rows[0].revision !== input.expectedSessionRevision) throw acceptanceConflict('ACCEPTANCE_SESSION_VERSION_CONFLICT', '验收会话已变化。');
-      const episodes = await client.query<EpisodeLock>('SELECT * FROM acceptance_episodes WHERE session_id = $1 FOR UPDATE', [input.sessionId]); if (!episodes.rows.length || episodes.rows.some((episode) => episode.status !== 'passed')) throw acceptanceInvalid('ACCEPTANCE_RELEASE_BLOCKED', '所有集数必须完成验收才能发布。', 'complete_acceptance');
-      for (const episode of episodes.rows) { const signature = acceptanceSignature({ selectedVideoAssetId: episode.selected_video_asset_id, authoritativeDurationMs: episode.authoritative_duration_ms === null ? null : Number(episode.authoritative_duration_ms) }, await cueSnapshot(client, episode.id)); if (signature !== (await client.query('SELECT pass_signature FROM acceptance_episodes WHERE id=$1',[episode.id])).rows[0].pass_signature) throw acceptanceInvalid('ACCEPTANCE_RELEASE_BLOCKED', '验收签名已失效。', 'complete_acceptance'); }
-      const cues = await client.query('SELECT * FROM acceptance_cues WHERE session_id = $1 AND NOT deleted ORDER BY episode_number, track, ordinal, id', [input.sessionId]); const digest = stableDigest(cues.rows.map((row: any) => ({ episode: row.episode_number, track: row.track, ordinal: row.ordinal, start: row.start_ms, end: row.end_ms, text: row.text })));
-      const version = Number((await client.query('SELECT COALESCE(max(version),0)+1 AS value FROM acceptance_releases WHERE project_id = $1', [input.projectId])).rows[0].value); const releaseId = randomUUID(); await client.query('INSERT INTO acceptance_releases(id,project_id,session_id,version,source_digest,acceptance_digest,cue_count) VALUES($1,$2,$3,$4,$5,$6,$7)', [releaseId, input.projectId, input.sessionId, version, session.rows[0].source_digest, digest, cues.rowCount]);
-      for (const cue of cues.rows) await client.query('INSERT INTO acceptance_release_cues(release_id,episode_number,track,ordinal,source_working_cue_id,start_ms,end_ms,text) VALUES($1,$2,$3,$4,$5,$6,$7,$8)', [releaseId, cue.episode_number, cue.track, cue.ordinal, cue.id, cue.start_ms, cue.end_ms, cue.text]);
-      await client.query("UPDATE acceptance_sessions SET status = 'released', revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $1", [input.sessionId]); await this.saveCommand(client, input.projectId, input.key, 'create_release', hash, releaseId, { resourceId: releaseId }); return { replay: false, resourceId: releaseId };
-    });
-  }
 }

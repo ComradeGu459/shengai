@@ -71,7 +71,7 @@ const episode = (episodeNumber: number, options: { status?: 'ready' | 'limited' 
   updatedAt: now,
 });
 
-const sessionDetail = (options: { status?: 'ready' | 'limited' | 'stale' | 'completed'; limited?: boolean; complete?: boolean } = {}) => ({
+const sessionDetail = (options: { status?: 'ready' | 'limited' | 'stale' | 'completed'; limited?: boolean; complete?: boolean; screenTextRelease?: Record<string, unknown> | null } = {}) => ({
   id: sessionId,
   projectId,
   projectVersion: 3,
@@ -90,6 +90,7 @@ const sessionDetail = (options: { status?: 'ready' | 'limited' | 'stale' | 'comp
   episodeCounts: { total: 2, completed: options.complete ? 2 : 0, limited: options.limited ? 1 : 0 },
   createdAt: now,
   updatedAt: now,
+  screenTextRelease: options.screenTextRelease ?? null,
   episodes: options.complete
     ? [episode(1, { status: 'completed', pending: 0 }), episode(2, { status: 'completed', pending: 0 })]
     : [episode(1), episode(2, options.limited ? { status: 'limited' } : {})],
@@ -167,7 +168,7 @@ const deferred = <T,>() => {
   return { promise, resolve };
 };
 
-const baseFetch = (options: { detail?: ReturnType<typeof sessionDetail>; items?: ReturnType<typeof item>[] } = {}) => {
+const baseFetch = (options: { detail?: ReturnType<typeof sessionDetail>; items?: ReturnType<typeof item>[]; screenTextReleases?: unknown[] } = {}) => {
   const detail = options.detail ?? sessionDetail();
   const rows = options.items ?? normalItems;
   return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -179,6 +180,12 @@ const baseFetch = (options: { detail?: ReturnType<typeof sessionDetail>; items?:
     if (url.endsWith(`/pre-review/sessions/${sessionId}`)) return response(detail);
     if (url.includes(`/pre-review/sessions/${sessionId}/items?`)) return response({ items: rows, total: rows.length });
     if (url.endsWith('/pre-review/releases')) return response({ items: [] });
+    if (url.includes('/screen-text/releases')) return response({ items: options.screenTextReleases ?? [{
+      id: '10000000-0000-4000-8000-000000000012', projectId, version: 3,
+      batchId: '10000000-0000-4000-8000-000000000013', termVersionId, manifestId,
+      draftRevision: 4, releaseDigest: digest, cueCount: 4, partial: false,
+      excludedEpisodes: [], exports: [], createdAt: now,
+    }], total: 1 });
     if (url.endsWith('/playback')) return response({ assetId: videoAssetId, episodeNumber: 1, url: '/media/episode.mp4', expiresAt: now, seek: { startMs: 1_000, contextEndMs: 6_000 } });
     throw new Error(`未模拟请求：${method} ${url}`);
   });
@@ -189,7 +196,7 @@ const Destination = ({ name, onRender }: { name: string; onRender?: (name: strin
   return <div>{name}</div>;
 };
 
-const renderPage = (options: { withShell?: boolean; onDestination?: (name: string) => void } = {}) => {
+const renderPage = (options: { entry?: string; withShell?: boolean; onDestination?: (name: string) => void } = {}) => {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   const routes = <Routes>
     <Route path="/projects/:projectId/pre-review" element={<PreReviewWorkspace />} />
@@ -197,9 +204,9 @@ const renderPage = (options: { withShell?: boolean; onDestination?: (name: strin
     <Route path="/projects" element={<Destination name="项目中心页" onRender={options.onDestination} />} />
     <Route path="/uploads" element={<Destination name="上传任务页" onRender={options.onDestination} />} />
     <Route path="/recycle-bin" element={<Destination name="回收站页" onRender={options.onDestination} />} />
-    <Route path="/asr-dispatches" element={<Destination name="中文识别任务页" onRender={options.onDestination} />} />
+    <Route path="/tasks" element={<Destination name="任务中心页" onRender={options.onDestination} />} />
   </Routes>;
-  return render(<QueryClientProvider client={queryClient}><MemoryRouter initialEntries={[`/projects/${projectId}/pre-review`]}>{options.withShell ? <AppShell>{routes}</AppShell> : routes}</MemoryRouter></QueryClientProvider>);
+  return render(<QueryClientProvider client={queryClient}><MemoryRouter initialEntries={[options.entry ?? `/projects/${projectId}/pre-review`]}>{options.withShell ? <AppShell>{routes}</AppShell> : routes}</MemoryRouter></QueryClientProvider>);
 };
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
@@ -627,5 +634,37 @@ describe('FRONT-M3-03B 前置审改工作台', () => {
     renderPage();
     expect(await screen.findByRole('button', { name: '生成待验收修订 SRT' })).toBeEnabled();
     expect(screen.queryByRole('button', { name: '完成本集并进入下一未完成集' })).not.toBeInTheDocument();
+  });
+
+  it('读取已固定的部分画面字 Release，并逐集展示排除与异常原因', async () => {
+    const partialRelease = {
+      id: '10000000-0000-4000-8000-000000000010',
+      version: 3,
+      releaseDigest: digest,
+      partial: true,
+      excludedEpisodes: [{
+        episodeNumber: 2,
+        jobId: '10000000-0000-4000-8000-000000000011',
+        status: 'failed',
+        attemptId: null,
+        errorCode: 'OCR_TIMEOUT',
+        effectClass: 'quality_rejected',
+        providerRequestId: null,
+      }],
+    };
+    vi.stubGlobal('fetch', baseFetch({ detail: sessionDetail({ screenTextRelease: partialRelease }) }));
+    renderPage({ entry: `/projects/${projectId}/pre-review?sessionId=${sessionId}` });
+    expect(await screen.findByText('V3（部分）')).toBeInTheDocument();
+    expect(screen.getByText('V3（部分）').closest('header')).toHaveTextContent('排除 1 集');
+    expect(screen.getByText('第 2 集 · failed · OCR_TIMEOUT')).toBeInTheDocument();
+    expect(screen.getByText(/不会重跑、删除或改写/)).toBeInTheDocument();
+  });
+
+  it('缺少画面字 Release 时把员工带到真实上游，而不是误导到术语页', async () => {
+    vi.stubGlobal('fetch', baseFetch({ screenTextReleases: [] }));
+    renderPage();
+    expect(await screen.findByText('当前项目没有已发布画面字 Release，请先完成画面字发布。')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '前往画面字' })).toHaveAttribute('href', `/projects/${projectId}/screen-text`);
+    expect(screen.queryByRole('link', { name: '前往术语' })).not.toBeInTheDocument();
   });
 });

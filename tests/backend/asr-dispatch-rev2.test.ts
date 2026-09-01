@@ -13,14 +13,122 @@ import { AsrWorker } from '../../backend/src/workers/asr.worker.js';
 const pool = createPool();
 const app = createApp({ database: pool });
 
-beforeAll(async () => app.ready());
+type AsrRoutingFixture = Readonly<{
+  deploymentId: string;
+  deploymentVersionId: string;
+  routingVersionId: string;
+}>;
+
+let routingFixture: AsrRoutingFixture | null = null;
+
+const activateAsrRouting = async (
+  routingPool: DatabasePool,
+  descriptor: {
+    provider: string;
+    adapter: string;
+    model: string;
+    language: string;
+    configDigest: string;
+    hotwordCapabilities: {
+      supported: boolean;
+      maxEntries: number | null;
+      maxCharacters: number | null;
+    };
+  },
+): Promise<AsrRoutingFixture> => {
+  const deploymentId = randomUUID();
+  const deploymentVersionId = randomUUID();
+  const routingVersionId = randomUUID();
+  await routingPool.query(
+    `INSERT INTO engine_deployments
+       (id,capability,execution_kind,display_name,provider,adapter_key,status)
+     VALUES ($1,'asr','cloud_api',$2,$3,$4,'enabled')`,
+    [deploymentId, `test-${descriptor.adapter}`, descriptor.provider, descriptor.adapter],
+  );
+  await routingPool.query(
+    `INSERT INTO engine_deployment_versions
+       (id,deployment_id,version,model,language,capabilities_snapshot,secret_reference_summary,config_digest,billing_snapshot)
+     VALUES ($1,$2,1,$3,$4,$5,$6,$7,$8)`,
+    [
+      deploymentVersionId,
+      deploymentId,
+      descriptor.model,
+      descriptor.language,
+      JSON.stringify({
+        capability: 'asr',
+        executionKind: 'cloud_api',
+        provider: descriptor.provider,
+        adapterKey: descriptor.adapter,
+        model: descriptor.model,
+        language: descriptor.language,
+        descriptorDigest: descriptor.configDigest,
+        capabilities: { hotword: descriptor.hotwordCapabilities },
+      }),
+      JSON.stringify({ present: false, referenceDigest: null, redactedLabel: null }),
+      descriptor.configDigest,
+      JSON.stringify(descriptor.billing),
+    ],
+  );
+  await routingPool.query(
+    `INSERT INTO routing_policy_versions
+       (id,environment,workflow_stage,version)
+     VALUES ($1,'development','asr',(
+       SELECT COALESCE(MAX(version),0)+1
+       FROM routing_policy_versions
+       WHERE environment='development' AND workflow_stage='asr'
+     ))`,
+    [routingVersionId],
+  );
+  await routingPool.query(
+    `INSERT INTO routing_policy_pools (routing_version_id,pool_id)
+     VALUES ($1,'asr_api'),($1,'ocr_api'),($1,'ocr_self_hosted_worker')`,
+    [routingVersionId],
+  );
+  await routingPool.query(`INSERT INTO routing_policy_targets (routing_version_id,pool_id,routing_target_id,deployment_version_id,priority,role,max_concurrent_jobs,per_project_max,queue_limit) VALUES ($1,'asr_api',$2,$3,1,'preferred',10,2,100)`, [routingVersionId, randomUUID(), deploymentVersionId]);
+  await routingPool.query(
+    `INSERT INTO routing_policy_status_events
+       (routing_version_id,status,request_id,actor_subject)
+     VALUES ($1,'active','asr-dispatch-fixture','test')`,
+    [routingVersionId],
+  );
+  await routingPool.query(
+    `INSERT INTO active_control_plane_pointers
+       (environment,workflow_stage,routing_version_id)
+     VALUES ('development','asr',$1)
+     ON CONFLICT (environment,workflow_stage)
+     DO UPDATE SET routing_version_id=EXCLUDED.routing_version_id,updated_at=CURRENT_TIMESTAMP`,
+    [routingVersionId],
+  );
+  return { deploymentId, deploymentVersionId, routingVersionId };
+};
+
+beforeAll(async () => {
+  await app.ready();
+  routingFixture = await activateAsrRouting(pool, createDefaultAsrAdapterRegistry().defaultDescriptor);
+});
 beforeEach(async () => {
   await pool.query('DELETE FROM asr_dispatch_groups');
   await pool.query('DELETE FROM projects');
+  if (routingFixture) {
+    await pool.query(
+      `INSERT INTO active_control_plane_pointers
+         (environment,workflow_stage,routing_version_id)
+       VALUES ('development','asr',$1)
+       ON CONFLICT (environment,workflow_stage)
+       DO UPDATE SET routing_version_id=EXCLUDED.routing_version_id,updated_at=CURRENT_TIMESTAMP`,
+      [routingFixture.routingVersionId],
+    );
+  }
 });
 afterAll(async () => {
   await pool.query('DELETE FROM asr_dispatch_groups');
   await pool.query('DELETE FROM projects');
+  await pool.query(
+    `TRUNCATE active_control_plane_pointers, routing_policy_status_events,
+      routing_advance_events, routing_policy_targets, routing_policy_pools, routing_policy_versions, system_control_audit_events,
+      connection_test_attempts, connection_test_runs, system_control_commands,
+      engine_deployment_versions, engine_deployments CASCADE`,
+  );
   await app.close();
 });
 
@@ -299,7 +407,7 @@ describe('BACK-M3-02D Rev 2 项目资格与 Dispatch 正式投影', () => {
     expect(search.statusCode, search.body).toBe(200);
     expect(search.json().total).toBe(2);
     expect(search.json().items.map((item: any) => item.eligibilityStatus).sort()).toEqual([
-      'missing_terms', 'missing_videos',
+      'eligible', 'missing_videos',
     ]);
 
     const activeOnly = await app.inject({

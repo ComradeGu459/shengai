@@ -1,0 +1,33 @@
+[Unit]
+Description=Qimao Terms Cloud worker (%i)
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=qimao
+Group=qimao
+WorkingDirectory=/opt/qimao-terms-cloud/current
+EnvironmentFile=/etc/qimao-terms-cloud/backend.env
+Environment=NODE_ENV=production
+# %i 必须是已经审核为 standalone 的 dist/workers 文件名，例如
+# pre-review.worker.entry.js；不能把任意导入模块当作 daemon。
+ExecStartPre=/usr/bin/test -r /etc/qimao-terms-cloud/backend.env
+ExecStartPre=/usr/bin/test -r /opt/qimao-terms-cloud/current/backend/dist/workers/%i
+ExecStart=/usr/bin/node /opt/qimao-terms-cloud/current/backend/dist/workers/%i
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/qimao-terms-cloud
+UMask=0027
+StandardOutput=append:/var/log/qimao-terms-cloud/worker-%i.log
+StandardError=append:/var/log/qimao-terms-cloud/worker-%i.error.log
+
+[Install]
+WantedBy=multi-user.target

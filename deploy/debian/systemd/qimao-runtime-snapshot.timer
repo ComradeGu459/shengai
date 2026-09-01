@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh Qimao runtime telemetry snapshot
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=30s
+AccuracySec=1s
+Persistent=false
+Unit=qimao-runtime-snapshot.service
+
+[Install]
+WantedBy=timers.target

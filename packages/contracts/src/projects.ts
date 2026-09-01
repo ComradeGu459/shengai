@@ -39,8 +39,14 @@ export const ListProjectsQuerySchema = Type.Object({
   search: Type.Optional(Type.String({ maxLength: 120 })),
   workflowStatus: Type.Optional(WorkflowStatusSchema),
   lifecycleStatus: Type.Optional(LifecycleStatusSchema),
-  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, default: 50 })),
-  offset: Type.Optional(Type.Integer({ minimum: 0, default: 0 })),
+  limit: Type.Optional(Type.Union([
+    Type.Integer({ minimum: 1, maximum: 100 }),
+    Type.String({ pattern: '^(?:[1-9]|[1-9][0-9]|100)$' }),
+  ])),
+  offset: Type.Optional(Type.Union([
+    Type.Integer({ minimum: 0 }),
+    Type.String({ pattern: '^(?:0|[1-9][0-9]*)$' }),
+  ])),
 });
 
 export const ProjectListSchema = Type.Object({

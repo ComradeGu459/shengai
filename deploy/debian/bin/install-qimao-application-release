@@ -1,0 +1,41 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+staging='/var/tmp/qimao-release-entry-install-1718'
+runner_source="$staging/qimao-application-release"
+validator_source="$staging/application-release-declaration.mjs"
+runner_target='/usr/local/sbin/qimao-application-release'
+validator_target='/usr/local/libexec/qimao-application-release-declaration.mjs'
+runner_sha='96730a2c14951968afedfbc83aa14f570076c96d8a6b45f9ed9a259c1d8e3ee9'
+validator_sha='4f064446c09ce40f4b27f980620377d25d813782d0ce237d72694c8a7ef3c3c3'
+installed=0
+
+cleanup_on_failure() {
+  if [ "$installed" -eq 1 ]; then
+    rm -f -- "$runner_target" "$validator_target"
+  fi
+}
+trap cleanup_on_failure ERR INT TERM
+
+[ "$(id -u)" -eq 0 ]
+[ -f "$runner_source" ] && [ ! -L "$runner_source" ]
+[ -f "$validator_source" ] && [ ! -L "$validator_source" ]
+[ "$(sha256sum "$runner_source" | awk '{print $1}')" = "$runner_sha" ]
+[ "$(sha256sum "$validator_source" | awk '{print $1}')" = "$validator_sha" ]
+[ ! -e "$runner_target" ]
+[ ! -e "$validator_target" ]
+
+installed=1
+install -D -o root -g root -m 0750 "$runner_source" "$runner_target"
+install -D -o root -g root -m 0750 "$validator_source" "$validator_target"
+/bin/bash -n "$runner_target"
+/usr/local/bin/node --check "$validator_target"
+/usr/local/bin/node "$validator_target" --self-test
+[ "$(stat -c '%U:%G:%a' "$runner_target")" = 'root:root:750' ]
+[ "$(stat -c '%U:%G:%a' "$validator_target")" = 'root:root:750' ]
+[ "$(sha256sum "$runner_target" | awk '{print $1}')" = "$runner_sha" ]
+[ "$(sha256sum "$validator_target" | awk '{print $1}')" = "$validator_sha" ]
+
+trap - ERR INT TERM
+rm -rf -- "$staging"
+echo 'install=passed release_execution=0 service_restarts=0'

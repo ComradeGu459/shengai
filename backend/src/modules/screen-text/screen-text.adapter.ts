@@ -20,15 +20,27 @@ export interface ScreenTextAdapterDescriptorInput {
   outputVersion: string;
   configVersion: string;
   capabilities: ScreenTextAdapterCapabilities;
+  billing: ScreenTextBillingCapability;
+}
+
+export interface ScreenTextBillingCapability {
+  billingClass: 'metered' | 'unmetered_local';
+  currency: string;
+  maximumAmount: string;
+  billingUnit: string;
+  maximumQuantity: string;
 }
 
 export interface ScreenTextAdapterDescriptor extends Omit<ScreenTextAdapterDescriptorInput, 'configVersion'> {
   configDigest: string;
+  billing: ScreenTextBillingCapability;
 }
 
 export const createScreenTextAdapterDescriptor = (
   input: ScreenTextAdapterDescriptorInput,
-): Readonly<ScreenTextAdapterDescriptor> => Object.freeze({
+): Readonly<ScreenTextAdapterDescriptor> => {
+  const billing = input.billing;
+  return Object.freeze({
   kind: input.kind,
   adapter: input.adapter,
   provider: input.provider,
@@ -38,6 +50,7 @@ export const createScreenTextAdapterDescriptor = (
   inputVersion: input.inputVersion,
   outputVersion: input.outputVersion,
   capabilities: Object.freeze({ ...input.capabilities }),
+  billing,
   configDigest: createHash('sha256').update(JSON.stringify({
     kind: input.kind,
     adapter: input.adapter,
@@ -49,8 +62,10 @@ export const createScreenTextAdapterDescriptor = (
     outputVersion: input.outputVersion,
     configVersion: input.configVersion,
     capabilities: input.capabilities,
+    billing,
   })).digest('hex'),
-});
+  });
+};
 
 export interface ScreenTextAdapterAsset {
   assetId: string;
@@ -74,7 +89,32 @@ export interface ScreenTextAdapterInput {
   jobId: string;
   episodeNumber: number;
   attemptNumber: number;
+  /** 新的本地 sidecar 必须绑定真实 Attempt；旧零网络 adapter 可继续只读 job 身份。 */
+  attemptId?: string;
+  signal?: AbortSignal;
   asset: ScreenTextAdapterAsset;
+  media?: {
+    inputKind: 'server_extracted_frames';
+    contentType: string;
+    sizeBytes: number;
+    checksumAlgorithm: 'sha256';
+    checksumValue: string;
+    videoDurationMs: number;
+    frameCount: number;
+    pixelCount: number;
+    maxFrameCount: number;
+    maxPixels: number;
+    /** 远程抽帧路径不回读整对象；本地 sidecar 路径仍提供源字节。 */
+    sourceBytes?: Uint8Array;
+    frames: Array<{
+      frameIndex: number;
+      capturedAtMs: number;
+      width: number;
+      height: number;
+      contentType: string;
+      bytes: Uint8Array;
+    }>;
+  };
   termProjectionDigest: string;
   termEntries: ScreenTextAdapterTermEntry[];
   frameStrategyVersion: string;
@@ -110,9 +150,12 @@ interface ScreenTextOutcomeBase {
   usage: ScreenTextUsage;
 }
 
+export type ScreenTextEffectClass = 'completed' | 'external_not_accepted' | 'unauthorized' | 'external_unknown' | 'quality_rejected' | 'cancelled';
+
 export type ScreenTextAdapterOutcome =
   | ScreenTextOutcomeBase & {
     kind: 'completed';
+    effectClass: 'completed' | 'quality_rejected';
     videoDurationMs: number;
     candidates: ScreenTextAdapterCandidate[];
   }
@@ -122,16 +165,21 @@ export type ScreenTextAdapterOutcome =
     errorDetail: string;
     retryable: boolean;
     externalSideEffectPossible: boolean;
+    effectClass: Exclude<ScreenTextEffectClass, 'completed' | 'quality_rejected'>;
   }
   | ScreenTextOutcomeBase & {
     kind: 'reconciliation_required';
     providerRequestId: string;
     errorCode: string;
     errorDetail: string;
+    effectClass: 'external_unknown';
   };
 
 export interface ScreenTextAdapter {
   readonly descriptor: Readonly<ScreenTextAdapterDescriptor>;
+  readonly requiresMedia?: boolean;
+  /** 仅允许通过有界 presigned GET + 抽帧器，禁止 readObject 整段回读。 */
+  readonly requiresStreamedMedia?: boolean;
   execute(input: ScreenTextAdapterInput): Promise<ScreenTextAdapterOutcome>;
 }
 
@@ -153,39 +201,26 @@ export const deterministicScreenTextDescriptor = createScreenTextAdapterDescript
   outputVersion: 'screen-text-output-v1',
   configVersion: 'screen-text-fake-config-v1',
   capabilities,
+  billing: { billingClass: 'unmetered_local', currency: 'CNY', maximumAmount: '0', billingUnit: 'zero_network_call', maximumQuantity: '0' },
 });
 
 const simulatedUsage = (
   descriptor: ScreenTextAdapterDescriptor,
   providerRequestId: string | null,
   reconciliationStatus: 'final' | 'pending',
-): ScreenTextUsage => descriptor.kind === 'cloud_api' ? {
+): ScreenTextUsage => {
+  const billingQuantity = Number(descriptor.billing.maximumQuantity);
+  const finalAmount = reconciliationStatus === 'final' ? descriptor.billing.maximumAmount : '0';
+  return {
   provider: descriptor.provider,
-  billingUnit: 'image',
-  billingQuantity: 8,
-  currency: 'USD',
-  estimatedAmount: '0.08',
-  finalAmount: reconciliationStatus === 'final' ? '0.08' : '0',
+  billingUnit: descriptor.billing.billingUnit,
+  billingQuantity,
+  currency: descriptor.billing.currency,
+  estimatedAmount: descriptor.billing.maximumAmount,
+  finalAmount,
   reconciliationStatus,
   providerRequestId,
-} : descriptor.kind === 'self_hosted_worker' ? {
-  provider: descriptor.provider,
-  billingUnit: 'compute_millisecond',
-  billingQuantity: 40,
-  currency: 'CNY',
-  estimatedAmount: '0',
-  finalAmount: '0',
-  reconciliationStatus,
-  providerRequestId,
-} : {
-  provider: descriptor.provider,
-  billingUnit: 'zero_network_call',
-  billingQuantity: 0,
-  currency: 'CNY',
-  estimatedAmount: '0',
-  finalAmount: '0',
-  reconciliationStatus,
-  providerRequestId,
+  };
 };
 
 const digest = (input: string | Uint8Array) => createHash('sha256').update(input).digest('hex');
@@ -205,6 +240,7 @@ class ZeroNetworkAdapterBase implements ScreenTextAdapter {
     };
     if (lower.includes('screen-reconcile')) return {
       kind: 'reconciliation_required',
+      effectClass: 'external_unknown',
       providerRequestId: requestId,
       receipt: 'unknown',
       stats: baseStats,
@@ -212,9 +248,22 @@ class ZeroNetworkAdapterBase implements ScreenTextAdapter {
       errorCode: 'SCREEN_TEXT_UNKNOWN_RESULT',
       errorDetail: '零网络桩模拟结果未知，必须先对账。',
     };
+    if (lower.includes('screen-unauthorized')) return {
+      kind: 'failed',
+      effectClass: 'unauthorized',
+      providerRequestId: null,
+      receipt: 'unsupported',
+      stats: baseStats,
+      usage: simulatedUsage(this.descriptor, null, 'final'),
+      errorCode: 'SCREEN_TEXT_PROVIDER_UNAUTHORIZED',
+      errorDetail: '零网络桩模拟供应商鉴权拒绝。',
+      retryable: false,
+      externalSideEffectPossible: false,
+    };
     if (lower.includes('screen-always-fail')
       || (lower.includes('screen-fail-once') && input.attemptNumber === 1)) return {
       kind: 'failed',
+      effectClass: 'external_not_accepted',
       providerRequestId: null,
       receipt: 'simulated',
       stats: baseStats,
@@ -252,6 +301,7 @@ class ZeroNetworkAdapterBase implements ScreenTextAdapter {
     ];
     return {
       kind: 'completed',
+      effectClass: 'completed',
       providerRequestId: requestId,
       receipt: 'simulated',
       stats: { ...baseStats, candidateCount: candidates.length },
@@ -289,6 +339,7 @@ export class ZeroNetworkCloudApiStub extends ZeroNetworkAdapterBase {
       model: 'zero-network-cloud-v1', language: 'zh-CN', deployment: 'external_api',
       inputVersion: 'screen-text-input-v1', outputVersion: 'screen-text-output-v1',
       configVersion: 'cloud-stub-config-v1', capabilities,
+      billing: { billingClass: 'metered', currency: 'USD', maximumAmount: '0.08', billingUnit: 'image', maximumQuantity: '8' },
     }));
   }
 }
@@ -300,6 +351,7 @@ export class ZeroNetworkSelfHostedWorkerStub extends ZeroNetworkAdapterBase {
       model: 'zero-network-worker-v1', language: 'zh-CN', deployment: 'worker_pool',
       inputVersion: 'screen-text-input-v1', outputVersion: 'screen-text-output-v1',
       configVersion: 'worker-stub-config-v1', capabilities,
+      billing: { billingClass: 'unmetered_local', currency: 'CNY', maximumAmount: '0', billingUnit: 'compute_millisecond', maximumQuantity: '40' },
     }));
   }
 }

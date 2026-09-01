@@ -1,0 +1,21 @@
+# TERM-CURRENT-BASELINE-AUDIT-SERVER-66
+
+- artifact_written: true
+- outcome: blocked
+- evidence:
+  - task: `TERM-CURRENT-BASELINE-AUDIT-SERVER-66`
+  - frozen_manifest: `3000555 bytes / 61372755bb1ac1a6bbe22aaf57ea98bd0a5afba78f44c4ff3b508dc615ec6f07`
+  - frozen_archive_contract: `9471776 bytes / 020437197f6fef783fa04a1789ba727cf293a152d140b38630122a9677c3b925`
+  - local_checker: `Node v24.19.0; 4518 bytes / 0aa038f4443088296d02bdad0ff163712d62dca30201aedd1e74d9de434de533; same SHA as SERVER-63; local manifest/archive contract passed`
+  - transfer_setup: `one SSH setup succeeded; fixed transfer=/var/tmp/qimao-term-current-baseline-audit-66-transfer`
+  - scp: `1; exit=0; only manifest-check.mjs and SERVER-38 manifest transferred`
+  - transient: `0`
+  - root_checker_attempt: `0; not invoked because the only fixed release-parent archive candidate was absent`
+  - first_failure: `archive_candidate=absent at /opt/qimao-terms-cloud/releases/term-provider-usage-20260830-r1.tar.gz`
+  - audit_boundary: `no target file bytes/SHA, summary recheck, current/static/unit/health/route audit was claimed or obtained; no release/current/static/env/DB/route/permission mutation and no Provider/COS/Tencent/business API call`
+  - cleanup: `one exact cleanup SSH; audit_transfer_absent=1; exit=0`
+  - local_cleanup: `the exact SERVER-66 checker temporary directory was removed after evidence capture`
+- remaining_gap: `the SERVER-63 checker requires an archive path even in root verification mode, while SERVER-66 permits transfer of only checker+manifest; no permitted remote archive exists at the fixed release-parent path, so the 12350-file target audit could not run without changing the checker contract or transfer scope`
+- next_owner: `PLANNER to provide a single internally consistent audit input contract (root-capable checker with the same required SHA, or explicit approved archive availability) before a new audit task; do not replay SERVER-66`
+- residual: `fixed audit transfer verified absent; no transient or staging was created; target release was not touched; target identity and production runtime baseline remain unverified by SERVER-66`
+- requires_user: false

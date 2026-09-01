@@ -1,0 +1,37 @@
+{
+  "$schema": "qimao.application-release/v2",
+  "formatVersion": 2,
+  "release": {
+    "id": "ocr-runtime-config-20260901-r1",
+    "previousBackendTarget": "/opt/qimao-terms-cloud/releases/asr-budget-default-off-20260901-r1",
+    "previousSystemStaticTarget": "/srv/qimao-terms-cloud/system-frontend-asr-budget-default-off-20260901-r1",
+    "employeeStatic": {
+      "mode": "preserve",
+      "expectedTarget": "/srv/qimao-terms-cloud/frontend-asr-budget-default-off-20260901-r1"
+    }
+  },
+  "runtime": {
+    "preservedUnits": {
+      "asr": "active/running/0/0",
+      "screenText": "inactive/dead/0/0",
+      "openVino": "active/running/0/0"
+    }
+  },
+  "candidate": {
+    "systemStaticMarkers": [
+      "OpenVINO 抽帧配置",
+      "抽帧间隔（毫秒）",
+      "每集最大帧数"
+    ],
+    "systemUnauthenticatedProbe": {
+      "label": "ocr_runtime_config_engines",
+      "path": "/api/system-control/engines",
+      "expectedStatus": 403
+    }
+  },
+  "migration": {
+    "mode": "gated",
+    "helper": "db-migration-gate.mjs",
+    "schema": "1754976037000_add_screen_text_runtime_config"
+  }
+}

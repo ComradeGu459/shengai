@@ -4,6 +4,7 @@ import {
   ZeroNetworkCloudApiStub,
   ZeroNetworkSelfHostedWorkerStub,
 } from './screen-text.adapter.js';
+import { ScreenTextLocalOcrSidecarAdapter, ZeroNetworkLocalOcrSidecarTransport } from './screen-text.local-ocr-sidecar.js';
 import { stableHash } from './screen-text.domain.js';
 
 const sameDescriptor = (left: ScreenTextAdapterDescriptor, right: ScreenTextAdapterDescriptor) =>
@@ -26,6 +27,14 @@ export class ScreenTextAdapterRegistry {
     return this.adapters.get(this.defaultAdapterId)!.descriptor;
   }
 
+  get(adapterKey: string): ScreenTextAdapter | undefined {
+    return this.adapters.get(adapterKey);
+  }
+
+  descriptors(): ReadonlyArray<Readonly<ScreenTextAdapterDescriptor>> {
+    return [...this.adapters.values()].map((adapter) => adapter.descriptor);
+  }
+
   resolve(saved: ScreenTextAdapterDescriptor) {
     const adapter = this.adapters.get(saved.adapter);
     if (!adapter || !sameDescriptor(adapter.descriptor, saved)) {
@@ -39,4 +48,5 @@ export const createDefaultScreenTextAdapterRegistry = () => new ScreenTextAdapte
   new DeterministicFakeScreenTextAdapter(),
   new ZeroNetworkCloudApiStub(),
   new ZeroNetworkSelfHostedWorkerStub(),
+  new ScreenTextLocalOcrSidecarAdapter(new ZeroNetworkLocalOcrSidecarTransport()),
 ], 'screen_text_deterministic_fake');

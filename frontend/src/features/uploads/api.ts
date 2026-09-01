@@ -5,24 +5,9 @@ import type {
   ConfirmUploadPartBody,
   CreateUploadBody,
   ProjectMaterialState,
+  UploadCreateCommandResult,
   UploadSession,
 } from '@qimao-terms-cloud/contracts';
-
-interface UploadPartAuthorization {
-  uploadId: string;
-  objectKey: string;
-  partNumber: number;
-  authorizationToken: string;
-  expiresAt: string;
-  uploadRequest: { url: string; method: 'PUT'; headers: Record<string, string> } | null;
-}
-
-interface UploadedPartReceipt {
-  partNumber: number;
-  sizeBytes: number;
-  etag: string;
-  checksumValue: string;
-}
 
 interface ApiFailureBody {
   error?: {
@@ -49,6 +34,25 @@ export class UploadApiError extends Error {
   }
 }
 
+export const CREATE_UPLOAD_TIMEOUT_MS = 30_000;
+
+const composeTimeoutSignal = (signal: AbortSignal | undefined, timeoutMs: number) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new DOMException('创建上传任务超时。', 'TimeoutError'));
+  }, timeoutMs);
+  const forwardAbort = () => controller.abort(signal?.reason);
+  if (signal?.aborted) forwardAbort();
+  else signal?.addEventListener('abort', forwardAbort, { once: true });
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', forwardAbort);
+    },
+  };
+};
+
 const readFailure = async (response: Response) => {
   const body = (await response.json().catch(() => ({}))) as ApiFailureBody;
   return new UploadApiError(
@@ -67,10 +71,13 @@ const jsonRequest = async <T>(url: string, init?: RequestInit): Promise<T> => {
   return response.json() as Promise<T>;
 };
 
-const command = <T>(url: string, idempotencyKey: string, body: unknown) => jsonRequest<T>(url, {
+const withSignal = (signal?: AbortSignal) => signal ? { signal } : {};
+
+const command = <T>(url: string, idempotencyKey: string, body: unknown, signal?: AbortSignal) => jsonRequest<T>(url, {
   method: 'POST',
   headers: { 'content-type': 'application/json', 'idempotency-key': idempotencyKey },
   body: JSON.stringify(body),
+  ...withSignal(signal),
 });
 
 export const getUploadContext = (projectId: string) => Promise.all([
@@ -78,43 +85,58 @@ export const getUploadContext = (projectId: string) => Promise.all([
   jsonRequest<{ items: UploadSession[] }>(`/api/projects/${projectId}/uploads`),
 ]).then(([materialState, uploads]) => ({ materialState, uploads: uploads.items }));
 
-export const getUpload = (uploadId: string) => jsonRequest<UploadSession>(`/api/uploads/${uploadId}`);
+export const getUpload = (uploadId: string, signal?: AbortSignal) =>
+  jsonRequest<UploadSession>(`/api/uploads/${uploadId}`, withSignal(signal));
 
-export const createUpload = (projectId: string, idempotencyKey: string, body: CreateUploadBody) =>
-  command<UploadSession>(`/api/projects/${projectId}/uploads`, idempotencyKey, body);
+export interface UploadPartAuthorization {
+  uploadId: string;
+  objectKey: string;
+  partNumber: number;
+  authorizationToken: string;
+  expiresAt: string;
+  uploadRequest: {
+    url: string;
+    method: 'PUT';
+    headers: Record<string, string>;
+  } | null;
+}
 
-export const authorizePart = (uploadId: string, body: AuthorizeUploadPartBody) =>
-  jsonRequest<UploadPartAuthorization>(`/api/uploads/${uploadId}/parts/authorize`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+export interface UploadedPartReceipt {
+  partNumber: number;
+  sizeBytes: number;
+  etag: string;
+  checksumValue: string;
+}
 
-export const putPart = async (authorization: UploadPartAuthorization, blob: Blob) => {
-  if (!authorization.uploadRequest) {
-    throw new UploadApiError(
-      'UPLOAD_DIRECT_REQUEST_UNAVAILABLE',
-      'contact_admin',
-      false,
-      'client',
-      undefined,
-      '当前环境未提供浏览器直传入口。',
-    );
-  }
-  const response = await fetch(authorization.uploadRequest.url, {
-    method: authorization.uploadRequest.method,
-    headers: authorization.uploadRequest.headers,
-    body: blob,
-  });
-  if (!response.ok) throw await readFailure(response);
-  return response.json() as Promise<UploadedPartReceipt>;
+export const authorizeUploadPart = (
+  uploadId: string,
+  body: AuthorizeUploadPartBody,
+  signal?: AbortSignal,
+) => jsonRequest<UploadPartAuthorization>(`/api/uploads/${uploadId}/parts/authorize`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify(body),
+  ...withSignal(signal),
+});
+
+export const confirmUploadPart = (
+  uploadId: string,
+  idempotencyKey: string,
+  body: ConfirmUploadPartBody,
+  signal?: AbortSignal,
+) => command<UploadSession>(`/api/uploads/${uploadId}/parts/confirm`, idempotencyKey, body, signal);
+
+export const createUpload = (projectId: string, idempotencyKey: string, body: CreateUploadBody, signal?: AbortSignal) => {
+  const bounded = composeTimeoutSignal(signal, CREATE_UPLOAD_TIMEOUT_MS);
+  return command<UploadSession>(`/api/projects/${projectId}/uploads`, idempotencyKey, body, bounded.signal)
+    .finally(bounded.cleanup);
 };
 
-export const confirmPart = (uploadId: string, idempotencyKey: string, body: ConfirmUploadPartBody) =>
-  command<UploadSession>(`/api/uploads/${uploadId}/parts/confirm`, idempotencyKey, body);
+export const getUploadCreateCommand = (projectId: string, commandId: string) =>
+  jsonRequest<UploadCreateCommandResult>(`/api/projects/${projectId}/uploads/commands/${commandId}`);
 
-export const completeUpload = (uploadId: string, idempotencyKey: string, body: CompleteUploadBody) =>
-  command<UploadSession>(`/api/uploads/${uploadId}/complete`, idempotencyKey, body);
+export const completeUpload = (uploadId: string, idempotencyKey: string, body: CompleteUploadBody, signal?: AbortSignal) =>
+  command<UploadSession>(`/api/uploads/${uploadId}/complete`, idempotencyKey, body, signal);
 
 export const abortUpload = (uploadId: string, idempotencyKey: string, body: AbortUploadBody) =>
   command<UploadSession>(`/api/uploads/${uploadId}/abort`, idempotencyKey, body);

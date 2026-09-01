@@ -14,7 +14,7 @@
     "pnpm": "11.21.0"
   },
   "scripts": {
-    "dev": "pnpm run db:setup && pnpm --parallel --filter @qimao-terms-cloud/backend --filter @qimao-terms-cloud/frontend run dev",
+    "dev": "pnpm --filter @qimao-terms-cloud/contracts run build && pnpm run db:setup && pnpm --parallel --filter @qimao-terms-cloud/backend --filter @qimao-terms-cloud/frontend run dev",
     "dev:backend": "pnpm --filter @qimao-terms-cloud/backend run dev",
     "dev:frontend": "pnpm --filter @qimao-terms-cloud/frontend run dev",
     "db:install": "node tools/local-postgres.mjs install",
@@ -22,10 +22,10 @@
     "db:stop": "node tools/local-postgres.mjs stop",
     "db:setup": "node tools/local-postgres.mjs setup && pnpm --filter @qimao-terms-cloud/backend run db:migrate",
     "db:status": "node tools/local-postgres.mjs status",
-    "build": "pnpm --recursive --if-present run build",
+    "build": "pnpm --filter @qimao-terms-cloud/contracts run build && pnpm --recursive --if-present run build",
     "typecheck": "pnpm --recursive --if-present run typecheck",
     "lint": "pnpm --recursive --if-present run lint && node --check tools/verify-repository.mjs && node --check tools/local-postgres.mjs",
-    "test": "pnpm run db:setup && vitest run",
+    "test": "pnpm --filter @qimao-terms-cloud/contracts run build && pnpm run db:setup && vitest run",
     "check:repo": "node tools/verify-repository.mjs",
     "check": "pnpm run check:repo && pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run build"
   },

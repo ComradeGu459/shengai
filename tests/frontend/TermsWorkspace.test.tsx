@@ -134,7 +134,10 @@ const renderPage = () => {
   return render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={[`/projects/${projectId}/terms`]}>
-        <Routes><Route path="/projects/:projectId/terms" element={<TermsWorkspace />} /></Routes>
+        <Routes>
+          <Route path="/projects/:projectId/terms" element={<TermsWorkspace />} />
+          <Route path="/projects/:projectId/asr" element={<div>中文识别入口</div>} />
+        </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -348,12 +351,27 @@ describe('正式术语工作台', () => {
       return baseFetch(input);
     });
     renderPage();
-    const trigger = await screen.findByRole('button', { name: '确认并导出' });
+    const trigger = await screen.findByRole('button', { name: '生成术语版本并进入中文识别' });
     fireEvent.click(trigger);
     expect(screen.getByRole('button', { name: '取消' })).toHaveFocus();
-    fireEvent.click(screen.getByRole('dialog').querySelector('button.primaryButton') ?? screen.getAllByRole('button', { name: '确认并导出' }).at(-1)!);
-    await screen.findByText(/术语 V3 已创建/);
+    fireEvent.click(screen.getByRole('dialog').querySelector('button.primaryButton') ?? screen.getAllByRole('button', { name: '生成术语版本并进入中文识别' }).at(-1)!);
+    await screen.findByText('中文识别入口');
     expect(calls).toEqual(['release']);
+  });
+
+  it('存在待确认候选时最终流程区保持可见并一键筛选待确认项', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith(`/projects/${projectId}/terms`)) return response(workspace(2));
+      if (url.includes('/terms/candidates?')) return response({ items: [candidate], total: 2 });
+      return baseFetch(input);
+    });
+    renderPage();
+    await screen.findByText('叶知秋');
+    expect(screen.getByRole('region', { name: '术语审核最终流程' })).toHaveTextContent('还需裁决 2 项');
+    fireEvent.click(screen.getByRole('button', { name: '查看待确认项' }));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input]) => String(input).includes('status=pending'))).toBe(true));
+    expect(screen.getByRole('combobox', { name: '状态' })).toHaveValue('pending');
   });
 
   it('发布结果未知时使用相同请求与幂等键重放，并恢复同一组版本、模板和导出标识', async () => {
@@ -373,13 +391,13 @@ describe('正式术语工作台', () => {
       return baseFetch(input);
     });
     renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: '确认并导出' }));
+    fireEvent.click(await screen.findByRole('button', { name: '生成术语版本并进入中文识别' }));
     const dialog = screen.getByRole('dialog');
-    fireEvent.click(within(dialog).getByRole('button', { name: '确认并导出' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: '生成术语版本并进入中文识别' }));
     expect(await within(dialog).findByText('发布结果未知')).toBeInTheDocument();
-    fireEvent.click(within(dialog).getByRole('button', { name: '确认并导出' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: '生成术语版本并进入中文识别' }));
 
-    await screen.findByText(/术语 V3 已创建/);
+    await screen.findByText('中文识别入口');
     expect(releaseCalls).toHaveLength(2);
     expect(releaseCalls[1]).toEqual(releaseCalls[0]);
     expect(JSON.parse(releaseCalls[0]!.body)).toEqual({
@@ -410,20 +428,33 @@ describe('正式术语工作台', () => {
       return baseFetch(input);
     });
     renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: '确认并导出' }));
+    fireEvent.click(await screen.findByRole('button', { name: '生成术语版本并进入中文识别' }));
     const dialog = screen.getByRole('dialog');
-    fireEvent.click(within(dialog).getByRole('button', { name: '确认并导出' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: '生成术语版本并进入中文识别' }));
 
     expect(await within(dialog).findByText('草稿已更新，请重新提交')).toBeInTheDocument();
     await waitFor(() => expect(workspaceReads).toBeGreaterThan(1));
     expect(releaseCalls).toHaveLength(1);
-    fireEvent.click(within(dialog).getByRole('button', { name: '确认并导出' }));
-    await screen.findByText(/术语 V3 已创建/);
+    fireEvent.click(within(dialog).getByRole('button', { name: '生成术语版本并进入中文识别' }));
+    await screen.findByText('中文识别入口');
 
     expect(releaseCalls).toHaveLength(2);
     expect(releaseCalls[1]!.key).not.toBe(releaseCalls[0]!.key);
     expect(JSON.parse(releaseCalls[0]!.body).expectedDraftRevision).toBe(4);
     expect(JSON.parse(releaseCalls[1]!.body).expectedDraftRevision).toBe(5);
+  });
+
+  it('首次 ready 来源且无 draft/version/run 时显示开始提取术语，不显示来源变化警告', async () => {
+    const firstImport = { ...workspace(0, false), latestRun: null, latestVersion: null };
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith(`/projects/${projectId}/terms`)) return response(firstImport);
+      return baseFetch(input);
+    });
+    renderPage();
+
+    expect(await screen.findByRole('button', { name: '开始提取术语' })).toBeInTheDocument();
+    expect(screen.queryByText('公司 SRT 内容已变化')).not.toBeInTheDocument();
   });
 
   it.each([
@@ -441,6 +472,10 @@ describe('正式术语工作台', () => {
     renderPage();
     await screen.findByText('叶知秋');
     expect(screen.getByRole('link', { name: '下载原历史 XLSX' })).toBeInTheDocument();
+    if (workspacePatch.sourceIsCurrent === false) {
+      expect(screen.getByText('公司 SRT 内容已变化')).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: '开始提取术语' })).not.toBeInTheDocument();
+    }
     expect(screen.queryByRole('button', { name: '人工新增' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '确认' })).not.toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: '选择 叶知秋' })).toBeDisabled();

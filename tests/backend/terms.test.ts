@@ -3,10 +3,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { createApp } from '../../backend/src/app.js';
-import type { ProjectLifecycleConfig, UploadProtocolConfig } from '../../backend/src/config.js';
+import { uploadCompletionConfig, type ProjectLifecycleConfig, type UploadProtocolConfig } from '../../backend/src/config.js';
 import { createPool } from '../../backend/src/database/pool.js';
 import { InMemoryStorageFake } from '../../backend/src/modules/uploads/in-memory-storage.fake.js';
+import { TermExtractionRepository } from '../../backend/src/modules/terms/term-extraction.repository.js';
+import { TermProviderError } from '../../backend/src/modules/terms/term-openai-compatible-adapter.js';
 import { ProjectCleanupWorker } from '../../backend/src/workers/project-cleanup.worker.js';
+import { TermExtractionWorker } from '../../backend/src/workers/term-extraction.worker.js';
+import { UploadCompletionWorker } from '../../backend/src/workers/upload-completion.worker.js';
 
 const pool = createPool();
 const storage = new InMemoryStorageFake();
@@ -146,8 +150,32 @@ const uploadBinding = async (
     headers: { 'idempotency-key': randomUUID() },
     payload: { expectedVersion: session.version },
   });
-  expect(completed.statusCode, completed.body).toBe(200);
-  return completed.json().asset;
+  expect(completed.statusCode, completed.body).toBe(202);
+  const verifying = completed.json();
+  expect(verifying).toMatchObject({ id: session.id, status: 'verifying' });
+
+  const worker = new UploadCompletionWorker(
+    pool,
+    storage,
+    uploadCompletionConfig,
+    { workerId: `terms-test-${randomUUID()}` },
+  );
+  const processed = await worker.runOnce();
+  expect(processed).toMatchObject({
+    processed: true,
+    uploadSessionId: session.id,
+    status: 'completed',
+  });
+
+  const finalized = await app.inject({ method: 'GET', url: `/api/uploads/${session.id}` });
+  expect(finalized.statusCode, finalized.body).toBe(200);
+  const finalizedSession = finalized.json();
+  expect(finalizedSession).toMatchObject({
+    id: session.id,
+    status: 'completed',
+    asset: expect.objectContaining({ id: expect.any(String) }),
+  });
+  return finalizedSession.asset;
 };
 
 const encode = (text: string) => new TextEncoder().encode(text);
@@ -187,6 +215,37 @@ const extract = async (projectId: string, expectedDigest?: string, key = randomU
   headers: { 'idempotency-key': key },
   payload: expectedDigest ? { expectedSourceSrtSetDigest: expectedDigest } : {},
 });
+
+const extractCompleted = async (projectId: string, expectedDigest?: string, key = randomUUID()) => {
+  const started = await extract(projectId, expectedDigest, key);
+  expect(started.statusCode, started.body).toBe(202);
+  const worker = new TermExtractionWorker(pool, storage, app.termExtractionAdapter, {
+    workerId: `terms-extraction-test-${randomUUID()}`,
+  });
+  expect(await worker.runOnce()).toMatchObject({
+    processed: true, projectId, status: 'completed',
+  });
+  const completed = await workspace(projectId);
+  return {
+    statusCode: 200,
+    body: JSON.stringify({ run: completed.latestRun, draft: completed.activeDraft }),
+    json: () => ({ run: completed.latestRun, draft: completed.activeDraft }),
+  };
+};
+
+const createRoutingVersionForTermTest = async () => {
+  const routingVersionId = randomUUID();
+  const next = await pool.query<{ version: number }>(
+    `SELECT COALESCE(MAX(version), 0) + 1 AS version
+       FROM routing_policy_versions WHERE environment = 'development' AND workflow_stage = 'terms'`,
+  );
+  await pool.query(
+    `INSERT INTO routing_policy_versions(id,environment,workflow_stage,version)
+     VALUES ($1,'development','terms',$2)`,
+    [routingVersionId, next.rows[0]!.version],
+  );
+  return routingVersionId;
+};
 
 const listCandidates = async (projectId: string, draftId: string, suffix = '') => {
   const response = await app.inject({
@@ -279,8 +338,9 @@ describe('BACK-M3-01A 术语后端权威流程', () => {
     const source = await prepareSource();
     const first = await workspace(source.project.id);
     expect(first.source).toMatchObject({ status: 'ready', assetCount: 1, episodeCount: 1 });
+    expect(first).toMatchObject({ activeDraft: null, latestVersion: null, latestRun: null, sourceIsCurrent: true });
     const digest = first.source.sourceSrtSetDigest;
-    expect((await extract(source.project.id, digest)).statusCode).toBe(201);
+    expect((await extract(source.project.id, digest)).statusCode).toBe(202);
     expect((await workspace(source.project.id)).sourceIsCurrent).toBe(true);
 
     const videoBytes = encode('video123');
@@ -323,16 +383,21 @@ describe('BACK-M3-01A 术语后端权威流程', () => {
     const state = await workspace(source.project.id);
     const key = randomUUID();
     const first = await extract(source.project.id, state.source.sourceSrtSetDigest, key);
+    expect(first.statusCode, first.body).toBe(202);
+    expect(first.json().run).toMatchObject({ status: 'running' });
+    expect(await new TermExtractionWorker(pool, storage, app.termExtractionAdapter, {
+      workerId: `terms-extraction-test-${randomUUID()}`,
+    }).runOnce()).toMatchObject({ processed: true, projectId: source.project.id, status: 'completed' });
     const replay = await extract(source.project.id, state.source.sourceSrtSetDigest, key);
-    expect(first.statusCode, first.body).toBe(201);
     expect(replay.statusCode, replay.body).toBe(200);
-    expect(replay.json()).toEqual(first.json());
-    expect(first.json().run).toMatchObject({
+    expect(replay.json().run).toMatchObject({
       status: 'completed', adapter: 'deterministic-marker-fake',
       adapterConfig: { paid: false }, usageSummary: { inputCues: 8, paidCalls: 0 },
       cueCount: 8, candidateCount: 8,
     });
-    const draftId = first.json().draft.id;
+    expect(replay.json().run.id).toBe(first.json().run.id);
+    expect(replay.json().draft.id).toBeDefined();
+    const draftId = replay.json().draft.id;
     const page1 = await listCandidates(source.project.id, draftId, '&limit=3&offset=0&sortBy=type');
     const page2 = await listCandidates(source.project.id, draftId, '&limit=3&offset=3&sortBy=type');
     expect(page1.total).toBe(8);
@@ -350,7 +415,7 @@ describe('BACK-M3-01A 术语后端权威流程', () => {
 
   it('Cue 查询限定活动草稿与来源，并支持原文搜索、集数、分页及人工新增', async () => {
     const source = await prepareSource();
-    const started = await extract(source.project.id);
+    const started = await extractCompleted(source.project.id);
     const draftId = started.json().draft.id;
     await pool.query(
       `INSERT INTO term_cues
@@ -434,7 +499,7 @@ describe('BACK-M3-01A 术语后端权威流程', () => {
 
   it('人工裁决使用条件版本、不可变事件，批量操作逐项返回局部结果并允许带证据新增', async () => {
     const source = await prepareSource();
-    const started = await extract(source.project.id);
+    const started = await extractCompleted(source.project.id);
     const draftId = started.json().draft.id;
     const list = await listCandidates(source.project.id, draftId);
     const first = list.items[0];
@@ -589,7 +654,7 @@ describe('BACK-M3-01A 术语后端权威流程', () => {
 
   it('候选写入在事务内阻断回收态、来源变化和运行中提取', async () => {
     const runningSource = await prepareSource();
-    const runningStarted = await extract(runningSource.project.id);
+    const runningStarted = await extractCompleted(runningSource.project.id);
     const runningList = await listCandidates(runningSource.project.id, runningStarted.json().draft.id);
     await pool.query(
       `INSERT INTO term_extraction_runs
@@ -644,7 +709,7 @@ describe('BACK-M3-01A 术语后端权威流程', () => {
 
     for (const lifecycle of ['recycled', 'purging'] as const) {
       const source = await prepareSource();
-      const started = await extract(source.project.id);
+      const started = await extractCompleted(source.project.id);
       const list = await listCandidates(source.project.id, started.json().draft.id);
       await pool.query('UPDATE projects SET lifecycle_status = $2 WHERE id = $1', [source.project.id, lifecycle]);
       const blocked = await app.inject({
@@ -667,7 +732,7 @@ describe('BACK-M3-01A 术语后端权威流程', () => {
 
   it('全部离开 pending 后幂等确认 V1，后续新草稿生成 V2 且不覆盖 V1', async () => {
     const source = await prepareSource();
-    const started = await extract(source.project.id);
+    const started = await extractCompleted(source.project.id);
     const draftId = started.json().draft.id;
     const template = await getActiveTemplate();
     const initial = await workspace(source.project.id);
@@ -754,7 +819,7 @@ describe('BACK-M3-01A 术语后端权威流程', () => {
 
   it('单一发布事务不留半成品，幂等重放稳定且显式模板不受启用项变化影响', async () => {
     const source = await prepareSource();
-    const started = await extract(source.project.id);
+    const started = await extractCompleted(source.project.id);
     await approveAll(source.project.id, started.json().draft.id);
     const ready = await workspace(source.project.id);
     const defaultTemplate = await getActiveTemplate();
@@ -867,7 +932,7 @@ describe('BACK-M3-01A 术语后端权威流程', () => {
 
   it('公司模板版本保持五字段唯一，明确绑定已确认版本并确定性生成历史 XLSX', async () => {
     const source = await prepareSource();
-    const started = await extract(source.project.id);
+    const started = await extractCompleted(source.project.id);
     await approveAll(source.project.id, started.json().draft.id);
     const ready = await workspace(source.project.id);
     const templateList = await app.inject({ method: 'GET', url: '/api/terms/export-templates' });
@@ -1095,7 +1160,7 @@ describe('BACK-M3-01A 术语后端权威流程', () => {
 
   it('项目到期清理会按既有 Worker 生命周期移除术语状态且不阻塞 Asset 清理', async () => {
     const source = await prepareSource();
-    const started = await extract(source.project.id);
+    const started = await extractCompleted(source.project.id);
     await approveAll(source.project.id, started.json().draft.id);
     const ready = await workspace(source.project.id);
     const confirmed = await publishTerms({
@@ -1131,5 +1196,202 @@ describe('BACK-M3-01A 术语后端权威流程', () => {
       [source.project.id],
     );
     expect(remaining.rows[0]?.count).toBe('0');
+  });
+
+  it('受控 run 固化主备 target，明确 external_not_accepted 才进入预固化 standby 且配置不漂移', async () => {
+    const source = await prepareSource();
+    const routingVersionId = await createRoutingVersionForTermTest();
+    const primaryId = randomUUID();
+    const standbyId = randomUUID();
+    const target = (routingTargetId: string, priority: number, endpoint: string) => ({
+      routingVersionId,
+      routingTargetId,
+      deploymentVersionId: randomUUID(),
+      priority,
+      role: priority === 1 ? 'preferred' as const : 'standard' as const,
+      adapterKey: 'controlled-stub',
+      executionKind: 'cloud_api' as const,
+      provider: 'stub',
+      model: `term-model-${priority}`,
+      runtimeConfig: { preset: 'custom', endpoint, prompt: `prompt-${priority}`, categoryOrder: ['人名', '地名', '特定物品', '朝代', '组织名', '等级', '物种/种族名', '特殊概念/事件'] },
+      adapterConfig: { preset: 'custom', endpoint, model: `term-model-${priority}`, prompt: `prompt-${priority}`, promptVersion: 'term-prompt-v1', categoryOrder: ['人名', '地名', '特定物品', '朝代', '组织名', '等级', '物种/种族名', '特殊概念/事件'] },
+      configDigest: `${priority}`.repeat(64),
+      secretReferenceVersionId: null,
+      secretReferenceSummary: {},
+    });
+    const snapshot = {
+      routingVersionId,
+      routeDigest: 'a'.repeat(64),
+      configDigest: 'b'.repeat(64),
+      targets: [target(primaryId, 1, 'https://primary.example.test/v1/chat/completions'), target(standbyId, 2, 'https://standby.example.test/v1/chat/completions')],
+    } as const;
+    const begun = await new TermExtractionRepository(pool).begin({
+      projectId: source.project.id,
+      sourceDigest: (await workspace(source.project.id)).source.sourceSrtSetDigest,
+      promptVersion: 'term-prompt-v1',
+      adapter: 'legacy-adapter',
+      adapterConfig: {},
+      idempotencyKey: randomUUID(),
+      requestHash: randomUUID().replaceAll('-', '').padEnd(64, '0'),
+      requestId: randomUUID(),
+      routeSnapshot: snapshot,
+    });
+    const seen: string[] = [];
+    const claimTime = new Date();
+    const preClaim = await new TermExtractionRepository(pool).claimAttempt({
+      workerId: 'expired-before-provider', leaseMs: 1_000, now: claimTime,
+    });
+    expect(preClaim?.attempt.id).toBeDefined();
+    expect(preClaim?.attempt.adapter_config).toMatchObject({ endpoint: 'https://primary.example.test/v1/chat/completions', model: 'term-model-1' });
+    const success = {
+      name: 'controlled-stub',
+      configSummary: {},
+      extract: async ({ cues }: { cues: Array<{ id: string }> }) => ({
+        candidates: [{ type: '人名' as const, name: '林川', aliases: [], gender: 'male' as const, note: '', confidence: 1, evidenceCueIds: [cues[0]!.id] }],
+        diagnostics: [], usageSummary: { inputCues: cues.length, paidCalls: 0 },
+      }),
+    };
+    const worker = new TermExtractionWorker(pool, storage, app.termExtractionAdapter, {
+      workerId: `controlled-${randomUUID()}`,
+      clock: () => new Date(claimTime.getTime() + 2_000),
+      adapterFactory: async (targetSnapshot) => {
+        seen.push(targetSnapshot.routingTargetId);
+        if (targetSnapshot.routingTargetId === primaryId) {
+          throw new TermProviderError('TERM_PROVIDER_HTTP_ERROR', '外部明确拒绝当前 target。', 'external_not_accepted', 409);
+        }
+        return success;
+      },
+    });
+    expect(await worker.runOnce()).toMatchObject({ processed: true, status: 'running', fallback: true });
+    expect(await worker.runOnce()).toMatchObject({ processed: true, status: 'completed' });
+    expect(seen).toEqual([primaryId, standbyId]);
+    const attempts = await pool.query<{ priority: number; status: string; adapter_config: Record<string, unknown> }>(
+      `SELECT priority,status,adapter_config FROM term_extraction_attempts WHERE run_id=$1 ORDER BY priority`, [begun.run.id],
+    );
+    expect(attempts.rows.map((row) => row.status)).toEqual(['failed', 'succeeded']);
+    expect(attempts.rows[0]?.adapter_config).toMatchObject({ endpoint: 'https://primary.example.test/v1/chat/completions', model: 'term-model-1' });
+    expect(attempts.rows[1]?.adapter_config).toMatchObject({ endpoint: 'https://standby.example.test/v1/chat/completions', model: 'term-model-2' });
+    const locked = await pool.query<{ route_digest: string; config_digest: string; route_snapshot: Record<string, unknown> }>(
+      'SELECT route_digest,config_digest,route_snapshot FROM term_extraction_runs WHERE id=$1', [begun.run.id],
+    );
+    expect(locked.rows[0]).toMatchObject({ route_digest: 'a'.repeat(64), config_digest: 'b'.repeat(64) });
+    expect(JSON.stringify(locked.rows[0]?.route_snapshot)).not.toMatch(/bearerKey|secretKey/i);
+  });
+
+  it('unknown Provider 只把当前 attempt 停在 unknown，不切备用也不自动重发', async () => {
+    const source = await prepareSource();
+    const routingVersionId = await createRoutingVersionForTermTest();
+    const primaryId = randomUUID();
+    const standbyId = randomUUID();
+    const snapshot = {
+      routingVersionId,
+      routeDigest: 'c'.repeat(64),
+      configDigest: 'd'.repeat(64),
+      targets: [1, 2].map((priority) => ({
+        routingVersionId,
+        routingTargetId: priority === 1 ? primaryId : standbyId,
+        deploymentVersionId: randomUUID(),
+        priority,
+        role: priority === 1 ? 'preferred' as const : 'standard' as const,
+        adapterKey: 'unknown-stub',
+        executionKind: 'cloud_api' as const,
+        provider: 'stub',
+        model: `unknown-${priority}`,
+        runtimeConfig: { preset: 'custom', endpoint: `https://unknown-${priority}.example.test`, prompt: 'prompt', categoryOrder: ['人名', '地名', '特定物品', '朝代', '组织名', '等级', '物种/种族名', '特殊概念/事件'] },
+        adapterConfig: { preset: 'custom', endpoint: `https://unknown-${priority}.example.test`, model: `unknown-${priority}`, prompt: 'prompt', promptVersion: 'term-prompt-v1', categoryOrder: ['人名', '地名', '特定物品', '朝代', '组织名', '等级', '物种/种族名', '特殊概念/事件'] },
+        configDigest: `${priority + 2}`.repeat(64),
+        secretReferenceVersionId: null,
+        secretReferenceSummary: {},
+      })),
+    } as const;
+    const begun = await new TermExtractionRepository(pool).begin({
+      projectId: source.project.id,
+      sourceDigest: (await workspace(source.project.id)).source.sourceSrtSetDigest,
+      promptVersion: 'term-prompt-v1', adapter: 'legacy-adapter', adapterConfig: {},
+      idempotencyKey: randomUUID(), requestHash: randomUUID().replaceAll('-', '').padEnd(64, '0'), requestId: randomUUID(), routeSnapshot: snapshot,
+    });
+    let calls = 0;
+    const worker = new TermExtractionWorker(pool, storage, app.termExtractionAdapter, {
+      workerId: `unknown-${randomUUID()}`,
+      adapterFactory: async () => {
+        calls += 1;
+        throw new TermProviderError('TERM_PROVIDER_REQUEST_FAILED', 'Provider 请求结果未知。', 'unknown');
+      },
+    });
+    expect(await worker.runOnce()).toMatchObject({ processed: true, status: 'failed', fallback: false });
+    expect(await worker.runOnce()).toEqual({ processed: false });
+    expect(calls).toBe(1);
+    const attempts = await pool.query<{ priority: number; status: string }>(
+      'SELECT priority,status FROM term_extraction_attempts WHERE run_id=$1 ORDER BY priority', [begun.run.id],
+    );
+    expect(attempts.rows.map((row) => row.status)).toEqual(['unknown', 'queued']);
+  });
+
+  it('marker 后进程崩溃且 lease 到期时 sweep 原子收敛 unknown，不解锁备用也不再调用 adapter', async () => {
+    const source = await prepareSource();
+    const routingVersionId = await createRoutingVersionForTermTest();
+    const primaryId = randomUUID();
+    const standbyId = randomUUID();
+    const snapshot = {
+      routingVersionId,
+      routeDigest: 'e'.repeat(64),
+      configDigest: 'f'.repeat(64),
+      targets: [1, 2].map((priority) => ({
+        routingVersionId,
+        routingTargetId: priority === 1 ? primaryId : standbyId,
+        deploymentVersionId: randomUUID(),
+        priority,
+        role: priority === 1 ? 'preferred' as const : 'standard' as const,
+        adapterKey: 'crash-stub',
+        executionKind: 'cloud_api' as const,
+        provider: 'stub',
+        model: `crash-${priority}`,
+        runtimeConfig: { preset: 'custom', endpoint: `https://crash-${priority}.example.test`, prompt: 'prompt', categoryOrder: ['人名', '地名', '特定物品', '朝代', '组织名', '等级', '物种/种族名', '特殊概念/事件'] },
+        adapterConfig: { preset: 'custom', endpoint: `https://crash-${priority}.example.test`, model: `crash-${priority}`, prompt: 'prompt', promptVersion: 'term-prompt-v1', categoryOrder: ['人名', '地名', '特定物品', '朝代', '组织名', '等级', '物种/种族名', '特殊概念/事件'] },
+        configDigest: `${priority + 4}`.repeat(64),
+        secretReferenceVersionId: null,
+        secretReferenceSummary: {},
+      })),
+    } as const;
+    const begun = await new TermExtractionRepository(pool).begin({
+      projectId: source.project.id,
+      sourceDigest: (await workspace(source.project.id)).source.sourceSrtSetDigest,
+      promptVersion: 'term-prompt-v1', adapter: 'legacy-adapter', adapterConfig: {},
+      idempotencyKey: randomUUID(), requestHash: randomUUID().replaceAll('-', '').padEnd(64, '0'), requestId: randomUUID(), routeSnapshot: snapshot,
+    });
+    const repository = new TermExtractionRepository(pool);
+    const marked = await repository.claimAttempt({ workerId: 'crashed-worker', leaseMs: 1_000, now: new Date('2026-01-01T00:00:00.000Z') });
+    expect(marked?.attempt.routing_target_id).toBe(primaryId);
+    expect(await repository.markAttemptProviderStarted({
+      runId: begun.run.id,
+      attemptId: marked!.attempt.id,
+      workerId: 'crashed-worker',
+      now: new Date('2026-01-01T00:00:00.000Z'),
+    })).toBe(true);
+    const adapterCalls: string[] = [];
+    const worker = new TermExtractionWorker(pool, storage, app.termExtractionAdapter, {
+      workerId: `after-crash-${randomUUID()}`,
+      clock: () => new Date('2026-01-01T00:01:00.000Z'),
+      adapterFactory: async (targetSnapshot) => {
+        adapterCalls.push(targetSnapshot.routingTargetId);
+        return app.termExtractionAdapter;
+      },
+    });
+    const first = await worker.runOnce();
+    expect(first).toEqual({ processed: false });
+    const state = await pool.query<{ run_status: string; run_error_code: string | null; priority: number; status: string; claimed_by: string | null; claim_expires_at: Date | null }>(
+      `SELECT run.status AS run_status, run.error_code AS run_error_code,
+              attempt.priority, attempt.status, attempt.claimed_by, attempt.claim_expires_at
+         FROM term_extraction_runs run
+         JOIN term_extraction_attempts attempt ON attempt.run_id = run.id
+        WHERE run.id = $1 ORDER BY attempt.priority`,
+      [begun.run.id],
+    );
+    expect(state.rows).toEqual([
+      expect.objectContaining({ run_status: 'failed', run_error_code: 'TERM_PROVIDER_UNKNOWN', priority: 1, status: 'unknown', claimed_by: null, claim_expires_at: null }),
+      expect.objectContaining({ run_status: 'failed', run_error_code: 'TERM_PROVIDER_UNKNOWN', priority: 2, status: 'queued', claimed_by: null }),
+    ]);
+    expect(await worker.runOnce()).toEqual({ processed: false });
+    expect(adapterCalls).toEqual([]);
   });
 });

@@ -1,0 +1,34 @@
+{
+  "$schema": "qimao.application-release/v1",
+  "formatVersion": 1,
+  "release": {
+    "id": "pre-review-acceptance-release-20260901-r1",
+    "previousBackendTarget": "/opt/qimao-terms-cloud/releases/screen-text-partial-release-20260901-r1",
+    "previousStaticTarget": "/srv/qimao-terms-cloud/frontend-screen-text-partial-release-20260901-r1"
+  },
+  "runtime": {
+    "preservedUnits": {
+      "asr": "active/running/0/0",
+      "screenText": "inactive/dead/0/0",
+      "openVino": "active/running/0/0"
+    }
+  },
+  "candidate": {
+    "staticMarkers": [
+      "前置审改会话已创建，正在准备对齐事实。",
+      "来源已经变化，历史会话只读",
+      "画面字来源为部分 Release",
+      "创建并固定来源",
+      "历史验收版本已发布，当前会话只读。"
+    ],
+    "unauthenticatedProbe": {
+      "label": "subtitle_acceptance_sessions",
+      "path": "/api/projects/00000000-0000-0000-0000-000000000000/subtitle-acceptance/sessions"
+    }
+  },
+  "migration": {
+    "mode": "gated",
+    "helper": "db-migration-gate.mjs",
+    "schema": "1754976035000_lock_review_source_identity"
+  }
+}

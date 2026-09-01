@@ -1,0 +1,65 @@
+{
+  "$schema": "qimao.worker-release/v1",
+  "formatVersion": 1,
+  "artifact": {
+    "releaseDirectory": "release",
+    "currentLink": "current",
+    "requiredEntries": [
+      {
+        "id": "storage",
+        "path": "backend/dist/modules/storage/s3-compatible-storage.js"
+      },
+      {
+        "id": "asr-runtime",
+        "path": "backend/dist/modules/asr/tencent-asr-runtime.js"
+      },
+      {
+        "id": "asr-worker",
+        "path": "backend/dist/workers/asr.worker.entry.js"
+      },
+      {
+        "id": "app",
+        "path": "backend/dist/app.js"
+      },
+      {
+        "id": "server",
+        "path": "backend/dist/server.js"
+      }
+    ],
+    "standaloneEntry": "backend/dist/workers/asr.worker.entry.js"
+  },
+  "systemd": {
+    "instanceUnit": "qimao-worker@asr.worker.entry.js.service",
+    "dropInDirectory": "/etc/systemd/system/qimao-worker@asr.worker.entry.js.service.d",
+    "dropInFile": "override.conf",
+    "user": "qimao",
+    "group": "qimao",
+    "environmentFiles": [
+      {
+        "id": "backend",
+        "path": "/etc/qimao-terms-cloud/backend.env",
+        "required": true
+      },
+      {
+        "id": "object-storage",
+        "path": "/etc/qimao-terms-cloud/object-storage.env",
+        "required": true
+      },
+      {
+        "id": "provider",
+        "path": "/etc/qimao-terms-cloud/provider.env",
+        "required": true
+      }
+    ],
+    "execStart": [
+      "/usr/local/bin/node",
+      "--preserve-symlinks-main",
+      "/opt/qimao-terms-cloud/current/backend/dist/workers/asr.worker.entry.js"
+    ]
+  },
+  "preflight": {
+    "runnerFlag": "--preserve-symlinks-main",
+    "requireExitCode": 0,
+    "silentStdoutIsFailure": true
+  }
+}

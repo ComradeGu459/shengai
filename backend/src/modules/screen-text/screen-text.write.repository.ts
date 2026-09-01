@@ -15,6 +15,9 @@ import type { ScreenTextAdapterDescriptor } from './screen-text.adapter.js';
 import { buildTermProjection, descriptorSnapshot, normalizeEpisodeNumbers, renderScreenTextSrt, stableHash } from './screen-text.domain.js';
 import { screenTextConflict, screenTextInvalid, screenTextNotFound } from './screen-text.errors.js';
 import { ScreenTextReadRepository } from './screen-text.read.repository.js';
+import type { ScreenTextAdapterRegistry } from './screen-text.adapter-registry.js';
+import type { SystemControlRoutingService } from '../system-control/system-control.routing.service.js';
+import { SystemControlRoutingError } from '../system-control/system-control.routing.errors.js';
 
 const activeBatchStatuses = [
   'queued', 'running', 'review_pending', 'partial', 'cancel_requested', 'reconciliation_required',
@@ -25,7 +28,8 @@ export class ScreenTextWriteRepository {
 
   constructor(
     private readonly database: DatabasePool,
-    private readonly descriptor: Readonly<ScreenTextAdapterDescriptor>,
+    private readonly routingService: SystemControlRoutingService,
+    private readonly adapterRegistry: ScreenTextAdapterRegistry,
   ) {
     this.reads = new ScreenTextReadRepository(database);
   }
@@ -66,6 +70,13 @@ export class ScreenTextWriteRepository {
       if (termVersion.rows[0].id !== input.body.termVersionId) {
         throw screenTextInvalid('SCREEN_TEXT_TERM_VERSION_NOT_LATEST', '必须使用项目最新已确认术语版本。', 'confirm_terms');
       }
+      let active: Awaited<ReturnType<SystemControlRoutingService['resolveActiveTarget']>>;
+      try {
+        active = await this.routingService.resolveActiveTarget('screen_text', 'ocr_api', this.adapterRegistry, client);
+      } catch (error) {
+        if (!(error instanceof SystemControlRoutingError)) throw error;
+        throw screenTextConflict('SCREEN_TEXT_ROUTING_NOT_ACTIVE', error.message, 'publish_routing_policy');
+      }
       const manifestEpisodes = await client.query<{ episode_number: number }>(`
         SELECT DISTINCT episode_number FROM material_manifest_bindings
         WHERE manifest_id = $1 ORDER BY episode_number
@@ -89,33 +100,37 @@ export class ScreenTextWriteRepository {
       if (!episodeNumbers.length || episodeNumbers.some((episode) => !available.includes(episode))) {
         throw screenTextInvalid('SCREEN_TEXT_VIDEO_NOT_READY', '所选集数没有已校验的画面字视频。', 'prepare_screen_videos');
       }
-      const active = await client.query(`
+      const activeBatch = await client.query(`
         SELECT id FROM screen_text_batches
         WHERE project_id = $1 AND manifest_id = $2 AND status = ANY($3::screen_text_batch_status[])
           AND episode_numbers && $4::integer[] LIMIT 1
       `, [input.projectId, manifest.rows[0].id, activeBatchStatuses, episodeNumbers]);
-      if (active.rowCount) throw screenTextConflict('SCREEN_TEXT_BATCH_ACTIVE', '同一来源和范围已有活动画面字批次。');
+      if (activeBatch.rowCount) throw screenTextConflict('SCREEN_TEXT_BATCH_ACTIVE', '同一来源和范围已有活动画面字批次。');
       const termRows = await client.query<any>(`
         SELECT id, type::text, name, aliases, note FROM term_version_items
         WHERE term_version_id = $1 ORDER BY sort_order, id
       `, [input.body.termVersionId]);
       const projection = buildTermProjection(termRows.rows);
-      const descriptor = descriptorSnapshot(this.descriptor);
+      const selectedDescriptor = active.descriptor as Readonly<ScreenTextAdapterDescriptor>;
+      const descriptor = descriptorSnapshot(selectedDescriptor);
+      const runtimeConfig = active.runtimeConfig ?? null;
+      const runtimeConfigDigest = runtimeConfig ? stableHash(runtimeConfig) : null;
       const batch = await client.query<{ id: string }>(`
         INSERT INTO screen_text_batches (
           project_id, scope_kind, episode_numbers, term_version_id, manifest_id, manifest_version,
           execution_kind, provider, adapter, model, language, deployment, input_version, output_version,
-          capabilities, config_digest, frame_strategy_version, dedupe_strategy_version,
-          term_projection, term_projection_entries, request_id
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+          capabilities, config_digest, runtime_config, runtime_config_digest, frame_strategy_version, dedupe_strategy_version,
+          term_projection, term_projection_entries, request_id, routing_version_id, route_digest
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
         RETURNING id
       `, [
         input.projectId, input.body.scope.kind, episodeNumbers, input.body.termVersionId,
         manifest.rows[0].id, manifest.rows[0].version,
         descriptor.kind, descriptor.provider, descriptor.adapter, descriptor.model, descriptor.language,
         descriptor.deployment, descriptor.inputVersion, descriptor.outputVersion, descriptor.capabilities,
-        descriptor.configDigest, 'adaptive-frame-v1', 'perceptual-dedupe-v1',
+        descriptor.configDigest, runtimeConfig, runtimeConfigDigest, 'adaptive-frame-v1', 'perceptual-dedupe-v1',
         projection.summary, JSON.stringify(projection.entries), input.requestId,
+        active.routingVersionId, active.routeDigest,
       ]);
       const batchId = batch.rows[0]?.id;
       if (!batchId) throw new Error('SCREEN_TEXT_BATCH_CREATE_FAILED');
@@ -129,9 +144,9 @@ export class ScreenTextWriteRepository {
         `, [batchId, episodeNumber, asset.asset_id, asset.object_key, asset.original_filename,
           asset.size_bytes, asset.checksum_algorithm, asset.checksum_value]);
         await client.query(`
-          INSERT INTO screen_text_jobs (batch_id, project_id, episode_number, asset_id, status)
-          VALUES ($1,$2,$3,$4,'queued')
-        `, [batchId, input.projectId, episodeNumber, asset.asset_id]);
+          INSERT INTO screen_text_jobs (batch_id, project_id, episode_number, asset_id, routing_version_id, route_digest, status)
+          VALUES ($1,$2,$3,$4,$5,$6,'queued')
+        `, [batchId, input.projectId, episodeNumber, asset.asset_id, active.routingVersionId, active.routeDigest]);
       }
       await this.saveCommand(client, input.projectId, 'create_batch', input.idempotencyKey, requestHash, batchId);
       return { batchId, replay: false };
@@ -181,7 +196,8 @@ export class ScreenTextWriteRepository {
           AND ((status='failed' AND EXISTS (
               SELECT 1 FROM screen_text_attempts attempt
               WHERE attempt.id=screen_text_jobs.current_attempt_id
-                AND attempt.status='failed' AND attempt.retryable=true
+                AND attempt.status='failed'
+                AND (attempt.retryable=true OR attempt.error_code='SCREEN_TEXT_TENCENT_MEDIA_UNAVAILABLE')
                 AND attempt.external_side_effect_possible=false
             ))
             OR (status='cancelled' AND (
@@ -248,6 +264,9 @@ export class ScreenTextWriteRepository {
         if (row.status !== 'rejected') throw screenTextInvalid('SCREEN_TEXT_DECISION_INVALID', '只有已忽略候选可以恢复为待确认。');
         await client.query(`UPDATE screen_text_candidates SET status='pending', revision=revision+1, updated_at=CURRENT_TIMESTAMP WHERE id=$1`, [candidateId]);
       } else if (body.action === 'edit') {
+        if (row.status === 'rejected') {
+          throw screenTextInvalid('SCREEN_TEXT_DECISION_INVALID', '已忽略候选必须先恢复为待确认后才能编辑。');
+        }
         const text = body.text?.trim() ?? row.text;
         const startMs = body.startMs ?? row.start_ms;
         const endMs = body.endMs ?? row.end_ms;
@@ -315,11 +334,11 @@ export class ScreenTextWriteRepository {
       const row = job.rows[0];
       this.validateEditable({ ...row, ...body, start_ms: body.startMs, end_ms: body.endMs, term_hits: [] });
       const evidenceObjectKey = `derived/screen-text/${batchId}/${episodeNumber}/manual-${stableHash(body).slice(0, 16)}.png`;
-      const candidate = await client.query<{ id: string }>(`
+      const candidate = await client.query<any>(`
         INSERT INTO screen_text_candidates (
           batch_id, job_id, episode_number, source, raw_text, text, start_ms, end_ms,
           category, position, confidence, status, evidence, term_hits
-        ) VALUES ($1,$2,$3,'manual',$4,$4,$5,$6,$7,$8,NULL,'edited',$9,'[]') RETURNING id
+        ) VALUES ($1,$2,$3,'manual',$4,$4,$5,$6,$7,$8,NULL,'edited',$9,'[]') RETURNING *
       `, [batchId, row.id, episodeNumber, body.text.trim(), body.startMs, body.endMs,
         body.category, body.position, {
           objectKey: evidenceObjectKey,
@@ -332,7 +351,7 @@ export class ScreenTextWriteRepository {
         INSERT INTO screen_text_decision_events (
           batch_id,job_id,candidate_id,episode_number,action,after_state,idempotency_key,request_hash
         ) VALUES ($1,$2,$3,$4,'manual_add',$5,$6,$7)
-      `, [batchId, row.id, candidateId, episodeNumber, body, idempotencyKey, requestHash]);
+      `, [batchId, row.id, candidateId, episodeNumber, { candidate: this.candidateState(candidate.rows[0]) }, idempotencyKey, requestHash]);
       await this.recomputeJobAndBatch(client, row.id, batchId);
       await this.saveCommand(client, projectId, 'manual_candidate', idempotencyKey, requestHash, candidateId);
       return { candidateId, replay: false };
@@ -374,7 +393,12 @@ export class ScreenTextWriteRepository {
   }
 
   async release(projectId: string, body: CreateScreenTextReleaseBody, idempotencyKey: string) {
-    const requestHash = stableHash(body);
+    const allowPartial = body.allowPartial === true;
+    const requestHash = stableHash({
+      batchId: body.batchId,
+      expectedBatchRevision: body.expectedBatchRevision,
+      allowPartial,
+    });
     const result = await this.transaction(async (client) => {
       await this.lockCommand(client, projectId, 'release', idempotencyKey);
       const existing = await this.command(client, projectId, 'release', idempotencyKey);
@@ -386,11 +410,50 @@ export class ScreenTextWriteRepository {
       if (batch.revision !== body.expectedBatchRevision) throw screenTextConflict('SCREEN_TEXT_CANDIDATE_VERSION_CONFLICT', '画面字批次修订已变化。');
       await this.recomputeBatch(client, body.batchId);
       const current = await client.query<any>(`SELECT * FROM screen_text_batches WHERE id=$1 FOR UPDATE`, [body.batchId]);
-      if (current.rows[0].status !== 'completed') throw screenTextConflict('SCREEN_TEXT_RELEASE_BLOCKED', '仍有待确认、失败、取消或需对账集数，不能发布。', 'complete_screen_text_review');
+      const jobs = await client.query<any>(`
+        SELECT job.id AS job_id, job.episode_number, job.status, job.current_attempt_id,
+               attempt.error_code, attempt.effect_class, attempt.provider_request_id
+        FROM screen_text_jobs job
+        LEFT JOIN screen_text_attempts attempt ON attempt.id = job.current_attempt_id
+        WHERE job.batch_id=$1
+        ORDER BY job.episode_number, job.id
+        FOR UPDATE OF job
+      `, [body.batchId]);
+      const blockingStatuses = new Set([
+        'not_started', 'queued', 'running', 'review_pending', 'cancel_requested', 'stale',
+      ]);
+      if (!allowPartial && current.rows[0].status !== 'completed') {
+        throw screenTextConflict('SCREEN_TEXT_RELEASE_BLOCKED', '仍有待确认、失败、取消或需对账集数，不能发布。', 'complete_screen_text_review');
+      }
+      if (allowPartial && jobs.rows.some((job) => blockingStatuses.has(job.status))) {
+        throw screenTextConflict('SCREEN_TEXT_PARTIAL_RELEASE_BLOCKED', '部分发布仍有未终结或待确认集数。', 'complete_screen_text_review');
+      }
+      const excludedEpisodes = jobs.rows
+        .filter((job) => !['completed', 'confirmed_empty'].includes(job.status))
+        .map((job) => ({
+          episodeNumber: job.episode_number,
+          jobId: job.job_id,
+          status: job.status,
+          attemptId: job.current_attempt_id ?? null,
+          errorCode: job.error_code ?? null,
+          effectClass: job.effect_class ?? null,
+          providerRequestId: job.provider_request_id ?? null,
+        }));
+      if (!allowPartial && excludedEpisodes.length > 0) {
+        throw screenTextConflict('SCREEN_TEXT_RELEASE_BLOCKED', '仍有待确认、失败、取消或需对账集数，不能发布。', 'complete_screen_text_review');
+      }
+      const includedEpisodeNumbers = jobs.rows
+        .filter((job) => ['completed', 'confirmed_empty'].includes(job.status))
+        .map((job) => job.episode_number);
+      const partial = allowPartial && excludedEpisodes.length > 0;
+      if (partial && includedEpisodeNumbers.length === 0) {
+        throw screenTextConflict('SCREEN_TEXT_PARTIAL_RELEASE_BLOCKED', '部分发布至少需要一集已完成或确认无画面字的集数。', 'complete_screen_text_review');
+      }
       const candidates = await client.query<any>(`
         SELECT c.*, j.video_duration_ms FROM screen_text_candidates c
         JOIN screen_text_jobs j ON j.id=c.job_id
-        WHERE c.batch_id=$1 AND c.status IN ('approved','edited')
+        WHERE c.batch_id=$1 AND j.status IN ('completed','confirmed_empty')
+          AND c.status IN ('approved','edited')
         ORDER BY c.episode_number,c.start_ms,c.end_ms,c.id
       `, [body.batchId]);
       for (const candidate of candidates.rows) this.validateEditable(candidate);
@@ -421,18 +484,26 @@ export class ScreenTextWriteRepository {
           ? `（${candidate.position === 'left' ? '左' : '右'}）${candidate.text}` : candidate.text,
         position: candidate.position,
       }));
-      const releaseDigest = stableHash({ batchId: body.batchId, revision: batch.revision, cues: cueSnapshot });
+      const releaseDigest = stableHash({
+        batchId: body.batchId,
+        revision: batch.revision,
+        partial,
+        excludedEpisodes,
+        cues: cueSnapshot,
+      });
       const release = await client.query<{ id: string }>(`
         INSERT INTO screen_text_releases (
-          project_id,version,batch_id,term_version_id,manifest_id,draft_revision,release_digest,cue_count
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id
+          project_id,version,batch_id,term_version_id,manifest_id,draft_revision,
+          release_digest,cue_count,partial,excluded_episodes
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id
       `, [projectId, version, body.batchId, batch.term_version_id,
-        batch.manifest_id, batch.revision, releaseDigest, cueSnapshot.length]);
+        batch.manifest_id, batch.revision, releaseDigest, cueSnapshot.length,
+        partial, JSON.stringify(excludedEpisodes)]);
       const releaseId = release.rows[0]?.id;
       if (!releaseId) throw new Error('SCREEN_TEXT_RELEASE_CREATE_FAILED');
       const grouped = new Map<number, typeof cueSnapshot>();
       for (const cue of cueSnapshot) grouped.set(cue.episodeNumber, [...(grouped.get(cue.episodeNumber) ?? []), cue]);
-      for (const episodeNumber of batch.episode_numbers as number[]) {
+      for (const episodeNumber of includedEpisodeNumbers) {
         const cues = grouped.get(episodeNumber) ?? [];
         for (const [index, cue] of cues.entries()) await client.query(`
           INSERT INTO screen_text_release_cues (
@@ -545,8 +616,11 @@ export class ScreenTextWriteRepository {
 
   private candidateState(row: any) {
     return {
-      id: row.id, text: row.text, startMs: row.start_ms, endMs: row.end_ms,
-      category: row.category, position: row.position, status: row.status, revision: row.revision,
+      id: row.id, source: row.source, rawText: row.raw_text, text: row.text,
+      startMs: row.start_ms, endMs: row.end_ms, category: row.category, position: row.position,
+      confidence: row.confidence, status: row.status, revision: row.revision,
+      systemSuggestion: row.system_suggestion, suggestionReason: row.suggestion_reason,
+      pairGroupId: row.pair_group_id, evidence: row.evidence, termHits: row.term_hits,
     };
   }
 

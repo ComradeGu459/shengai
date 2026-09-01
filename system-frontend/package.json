@@ -1,0 +1,23 @@
+{
+  "name": "@qimao-terms-cloud/system-frontend",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter @qimao-terms-cloud/contracts run build && vite --host 127.0.0.1 --port 3010",
+    "build": "pnpm --filter @qimao-terms-cloud/contracts run build && vite build",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@qimao-terms-cloud/contracts": "workspace:*",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@vitejs/plugin-react": "6.0.5",
+    "vite": "8.2.1"
+  }
+}

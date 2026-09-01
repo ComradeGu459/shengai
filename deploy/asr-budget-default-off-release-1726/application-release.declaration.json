@@ -1,0 +1,36 @@
+{
+  "$schema": "qimao.application-release/v2",
+  "formatVersion": 2,
+  "release": {
+    "id": "asr-budget-default-off-20260901-r1",
+    "previousBackendTarget": "/opt/qimao-terms-cloud/releases/pre-review-acceptance-release-20260901-r1",
+    "previousStaticTarget": "/srv/qimao-terms-cloud/frontend-pre-review-acceptance-release-20260901-r1",
+    "previousSystemStaticTarget": "/srv/qimao-terms-cloud/system-frontend-ai-hotfix-1552"
+  },
+  "runtime": {
+    "preservedUnits": {
+      "asr": "active/running/0/0",
+      "screenText": "inactive/dead/0/0",
+      "openVino": "active/running/0/0"
+    }
+  },
+  "candidate": {
+    "staticMarkers": [
+      "这些任务未调用识别供应商，不属于识别失败。",
+      "系统不会自动重试。管理员关闭硬门、补齐规则或调整限额后，再使用本批次的恢复操作。"
+    ],
+    "systemStaticMarkers": [
+      "预算仍记录用量并产生提醒；超过阈值也不会阻断新的识别请求。",
+      "默认只统计和提醒，不阻断；显式开启硬门并发布后，服务端才会按日/月硬限额阻断新请求。",
+      "开启预算硬门（ASR / OCR）"
+    ],
+    "systemUnauthenticatedProbe": {
+      "label": "budget_overview",
+      "path": "/api/system-control/budget-overview",
+      "expectedStatus": 403
+    }
+  },
+  "migration": {
+    "mode": "none"
+  }
+}

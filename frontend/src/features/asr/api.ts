@@ -5,6 +5,7 @@ import type {
   AsrBatchPreparation,
   AsrBatchSummary,
   AsrBatchStatus,
+  AsrSrtComparison,
   CreateAsrBatchBody,
   RetryAsrBatchBody,
 } from '@qimao-terms-cloud/contracts';
@@ -88,6 +89,9 @@ export const prepareAsrBatch = (
 
 export const getAsrBatchHotwords = (projectId: string, batchId: string) =>
   request<AsrBatchHotwordEvidence>(`/api/projects/${projectId}/asr/batches/${batchId}/hotwords`);
+
+export const getAsrSrtComparison = (projectId: string, batchId: string) =>
+  request<AsrSrtComparison>(`/api/projects/${projectId}/asr/batches/${batchId}/srt-compare`);
 
 export const createAsrBatch = (
   projectId: string,

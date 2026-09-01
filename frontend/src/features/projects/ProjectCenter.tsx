@@ -7,13 +7,24 @@ import {
   type FormEvent,
   type KeyboardEvent,
 } from 'react';
-import type { Project } from '@qimao-terms-cloud/contracts';
+import type { Project, ProjectList } from '@qimao-terms-cloud/contracts';
 
 import { PlusIcon } from '../../components/Icons.js';
+import { createUuid } from '../../platform/randomUuid.js';
 import { AsrProjectDispatch } from '../asr-dispatch/AsrProjectDispatch.js';
 import { recycleProject, RecycleApiError } from '../recycle/api.js';
-import { createProject, listProjects } from './api.js';
+import { createProject, listProjects, projectsQueryKey } from './api.js';
 import styles from './ProjectCenter.module.css';
+
+const mergeCreatedProject = (current: ProjectList | undefined, createdProject: Project): ProjectList => {
+  if (!current) return { items: [createdProject], total: 1 };
+  const items = [createdProject, ...current.items.filter((project) => project.id !== createdProject.id)].slice(0, 100);
+  return {
+    ...current,
+    items,
+    total: current.total + (current.items.some((project) => project.id === createdProject.id) ? 0 : 1),
+  };
+};
 
 export const ProjectCenter = () => {
   const queryClient = useQueryClient();
@@ -31,7 +42,7 @@ export const ProjectCenter = () => {
   const restoreTriggerFocus = useRef(false);
   const focusRecycleNotice = useRef(false);
   const projects = useQuery({
-    queryKey: ['projects', ''],
+    queryKey: projectsQueryKey,
     queryFn: () => listProjects(''),
   });
   const projectVersions = useMemo(
@@ -40,14 +51,16 @@ export const ProjectCenter = () => {
   );
   const createMutation = useMutation({
     mutationFn: createProject,
-    onSuccess: async () => {
+    onSuccess: async (createdProject) => {
       createIntent.current = null;
       setName('');
       setCreating(false);
+      queryClient.setQueryData<ProjectList>(projectsQueryKey, (current) => mergeCreatedProject(current, createdProject));
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['projects'] }),
+        queryClient.invalidateQueries({ queryKey: projectsQueryKey }),
         queryClient.invalidateQueries({ queryKey: ['asr-eligibility-search'] }),
       ]);
+      queryClient.setQueryData<ProjectList>(projectsQueryKey, (current) => mergeCreatedProject(current, createdProject));
     },
   });
   const recycleMutation = useMutation({
@@ -55,7 +68,7 @@ export const ProjectCenter = () => {
       const current = recycleIntent.current;
       const intent = current?.projectId === project.id && current.version === project.version
         ? current
-        : { projectId: project.id, version: project.version, idempotencyKey: crypto.randomUUID() };
+        : { projectId: project.id, version: project.version, idempotencyKey: createUuid() };
       recycleIntent.current = intent;
       const result = await recycleProject(project.id, project.version, intent.idempotencyKey);
       return { project, result };
@@ -72,7 +85,7 @@ export const ProjectCenter = () => {
           : ''}。`,
       );
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['projects'] }),
+        queryClient.invalidateQueries({ queryKey: projectsQueryKey }),
         queryClient.invalidateQueries({ queryKey: ['recycle-bin'] }),
         queryClient.invalidateQueries({ queryKey: ['asr-eligibility-search'] }),
       ]);
@@ -106,7 +119,7 @@ export const ProjectCenter = () => {
     setFormError('');
     const intent = createIntent.current?.name === trimmedName
       ? createIntent.current
-      : { name: trimmedName, idempotencyKey: crypto.randomUUID() };
+      : { name: trimmedName, idempotencyKey: createUuid() };
     createIntent.current = intent;
     createMutation.mutate({ body: { name: trimmedName }, idempotencyKey: intent.idempotencyKey });
   };

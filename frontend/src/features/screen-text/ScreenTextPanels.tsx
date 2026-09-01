@@ -266,7 +266,7 @@ export const CandidateEvidence = ({
       {!previewUrl && <div className={styles.mediaPlaceholder}>{evidencePending ? '正在读取代表截图' : '代表截图暂不可用'}</div>}
       <div className={styles.ocrBox}><span>{candidate.rawText}</span><small>OCR 原始候选</small></div>
     </div>
-    {playbackUrl && <video className={styles.video} src={playbackUrl} controls autoPlay onError={() => setPlaybackError('当前编码不受浏览器支持，需要后续兼容代理。')} aria-label={`第 ${candidate.episodeNumber} 集同源视频证据`} />}
+    {playbackUrl && <video className={styles.video} src={playbackUrl} controls autoPlay onLoadedMetadata={(event) => { event.currentTarget.currentTime = candidate.startMs / 1_000; }} onError={() => setPlaybackError('当前编码不受浏览器支持，需要后续兼容代理。')} aria-label={`第 ${candidate.episodeNumber} 集同源视频证据`} />}
     <div className={styles.mediaControls}><button className={styles.primaryCompact} type="button" onClick={() => void play()}>播放同源视频</button><span>定位 {formatTime(candidate.startMs)}</span></div>
     {Boolean(evidenceError) && <ErrorBlock title="候选证据读取失败" error={evidenceError} action="重新读取候选证据" actionRef={evidenceRetryRef} pending={evidencePending || evidenceRetrying} onAction={() => {
       if (evidenceRetrying) return;
@@ -303,8 +303,9 @@ export const CandidateEvidence = ({
             ? <button type="button" disabled={controlsDisabled} onClick={() => onDecision({ action: 'restore', expectedRevision: candidate.revision })}>恢复为待确认</button>
             : candidate.status === 'pending' || dualParent ? <>
               <button type="button" disabled={controlsDisabled} onClick={() => onDecision({ action: 'reject', expectedRevision: candidate.revision })}>忽略</button>
-              <button ref={splitRef} type="button" disabled={controlsDisabled} onClick={() => setSplitOpen(true)}>拆分左右</button>
-              {!dualParent && <button className={styles.primary} type="button" disabled={controlsDisabled} onClick={() => onDecision({ action: 'approve', expectedRevision: candidate.revision })}>保留并下一条</button>}
+              {dualParent && <button ref={splitRef} type="button" disabled={controlsDisabled} onClick={() => setSplitOpen(true)}>拆分左右</button>}
+              {!dualParent && <button className={styles.primary} type="button" disabled={controlsDisabled} onClick={() => onDecision({ action: 'approve', expectedRevision: candidate.revision })}>保留</button>}
+              <span className={styles.editHint}>本条不纳入画面字字幕，可从已忽略恢复</span>
             </> : <span className={styles.editHint}>既有人工决定保持不变；如需修订，请保存编辑。</span>}
         </div>
         {candidate.status !== 'rejected' && !dualParent && <button className={styles.wideButton} type="submit" disabled={controlsDisabled}>保存修改</button>}

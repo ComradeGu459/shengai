@@ -1,0 +1,24 @@
+# TERM-CURRENT-BASELINE-RESTORE-SERVER-65
+
+- artifact_written: true
+- outcome: blocked
+- evidence:
+  - task: `TERM-CURRENT-BASELINE-RESTORE-SERVER-65`
+  - frozen_input_archive: `9471776 bytes / 020437197f6fef783fa04a1789ba727cf293a152d140b38630122a9677c3b925`
+  - frozen_input_manifest: `3000555 bytes / 61372755bb1ac1a6bbe22aaf57ea98bd0a5afba78f44c4ff3b508dc615ec6f07`
+  - frozen_input_audit: `1190 bytes / 0f03a1de65ed6b93ae11a05c6abe95d60c8d2de4ea9e3830ef0c706663d5bcff`
+  - checker_contract: `Node v24.19.0; archive/manifest schema, candidateId, bytes+SHA, unique safe relative files and summary contract passed`
+  - checker: `4518 bytes / 0aa038f4443088296d02bdad0ff163712d62dca30201aedd1e74d9de434de533; same as SERVER-63`
+  - runner: `8765 bytes / ea9a01893696637dd0c95c29bd0e5f52798e84f08df4e5a4b7cc4a999428b67e; 63-normalized SHA=08452e0ec4ad6a8a90bb3330242a0655e24226e4104ea01efd91c2e7520ef69f`
+  - local_gates: `checker node --check=0; runner Git Bash --noprofile --norc -n=0; checker/runner CR=0; forbidden static scan=0`
+  - transfer_setup: `one SSH setup succeeded; /var/tmp/qimao-term-current-baseline-restore-65-transfer created as qimao-deploy:qimao-deploy:700:directory`
+  - scp: `1; exit=0`
+  - transient: `1; qimao-term-current-baseline-restore-65.service launched once`
+  - first_failure: `runner=failed|code=release_already_present`
+  - remote_write_boundary: `runner stopped before archive extraction, stage creation, release rename, current/static mutation, unit restart, DB change, Secret/config change or Provider/COS/Tencent/business API call`
+  - post_audit: `not executed; its local PowerShell command failed to parse before starting another SSH process, so no retry or remote diagnostic was made`
+  - local_cleanup: `the exact SERVER-65 temporary checker/runner directory was removed after evidence capture`
+- remaining_gap: `the expected old release target was already present when Step0 ran, so this restore was not applicable and Step0 did not continue to static/route/unit/health verification`
+- next_owner: `PLANNER to reconcile the already-present target against the frozen restore baseline and schedule the next single authorized action; do not replay SERVER-65`
+- residual: `runner EXIT cleanup was invoked for the fixed transfer/status/health/stage paths and systemd-run used --collect; independent post-cleanup SSH verification was unavailable after the local parser failure. No SERVER-65 archive/stage/release mutation was performed; the pre-existing release target remains`
+- requires_user: false

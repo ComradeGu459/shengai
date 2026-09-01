@@ -21,6 +21,15 @@ export interface AsrAdapterDescriptorInput {
     maxEntries?: number | null;
     maxCharacters?: number | null;
   };
+  billing: AsrBillingCapability;
+}
+
+export interface AsrBillingCapability {
+  billingClass: 'metered' | 'unmetered_local';
+  currency: string;
+  maximumAmount: string;
+  billingUnit: string;
+  maximumQuantity: string;
 }
 
 export interface AsrAdapterDescriptor extends Omit<AsrAdapterDescriptorInput, 'configVersion' | 'hotwordCapabilities'> {
@@ -30,6 +39,7 @@ export interface AsrAdapterDescriptor extends Omit<AsrAdapterDescriptorInput, 'c
     maxEntries: number | null;
     maxCharacters: number | null;
   };
+  billing: AsrBillingCapability;
 }
 
 export const createAsrAdapterDescriptor = (
@@ -40,12 +50,14 @@ export const createAsrAdapterDescriptor = (
     maxEntries: input.hotwordCapabilities?.maxEntries ?? null,
     maxCharacters: input.hotwordCapabilities?.maxCharacters ?? null,
   });
+  const billing = input.billing;
   const digestInput = {
     provider: input.provider,
     adapter: input.adapter,
     model: input.model,
     language: input.language,
     configVersion: input.configVersion,
+    billing,
   };
   return Object.freeze({
     provider: input.provider,
@@ -54,6 +66,7 @@ export const createAsrAdapterDescriptor = (
     language: input.language,
     hotwordCapabilities,
     configDigest: createHash('sha256').update(JSON.stringify(digestInput)).digest('hex'),
+    billing,
   });
 };
 
@@ -79,8 +92,12 @@ export interface AsrAdapterInput {
   episodeNumber: number;
   asset: AsrAdapterAsset;
   attemptNumber: number;
+  /** 已受理任务的持久供应商任务标识；存在时适配器只能查询，不得再次提交。 */
+  providerRequestId?: string | null;
   retryOfBatchId: string | null;
   hasPreviousResult: boolean;
+  /** 发起批次时锁定的 confirmed TermVersion；null 表示项目当时无版本。 */
+  termVersionId?: string | null;
   hotwords: AsrAdapterHotwords;
 }
 
@@ -90,9 +107,12 @@ interface AsrAdapterOutcomeBase {
   hotwordReceiptFacts: AsrHotwordReceiptFacts;
 }
 
+export type AsrEffectClass = 'completed' | 'external_not_accepted' | 'unauthorized' | 'external_unknown' | 'quality_rejected' | 'cancelled';
+
 export type AsrAdapterOutcome =
   | AsrAdapterOutcomeBase & {
     kind: 'completed';
+    effectClass: 'completed' | 'quality_rejected';
     providerRequestId: string;
     cues: Array<Omit<AsrCue, 'id'>>;
     qualityStatus: AsrQualityStatus;
@@ -105,12 +125,14 @@ export type AsrAdapterOutcome =
     errorDetail: string;
     retryable: boolean;
     externalSideEffectPossible: boolean;
+    effectClass: Exclude<AsrEffectClass, 'completed' | 'quality_rejected'>;
   }
   | AsrAdapterOutcomeBase & {
     kind: 'reconciliation_required';
     providerRequestId: string;
     errorCode: string;
     errorDetail: string;
+    effectClass: 'external_unknown';
   };
 
 export interface AsrAdapter {
@@ -140,6 +162,7 @@ export const deterministicFakeDescriptor = createAsrAdapterDescriptor({
   language: 'zh-CN',
   configVersion: 'deterministic-fake-config-v1',
   hotwordCapabilities: { maxEntries: 100, maxCharacters: 2_000 },
+  billing: { billingClass: 'unmetered_local', currency: 'CNY', maximumAmount: '0', billingUnit: 'zero_network_call', maximumQuantity: '0' },
 });
 
 const fakeUsage = (
@@ -171,6 +194,7 @@ export class DeterministicFakeAsrAdapter implements AsrAdapter {
     if (filename.includes('fake-reconcile')) {
       return {
         kind: 'reconciliation_required',
+        effectClass: 'external_unknown',
         providerRequestId,
         errorCode: 'FAKE_UNKNOWN_RESULT',
         errorDetail: '模拟供应商已受理但结果未知，必须先对账。',
@@ -179,11 +203,40 @@ export class DeterministicFakeAsrAdapter implements AsrAdapter {
         usage: fakeUsage(providerRequestId, 'pending'),
       };
     }
+    if (filename.includes('fake-unauthorized')) {
+      return {
+        kind: 'failed',
+        effectClass: 'unauthorized',
+        providerRequestId: null,
+        errorCode: 'ASR_PROVIDER_UNAUTHORIZED',
+        errorDetail: '零网络桩模拟供应商鉴权拒绝。',
+        retryable: false,
+        externalSideEffectPossible: false,
+        hotwordReceipt: 'simulated',
+        hotwordReceiptFacts,
+        usage: fakeUsage(null, 'final'),
+      };
+    }
+    if (filename.includes('fake-route-fail-once') && input.attemptNumber === 1) {
+      return {
+        kind: 'failed',
+        effectClass: 'external_not_accepted',
+        providerRequestId: null,
+        errorCode: 'ASR_ROUTE_RETRYABLE_FAILURE',
+        errorDetail: '零网络桩模拟首目标未受理。',
+        retryable: true,
+        externalSideEffectPossible: false,
+        hotwordReceipt: 'simulated',
+        hotwordReceiptFacts,
+        usage: fakeUsage(null, 'final'),
+      };
+    }
     if (filename.includes('fake-always-fail')
       || (filename.includes('fake-fail-once') && !input.retryOfBatchId)
       || (filename.includes('fake-pass-then-fail') && input.hasPreviousResult)) {
       return {
         kind: 'failed',
+        effectClass: 'external_not_accepted',
         providerRequestId: null,
         errorCode: 'FAKE_RETRYABLE_FAILURE',
         errorDetail: '模拟本地执行失败，未产生外部付费副作用。',
@@ -213,9 +266,10 @@ export class DeterministicFakeAsrAdapter implements AsrAdapter {
         confidence: qualityStatus === 'rejected' ? 0.2 : 0.94,
       },
     ];
-    return {
-      kind: 'completed',
-      providerRequestId,
+      return {
+        kind: 'completed',
+        effectClass: qualityStatus === 'rejected' ? 'quality_rejected' : 'completed',
+        providerRequestId,
       cues,
       qualityStatus,
       qualitySummary: qualitySummary(

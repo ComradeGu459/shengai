@@ -13,6 +13,7 @@ import {
   AsrEligibilityListSchema,
   AsrProjectEligibilitySearchQuerySchema,
   AsrProjectEligibilitySearchResultSchema,
+  AsrSrtComparisonSchema,
   AsrHotwordPreviewQuerySchema,
   AsrHotwordPreviewSchema,
   CancelAsrBatchBodySchema,
@@ -31,6 +32,8 @@ import { AsrEligibilityRepository } from './asr-eligibility.repository.js';
 import { AsrDomainError } from './asr-errors.js';
 import { AsrReadRepository } from './asr-read.repository.js';
 import { AsrService } from './asr.service.js';
+import { SystemControlRoutingService } from '../system-control/system-control.routing.service.js';
+import type { AsrAdapterRegistry } from './asr-adapter-registry.js';
 
 const ProjectParamsSchema = Type.Object({ projectId: Type.String({ format: 'uuid' }) });
 const BatchParamsSchema = Type.Object({
@@ -53,8 +56,15 @@ const sendAsrError = (reply: FastifyReply, requestId: string, error: AsrDomainEr
     },
   });
 
+/** 生产只禁用默认 deterministic fake；实际 Registry 已装配真实适配器时开放既有写链。 */
+export const asrWriteCommandsEnabled = (
+  registry: Pick<AsrAdapterRegistry, 'defaultDescriptor'>,
+  nodeEnv = process.env.NODE_ENV,
+) => nodeEnv !== 'production' || registry.defaultDescriptor.adapter !== 'deterministic_fake';
+
 export const asrRoutes: FastifyPluginAsyncTypebox = async (app) => {
-  const commands = new AsrCommandRepository(app.database, app.asrAdapterRegistry.defaultDescriptor);
+  const routing = new SystemControlRoutingService(app.database, { asr: app.asrAdapterRegistry, screenText: app.screenTextAdapterRegistry });
+  const commands = new AsrCommandRepository(app.database, routing, app.asrAdapterRegistry);
   const reads = new AsrReadRepository(app.database, app.asrAdapterRegistry.defaultDescriptor);
   const eligibility = new AsrEligibilityRepository(
     app.database,
@@ -65,7 +75,7 @@ export const asrRoutes: FastifyPluginAsyncTypebox = async (app) => {
     reads,
     eligibility,
     new AsrDispatchRepository(app.database, eligibility, commands),
-    process.env.NODE_ENV !== 'production',
+    asrWriteCommandsEnabled(app.asrAdapterRegistry),
   );
   const handle = async <T>(reply: FastifyReply, requestId: string, operation: () => Promise<T>) => {
     try {
@@ -223,6 +233,16 @@ export const asrRoutes: FastifyPluginAsyncTypebox = async (app) => {
       },
     },
   }, async (request, reply) => handle(reply, request.id, () => service.batchHotwords(
+    request.params.projectId,
+    request.params.batchId,
+  )));
+
+  app.get('/api/projects/:projectId/asr/batches/:batchId/srt-compare', {
+    schema: {
+      params: BatchParamsSchema,
+      response: { 200: AsrSrtComparisonSchema, 404: ApiErrorSchema },
+    },
+  }, async (request, reply) => handle(reply, request.id, () => service.compareSrt(
     request.params.projectId,
     request.params.batchId,
   )));
